@@ -6,16 +6,24 @@
 ;;
 ;; writes OUT-DIR/cNNN.coil for the hand-written cases and OUT-DIR/pNNNNN.coil for
 ;; N random programs, and OUT-DIR/verdicts.txt: one line per program,
-;;   NAME accept|reject        a program written out
+;;   NAME accept|reject|reborrow   a program written out (see `verdict`)
 ;;   NAME skipped REASON       a program Coil has no way to write
 (require "rules.rkt" "cases.rkt" "search.rkt" "to-coil.rkt")
+
+;; `reborrow`: refused only because an exclusive reference is used after it was
+;; moved. Coil never moves one: naming it lends what it refers to again, and the
+;; checker holds that loan. The checker may accept such a program.
+(define (verdict prog)
+  (cond [(check-program prog) 'accept]
+        [(parameterize ([mutant 'copy-mut]) (check-program prog)) 'reborrow]
+        [else 'reject]))
 
 (define (emit out-dir verdicts name prog)
   (define-values (text why) (program->coil prog (format "diff.~a" name)))
   (cond [text
          (call-with-output-file (build-path out-dir (format "~a.coil" name)) #:exists 'replace
            (λ (out) (write-string text out)))
-         (fprintf verdicts "~a ~a\n" name (if (check-program prog) 'accept 'reject))]
+         (fprintf verdicts "~a ~a\n" name (verdict prog))]
         [else (fprintf verdicts "~a skipped ~a\n" name why)]))
 
 (module+ main

@@ -23,11 +23,6 @@
 
 ;; ---------------------------------------------------------------- types
 
-;; A function's type parameters are renamed. Coil (commit 3fbe0d14) reads a
-;; generic method's own `T` as the caller's when the caller has a `T` too:
-;; `(Box::new 0)` inside `(defn f [T] …)` is refused, "has type i64 but expected T".
-(define function-tparams (make-parameter '()))
-
 (define (coil-type τ)
   (match τ
     ['int "i64"]
@@ -39,7 +34,7 @@
     [`(ref ,σ) (format "(ref ~a)" (coil-type σ))]
     [`(mut ,σ) (format "(mut ~a)" (coil-type σ))]
     [`(view ,_) (bail "a view")]
-    [(? symbol? T) (if (memq T (function-tparams)) (format "F~a" T) (symbol->string T))]
+    [(? symbol? T) (symbol->string T)]
     [(list S) (type-name S)]
     [(cons S args) (format "(~a ~a)" (type-name S) (string-join (map coil-type args)))]))
 
@@ -339,11 +334,10 @@
        (string-append*
         (for/list ([p params] #:unless (ref? (cadr p)))
           (format "(mut ~a) ~a " (var-name (car p)) (var-name (car p))))))
-     (parameterize ([function-tparams Ts])
      (format "(defn ~a~a [~a] (-> ~a)\n  (let [~a] ~a))"
-             (fn-name f) (type-params (map (λ (T) (string->symbol (format "F~a" T))) Ts))
+             (fn-name f) (type-params Ts)
              (string-join (for/list ([p params]) (format "(~a ~a)" (var-name (car p)) (coil-type (cadr p)))))
-             (coil-type τr) rebound (value Σ Γ body)))]))
+             (coil-type τr) rebound (value Σ Γ body))]))
 
 ;; The functions of DS that cannot be written, with why: one that uses what Coil
 ;; lacks, and then any that calls one of those.

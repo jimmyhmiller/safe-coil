@@ -1,0 +1,9 @@
+(module case.ok-return-pool-element)
+(import "safe.pool" :use [Pool Handle])
+(defstruct Pt [(x i64) (y i64)])
+(defn newest [(pool (mut (Pool Pt)))] (-> (ref Pt))
+  (let [h (Pool::insert! (mut pool) (Pt :x 7 :y 8))]
+    (Pool::at pool h)))
+(defn main [] (-> i64)
+  (let [(mut pool) (Pool::new [Pt])]
+    (.x (newest (mut pool)))))

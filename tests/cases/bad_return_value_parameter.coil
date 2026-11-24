@@ -1,0 +1,5 @@
+(module case.bad-return-value-parameter)
+(defstruct Pt [(x i64) (y i64)])
+(defn idr [(a (ref Pt))] (-> (ref Pt)) a)
+(defn leak [(p Pt)] (-> (ref Pt)) (idr p))
+(defn main [] (-> i64) (.x (leak (Pt :x 1 :y 2))))

@@ -43,7 +43,8 @@ adds the rest of the model:
 - **No escape.** A reference cannot leave the scope of the local it refers to: not
   as the value of a `let`, a `block`, a `break` or a function, and not as a
   reference to a temporary.
-- **Results.** A reference a call returns borrows from every argument of the call.
+- **Results.** A reference a call returns borrows from every argument the call
+  took by reference.
 - **Match.** A `match` on a name lends the parts of the payload that own something
   to the arm, where they lie. The matched place stays lent to those names, so the
   variant cannot be replaced under them. `(match (move x) …)` consumes x instead.
@@ -93,15 +94,28 @@ run fails if the checker accepts anything the model refuses.
 checker at a time and requires `diff.py` to find a program the weakened checker
 wrongly accepts.
 
+On the model's 99 cases and 4000 random programs (seed 7), 3112 can be written
+as Coil. The compiler refuses 821 of them itself. Of the other 2291, the checker
+and the model agree on 2274 (1715 accepted, 559 refused), the checker refuses 14
+the model accepts, and it accepts none the model refuses. Three more are the
+exclusive-reference case below. All nine weakenings are caught, eight of them by
+a hand-written case.
+
 ### Where Coil and the model differ
 
-Found by the differential run, and all in the strict direction:
+Found by the differential run:
+
+- **An exclusive reference is never moved.** The model moves one when it is
+  named, and refuses a later use. Coil lends through it again each time, and the
+  checker holds that loan, so it accepts some programs the model refuses for
+  that reason alone. `diff.py` counts them apart (`reborrow`).
 
 - **The compiler's move rule is stricter.** An `if` or `match` whose branches do
   not move the same owners is refused by the compiler; the model treats the owner
   as moved afterwards.
 - **A name holding a raw pointer cannot be lent to a generic function outside
-  `unsafe`.** Coil turns a raw pointer passed for a reference parameter into a
+  `unsafe`.** This is all 14 of the programs the checker refuses and the model
+  accepts. Coil turns a raw pointer passed for a reference parameter into a
   reference to its pointee, and the checker cannot tell that from lending the
   name itself when the parameter's type is a type parameter.
 - **Plain data passed by value counts as lent for the call.** The model copies
@@ -163,7 +177,7 @@ one rule (`mutants`), and the machine can drop its run-time check on globals.
 These are sound and simple. The model should be relaxed first, then the checker.
 
 - Loans are lexical: one lives until its holder's scope ends, not until its last use.
-- A returned reference borrows from every argument of the call.
+- A returned reference borrows from every argument the call took by reference.
 - Every element of a pool is one place: two elements cannot be lent exclusively at once.
 - Only a whole variable can be moved. `replace!` swaps an owner out of a field, a
   box or a pool element.

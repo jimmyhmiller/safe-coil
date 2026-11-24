@@ -783,6 +783,9 @@
           (head-is? param `ref) (eval (mut cx) arg (WShared))
           (raw-type? param) (eval (mut cx) arg (WValue))
           (and (primitive/code-sym? t) (scalar-name? t)) (eval (mut cx) arg (WValue))
+          ; a number in a place, for a parameter known to take it by value, is copied
+          (and (not (primitive/code-eq param `unknown)) (word-type? content))
+            (eval (mut cx) arg (WValue))
           (primitive/code-eq param `unknown)
             ; taken by value or lent: an owner is checked as moved and as lent
             (do (when (and (= (len q) 1) (owner-type? cx content))
@@ -819,7 +822,11 @@
             (let [r (eval-arg (mut cx) arg (if known (get params (- i 1 skipped)) `unknown))
                   carried (.loans (use-value arg r (WShared)))]
               (hold! (mut cx) -1 carried)
-              (set! all (union all carried)))))))
+              ; The result borrows from what was passed by reference. Plain data
+              ; taken by value is the callee's own for the call: a checked callee
+              ; cannot return a reference to it.
+              (when (or (not known) (head-is? arg `mut) (ref-type? (get params (- i 1 skipped))))
+                (set! all (union all carried))))))))
     (drop-loans-to! (mut cx) loans)
     ; a reference that is thrown away still may not outlive what it refers to
     (if (ref-type? (type-of e))

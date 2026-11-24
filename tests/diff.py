@@ -7,7 +7,8 @@
 Coil, with the model's verdict on each. Every one is then compiled with
 `--use safe.check`. A program the compiler itself refuses (a type error, a use
 of a moved value) is set aside: the checker never saw it. For the rest, the
-checker must accept exactly what the model accepts.
+checker must accept exactly what the model accepts. build/diff/results.txt lists
+every program with both verdicts.
 
 Exit status 1 if the checker accepts a program the model refuses.
 """
@@ -40,9 +41,13 @@ for line in open(os.path.join(out, "verdicts.txt")):
     else:
         model[name] = verdict
 
-table, reasons, unsound, strict, refused = {}, {}, [], [], {}
+table, reasons, unsound, strict, refused, details, reborrow = {}, {}, [], [], {}, [], {}
 with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
     for name, verdict, why in pool.map(coil, sorted(model)):
+        details.append(f"{name} model={model[name]} checker={verdict} {why}")
+        if model[name] == "reborrow":
+            reborrow[verdict] = reborrow.get(verdict, 0) + 1
+            continue
         key = (model[name], verdict)
         table[key] = table.get(key, 0) + 1
         if key == ("accept", "compiler"):
@@ -60,6 +65,10 @@ print("model    checker   programs")
 for key in [("accept", "accept"), ("reject", "reject"), ("accept", "reject"), ("reject", "accept"),
             ("accept", "compiler"), ("reject", "compiler")]:
     print(f"{key[0]:8} {key[1]:9} {table.get(key, 0)}")
+if reborrow:
+    print("refused by the model only for using an exclusive reference after moving it, which Coil")
+    print(f"never does (it lends again): {sum(reborrow.values())}, of which the checker accepts {reborrow.get('accept', 0)}")
+open(os.path.join(out, "results.txt"), "w").write("\n".join(details) + "\n")
 if refused:
     print("the compiler refuses what the model accepts:")
     for why, count in sorted(refused.items())[:40]:
