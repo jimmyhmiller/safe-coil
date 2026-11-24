@@ -1,0 +1,10 @@
+(module case.ok-trait-method)
+(defstruct Pt [(x i64) (y i64)])
+(deftrait Area [Self] (area [(s (ref Self))] (-> i64)))
+(impl Area Pt (area [(s (ref Pt))] (-> i64) (* (.x s) (.y s))))
+(impl Pt (grow! [(p (mut Pt)) (by i64)] (-> void) (set! (.x p) (+ (.x p) by))))
+(defn twice [(T Area)] [(a (ref T))] (-> i64) (* 2 (area a)))
+(defn main [] (-> i64)
+  (let [(mut p) (Pt :x 2 :y 3)]
+    (Pt::grow! (mut p) 1)
+    (+ (area p) (twice p))))

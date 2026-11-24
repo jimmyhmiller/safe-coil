@@ -1,0 +1,16 @@
+;;; Two calls at once. Not built yet.
+;;;
+;;; The model's rule is that the arguments of both calls are checked as the
+;;; arguments of one, so nothing lent exclusively to one call reaches the other.
+;;; The checker gets that rule for free once `par` binds every argument to a name
+;;; before either call starts. What is missing is the run-time half: a thread's
+;;; entry point takes its arguments through a struct, whose field types a macro
+;;; cannot know because it runs before the program is typed. It needs a transform
+;;; that reads the checked types. Until then a use of `par` is a compile error,
+;;; and `safe.global` counts its borrowers with plain integers, which is right
+;;; only while safe code cannot start a thread.
+(module safe.par)
+(import "coil.primitive" :as primitive)
+
+(defn par [(first Code) (second Code)] (-> Code)
+  (primitive/error "safe: par is not built yet: safe Coil has no way to run two calls at once"))

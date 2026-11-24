@@ -14,7 +14,7 @@ Exit status 1 if the checker accepts a program the model refuses.
 import concurrent.futures, os, subprocess, sys
 
 root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-out = os.path.join(root, "build", "diff")
+out = os.environ.get("SAFE_DIFF_OUT", os.path.join(root, "build", "diff"))
 n = sys.argv[1] if len(sys.argv) > 1 else "300"
 seed = sys.argv[2] if len(sys.argv) > 2 else "1"
 

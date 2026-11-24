@@ -1,0 +1,4 @@
+(module case.bad-array-literal)
+(defn main [] (-> i64)
+  (let [xs [1 2 3]]
+    (get xs 1)))

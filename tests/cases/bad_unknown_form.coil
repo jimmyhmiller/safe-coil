@@ -1,0 +1,5 @@
+(module case.bad-unknown-form)
+(defn main [] (-> i64)
+  (let [(mut n) 0]
+    (defer (set! n 1))
+    n))

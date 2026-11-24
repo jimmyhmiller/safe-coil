@@ -233,7 +233,8 @@
         false))
     (primitive/UnknownShape [] true)))
 
-;;; Can a value of T hold raw memory, at any depth? Unknown types can.
+;;; Can a value of T hold raw memory, at any depth? Unknown types can, and an
+;;; array counts: the library reads one without checking the index.
 (defn raw-carrying? [(cx (ref Cx)) (t Code) (depth i64)] (-> bool)
   (cond (> depth 16) true
         (primitive/code-sym? t)
@@ -242,7 +243,8 @@
                 :else (raw-parts? cx t depth))
         (raw-type? t) true
         (ref-type? t) (raw-carrying? cx (get t 1) (+ depth 1))
-        (head-is? t `array) (raw-carrying? cx (get t 1) (+ depth 1))
+        ; an array is indexed without a bounds check
+        (head-is? t `array) true
         (not (primitive/code-list? t)) true
         :else (raw-parts? cx t depth)))
 
@@ -418,7 +420,9 @@
 ;;; functions are: what they generate may follow raw memory. Code the program
 ;;; wrote inside a use of one is checked as usual.
 (defn trusted? [(node Code)] (-> bool)
-  (expanded-by? node `(coil.print.print coil.print.println coil.fmt.fmt)))
+  (expanded-by? node
+                `(coil.print.print coil.print.println coil.fmt.fmt coil.panic.panic coil.panic.unreachable
+                  coil.assert.assert coil.assert.assert-eq)))
 
 (defn raw-ok? [(cx (ref Cx)) (node Code)] (-> bool)
   (or (.unsafe cx) (trusted? node)))
@@ -575,12 +579,16 @@
         q (place-of (mut cx) scrutinee)
         named (= (len q) 1)
         writable (head-is? (type-of scrutinee) `mut)
+        ; a reference a call returned is matched where it points, like a name
+        lends (or named (ref-type? (type-of scrutinee)))
         sum (pointee (type-of scrutinee))
+        lent (cond named
+                     (do (check-read! cx scrutinee (get q 0))
+                         (if writable (excl-loan (get q 0)) (shared-loan (get q 0))))
+                   lends (.loans (eval (mut cx) scrutinee (if writable (WExcl) (WShared))))
+                   :else (do (eval (mut cx) scrutinee (WValue)) (no-loans)))
         (mut out) (fresh)
         (mut first) true]
-    (if named
-        (check-read! cx scrutinee (get q 0))
-        (do (eval (mut cx) scrutinee (WValue)) 0))
     (for [i 2 (len e)]
       (let [arm (get e i)
             locals (len (.locals cx))
@@ -591,12 +599,11 @@
                 (for [k 0 (len (get arm 1))]
                   (let [b (get (get arm 1) k)]
                     (if (primitive/code-sym? b)
-                        (if (and named (owner-type? cx (payload-type sum arm k)))
+                        (if (and lends (owner-type? cx (payload-type sum arm k)))
                             (let [serial (push-local! (mut cx) b true)]
-                              (when writable
+                              (when (and named writable)
                                 (check-write! cx scrutinee (get q 0) "matched, which lends its payload exclusively,"))
-                              (hold! (mut cx) serial
-                                     (if writable (excl-loan (get q 0)) (shared-loan (get q 0)))))
+                              (hold! (mut cx) serial lent))
                             (do (push-local! (mut cx) b false) 0))
                         (fail! b "safe: this pattern is not covered by the rules")))))
               (let [r (eval-seq (mut cx) arm (if binds? 2 1) want)
@@ -725,8 +732,8 @@
               (do (eval (mut cx) source (WShared)) (fresh)))))))
 
 (defn eval-cast [(cx (mut Cx)) (e Code)] (-> Res)
-  (when (and (ref-type? (type-of e)) (raw-type? (type-of (get e 2))))
-    (need-unsafe! cx e "a reference made from a raw pointer"))
+  (when (ref-type? (type-of e))
+    (need-unsafe! cx e "a reference made by a cast"))
   (eval (mut cx) (get e 2) (WValue))
   (fresh))
 
@@ -757,6 +764,10 @@
 (defn checked-module? [(cx (ref Cx)) (module Code)] (-> bool)
   (name-in? module (.user cx)))
 
+;;; A vector the compiler gave no type is a list of type arguments, not an array.
+(defn type-arguments? [(e Code)] (-> bool)
+  (and (primitive/code-vector? e) (primitive/code-eq (type-of e) `unknown-type)))
+
 ;;; One argument of a call, for a parameter of type PARAM (`unknown` when the
 ;;; declaration could not be read).
 (defn eval-arg [(cx (mut Cx)) (arg Code) (param Code)] (-> Res)
@@ -785,14 +796,17 @@
                  (name Code) (signature Code)] (-> Res)
   (let [params (callee-params kind name signature)
         (mut positional) true
+        ; explicit type arguments, `(f [T] x)`, come before the first argument
+        (mut skipped) 0
         loans (len (.loans cx))
         (mut all) (no-loans)
         external (not (checked-module? cx module))]
     (for [i 1 (len e)]
-      (when (primitive/code-keyword? (get e i)) (set! positional false)))
+      (when (primitive/code-keyword? (get e i)) (set! positional false))
+      (when (type-arguments? (get e i)) (set! skipped (+ skipped 1))))
     (let [known (and positional
                      (not (head-is? params `unknown))
-                     (= (len params) (- (len e) 1)))]
+                     (= (len params) (- (len e) 1 skipped)))]
       (when (and external (not (raw-ok? cx e)))
         (if known
             (when (or (any-raw-parameter? cx params) (any-raw-argument? cx e))
@@ -800,9 +814,9 @@
             (do (fail! e (text3 "safe: cannot read the declaration of `" (meta/source name) "`; calling it is allowed only inside (unsafe …)")) 0)))
       (for [i 1 (len e)]
         (let [arg (get e i)]
-          (unless (primitive/code-keyword? arg)
+          (unless (or (primitive/code-keyword? arg) (type-arguments? arg))
             (guard-raw-flow! cx e arg)
-            (let [r (eval-arg (mut cx) arg (if known (get params (- i 1)) `unknown))
+            (let [r (eval-arg (mut cx) arg (if known (get params (- i 1 skipped)) `unknown))
                   carried (.loans (use-value arg r (WShared)))]
               (hold! (mut cx) -1 carried)
               (set! all (union all carried)))))))
@@ -828,6 +842,14 @@
       rotr mulhi iadd-overflow? isub-overflow? imul-overflow? fadd fsub fmul fdiv frem icmp-lt
       icmp-le icmp-gt icmp-ge icmp-eq icmp-ne fcmp-lt fcmp-le fcmp-gt fcmp-ge fcmp-eq fcmp-ne)))
 
+;;; Is an argument of the call E a trait object? A method called on one is
+;;; reached through the raw pointers it holds.
+(defn any-trait-object? [(e Code)] (-> bool)
+  (block :any
+    (for [i 1 (len e)]
+      (when (head-is? (pointee (type-of (get e i))) `dyn) (return-from :any true)))
+    false))
+
 ;;; A form headed by a name the compiler resolves to something.
 (defn eval-resolved [(cx (mut Cx)) (e Code) (want Want)] (-> Res)
   (match (primitive/code-decl e)
@@ -846,7 +868,10 @@
                   (eval (mut cx) (get e i) (WValue))))
               (fresh)))
         (primitive/FunctionDecl [] (eval-call (mut cx) e want module kind name signature))
-        (primitive/MethodDecl [] (eval-call (mut cx) e want module kind name signature))
+        (primitive/MethodDecl []
+          (do (when (any-trait-object? e)
+                (need-unsafe! cx e "a call through a trait object"))
+              (eval-call (mut cx) e want module kind name signature)))
         (primitive/ExternDecl []
           (do (need-unsafe! cx e "a call of an extern function")
               (eval-parts (mut cx) e 1)))
@@ -887,6 +912,14 @@
           (and (= (len e) 2) (form-is? e `load)) (eval-load (mut cx) e want)
           (and (= (len e) 3) (form-is? e `cast)) (eval-cast (mut cx) e)
           (or (head-is? e `quote) (head-is? e `quasiquote)) (fresh)
+          ; a function literal captures nothing: its body is a function of its own,
+          ; and its value is a function pointer, which only `unsafe` code can call
+          (or (head-is? e `fn*) (head-is? e `fn))
+            (let [arrow (arrow-index e)]
+              (if (and (> arrow 0) (primitive/code-vector? (get e (- arrow 1))))
+                  (check-function! (.user cx) e arrow (.tparams cx))
+                  (fail! e "safe: this function form is not covered by the rules"))
+              (fresh))
           :else (eval-resolved (mut cx) e want))))
 
 ;;; Check E, whose consumer wants WANT.
@@ -979,10 +1012,13 @@
                 (fail! form "safe: this returns a reference to a temporary")))
             0)))))
 
+;;; Check the methods of an `impl` or a `deftrait` (a trait's method may have a
+;;; body). A vector written directly in the form lists type parameters.
 (defn check-impl! [(user Code) (form Code)] (-> i64)
-  (let [outer (if (and (> (len form) 1) (primitive/code-vector? (get form 1)))
-                  (type-parameter-names (get form 1))
-                  `())]
+  (let [(mut outer) `()]
+    (for part (iter form)
+      (when (primitive/code-vector? part)
+        (set! outer (union outer (type-parameter-names part)))))
     (for part (iter form)
       (when (and (primitive/code-list? part) (> (len part) 0) (primitive/code-sym? (get part 0)))
         (let [arrow (arrow-index part)]
@@ -996,7 +1032,7 @@
             (if (and (> arrow 1) (primitive/code-vector? (get form (- arrow 1))))
                 (check-function! user form arrow `())
                 (fail! form "safe: this function form is not covered by the rules")))
-        (head-is? form `impl) (check-impl! user form)
+        (or (head-is? form `impl) (head-is? form `deftrait)) (check-impl! user form)
         :else 0))
 
 ;;; Is the module record M one of the program's own, to be checked? This module

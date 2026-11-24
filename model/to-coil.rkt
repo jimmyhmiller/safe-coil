@@ -263,19 +263,20 @@
      (for ([v (or (variants-of Σ τp) (bail "an ill-typed program"))])
        (when (copy? Σ (cadr v))
          (bail "a match by reference on a plain-data payload")))
-     ;; a match on a place that can be written lends its payload exclusively; a
-     ;; shared reference to the same place lends it shared
-     (define scrutinee
+     ;; a match on a name that can be written lends its payload exclusively; on a
+     ;; shared reference to the same place, shared
+     (define-values (before scrutinee after)
        (if (eq? k 'ref)
-           (format "(borrow ~a)" (shared-place Σ Γ p))
-           (format "(borrow-mut (mut ~a))" (written-place Σ Γ p))))
-     (format "(let [scrutinee ~a] (match scrutinee~a))" scrutinee
+           (values (format "(let [scrutinee (borrow ~a)] " (shared-place Σ Γ p)) "scrutinee" ")")
+           (values "" (written-place Σ Γ p) "")))
+     (format "~a(match ~a~a)~a" before scrutinee
              (string-append*
               (for/list ([arm arms])
                 (match arm
                   [`((,K ,x) ,ea)
                    (define Γa (cons (cons x `(,k ,(variant-type Σ τp K))) Γ))
-                   (format " (~a [~a] ~a)" (variant-name K) (var-name x) (value Σ Γa ea))]))))]
+                   (format " (~a [~a] ~a)" (variant-name K) (var-name x) (value Σ Γa ea))])))
+             after)]
     [`(pool-new ,σ) (format "(Pool::new [~a])" (coil-type σ))]
     [`(insert ,p ,e1)
      (format "(let [(mut new-value) ~a] (Pool::insert! (mut ~a) new-value))" (plain Σ Γ e1) (written-place Σ Γ p))]
