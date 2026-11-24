@@ -1,0 +1,15 @@
+(module case.ok-pool)
+(import "safe.pool" :use [Pool Handle])
+(import "safe.box" :use [Box])
+(import "safe.core" :use [replace!])
+(defstruct Pt [(x i64) (y i64)])
+(defn main [] (-> i64)
+  (let [(mut pool) (Pool::new [(Box Pt)])
+        a (Pool::insert! (mut pool) (Box::new (Pt :x 1 :y 2)))
+        b (Pool::insert! (mut pool) (Box::new (Pt :x 3 :y 4)))]
+    (for i (range 0 10) (Pool::insert! (mut pool) (Box::new (Pt :x i :y i))))
+    (println "{} {}" (.x (Box::get (Pool::at pool a))) (.x (Box::get (Pool::at pool b))))
+    (let [old (replace! (mut (Pool::at-mut (mut pool) a)) (Box::new (Pt :x 9 :y 9)))]
+      (println "{} {}" (.x (Box::get old)) (.x (Box::get (Pool::at pool a)))))
+    (let [gone (Pool::remove! (mut pool) b)]
+      (.x (Box::into gone)))))

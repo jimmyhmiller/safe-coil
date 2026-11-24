@@ -1,8 +1,24 @@
 ;;; What safe Coil code is written with besides the language itself.
 (module safe.core)
+(import "coil.primitive" :as primitive)
 
 ;;; `(unsafe FORM…)`: the forms may follow raw memory. Every other rule still
 ;;; applies inside. The checker recognizes the `do` this expands to by the macro
 ;;; that produced it.
 (defn unsafe [(first Code) & (rest Code)] (-> Code)
   `(do ~first ~@rest))
+
+;;; What SLOT points at, lent. A raw pointer passed for a reference parameter is
+;;; the reference to its pointee, so only `unsafe` code can call these with one.
+(defn lend [T] [(slot (ref T))] (-> (ref T)) slot)
+
+(defn lend-mut [T] [(slot (mut T))] (-> (mut T)) slot)
+
+;;; Put VALUE in SLOT and give back what was there. The way to take an owner out
+;;; of a field, a box or a pool element, which cannot be moved out of.
+(defn replace! [T] [(slot (mut T)) (value T)] (-> T)
+  (unsafe
+    (let [raw (primitive/cast (ptr T) (mut slot))
+          old (take! [T] raw)]
+      (store! raw value)
+      old)))

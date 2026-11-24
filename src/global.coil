@@ -1,0 +1,88 @@
+;;; Globals safe code can change: lent for a scope, with exclusivity checked when
+;;; the scope is entered.
+(module safe.global)
+(import "coil.primitive" :as primitive)
+(import "safe.core" :use [unsafe lend lend-mut])
+
+;;; A global's storage. `value` holds a value once `ready`.
+(defstruct Cell [T] [(readers i64) (writer bool) (ready bool) (value T)])
+
+;;; A global of type T, made by `defglobal`. Plain data: it names the storage.
+(defstruct Global [T] [(cell (ptr (Cell T)))])
+
+;;; The global, lent shared for as long as this lives.
+(defstruct Shared [T] [(cell (ptr (Cell T)))])
+
+;;; The global, lent exclusively for as long as this lives.
+(defstruct Exclusive [T] [(cell (ptr (Cell T)))])
+
+(defn ready? [T] [(g (Global T))] (-> bool)
+  (unsafe (load (field (.cell g) ready))))
+
+(defn fill! [T] [(g (Global T)) (value T)] (-> void)
+  (unsafe
+    (store! (field (.cell g) value) value)
+    (store! (field (.cell g) ready) true)
+    0))
+
+;;; Lend G shared. Stops the program if it is lent exclusively.
+(defn share [T] [(g (Global T))] (-> (Shared T))
+  (unsafe
+    (when (load (field (.cell g) writer))
+      (panic "safe: a global was read while it is lent exclusively"))
+    (store! (field (.cell g) readers) (+ (load (field (.cell g) readers)) 1))
+    (Shared :cell (.cell g))))
+
+;;; Lend G exclusively. Stops the program if it is lent at all.
+(defn claim [T] [(g (Global T))] (-> (Exclusive T))
+  (unsafe
+    (when (or (load (field (.cell g) writer)) (> (load (field (.cell g) readers)) 0))
+      (panic "safe: a global was lent exclusively while it is lent"))
+    (store! (field (.cell g) writer) true)
+    (Exclusive :cell (.cell g))))
+
+(impl [T] (Shared T)
+  (get [(lent (ref (Shared T)))] (-> (ref T))
+    (unsafe (lend (field (load (field lent cell)) value)))))
+
+(impl [T] (Exclusive T)
+  (get-mut [(lent (mut (Exclusive T)))] (-> (mut T))
+    (unsafe (lend-mut (field (load (field lent cell)) value)))))
+
+(impl [T] Drop (Shared T)
+  (drop [(self (mut (Shared T)))] (-> void)
+    (unsafe
+      (let [cell (load (field self cell))]
+        (store! (field cell readers) (- (load (field cell readers)) 1))
+        0))))
+
+(impl [T] Drop (Exclusive T)
+  (drop [(self (mut (Exclusive T)))] (-> void)
+    (unsafe
+      (store! (field (load (field self cell)) writer) false)
+      0)))
+
+;;; `(defglobal NAME TYPE INIT)`: a global NAME of TYPE. INIT is evaluated the
+;;; first time the global is used. `(NAME)` is the global, for `with-ref` and
+;;; `with-mut`.
+(defn defglobal [(name Code) (type Code) (init Code)] (-> Code)
+  (let [cell (primitive/fresh-identifier "cell")]
+    `(do (def ~cell (primitive/alloc-static (Cell ~type) (primitive/zeroed (Cell ~type))))
+         (defn ~name [] (-> (Global ~type))
+           (let [global (Global :cell ~cell)]
+             (unless (ready? global) (fill! global ~init))
+             global)))))
+
+;;; `(with-ref GLOBAL NAME BODY…)`: NAME is a shared reference to the global's
+;;; value for BODY. It cannot leave BODY.
+(defn with-ref [(global Code) (name Code) & (body Code)] (-> Code)
+  `(let [lent (share ~global)
+         ~name (Shared::get lent)]
+     ~@body))
+
+;;; `(with-mut GLOBAL NAME BODY…)`: NAME is an exclusive reference to the global's
+;;; value for BODY. It cannot leave BODY.
+(defn with-mut [(global Code) (name Code) & (body Code)] (-> Code)
+  `(let [(mut lent) (claim ~global)
+         ~name (Exclusive::get-mut (mut lent))]
+     ~@body))

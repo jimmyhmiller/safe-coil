@@ -1,0 +1,89 @@
+;;; A collection that owns its elements and hands out handles to them.
+(module safe.pool)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "safe.core" :use [unsafe lend lend-mut])
+
+;;; The name of one element of a `(Pool T)`. A handle is plain data: it can be
+;;; copied and stored, and it keeps nothing alive. Using one whose element has
+;;; been removed stops the program.
+(defstruct Handle [T] [(slot i64) (generation i64)])
+
+;;; One element's storage. `value` holds a value only while `full`.
+(defstruct Slot [T] [(generation i64) (full bool) (value T)])
+
+;;; A collection of T that owns its elements. They are freed with the pool.
+(defstruct Pool [T] [(slots (slice (Slot T))) (used i64)])
+
+(defn slot-at [T] [(slots (slice (Slot T))) (i i64)] (-> (ptr (Slot T)))
+  (unsafe (primitive/index (data slots) i)))
+
+(defn room [T] [(count i64)] (-> (slice (Slot T)))
+  (unsafe
+    (match (alloc/alloc [(Slot T)] (alloc/malloc-allocator) count)
+      (Some [memory] memory)
+      (None [] (panic "safe: out of memory")))))
+
+;;; The live slot H names in POOL. A handle to a removed element stops the program.
+(defn live [T] [(pool (ref (Pool T))) (h (Handle T))] (-> (ptr (Slot T)))
+  (unsafe
+    (when (or (< (.slot h) 0) (>= (.slot h) (.used pool)))
+      (panic "safe: a handle was used with a pool it does not belong to"))
+    (let [slot (slot-at (.slots pool) (.slot h))]
+      (unless (and (load (field slot full)) (= (load (field slot generation)) (.generation h)))
+        (panic "safe: a handle was used after its element was removed"))
+      slot)))
+
+(impl [T] (Pool T)
+  ;;; An empty pool.
+  (new [] (-> (Pool T))
+    (Pool :slots (room [T] 4) :used 0))
+
+  ;;; Put VALUE in the pool. The handle names it until it is removed.
+  (insert! [(pool (mut (Pool T))) (value T)] (-> (Handle T))
+    (unsafe
+      (let [(mut at) -1]
+        (for i (range 0 (.used pool))
+          (when (and (< at 0) (not (load (field (slot-at (.slots pool) i) full))))
+            (set! at i)))
+        (when (< at 0)
+          (when (= (.used pool) (len (.slots pool)))
+            (let [bigger (room [T] (* 2 (len (.slots pool))))]
+              (for i (range 0 (.used pool))
+                (store! (slot-at bigger i) (take! [(Slot T)] (slot-at (.slots pool) i))))
+              (alloc/free (alloc/malloc-allocator) (.slots pool))
+              (set! (.slots pool) bigger)))
+          (set! at (.used pool))
+          (store! (field (slot-at (.slots pool) at) generation) 0)
+          (set! (.used pool) (+ (.used pool) 1)))
+        (let [slot (slot-at (.slots pool) at)]
+          (store! (field slot value) value)
+          (store! (field slot full) true)
+          (Handle :slot at :generation (load (field slot generation)))))))
+
+  ;;; Take the element H names out of the pool. H and its copies are stale after.
+  (remove! [(pool (mut (Pool T))) (h (Handle T))] (-> T)
+    (unsafe
+      (let [slot (live pool h)
+            value (take! [T] (field slot value))]
+        (store! (field slot full) false)
+        (store! (field slot generation) (+ (load (field slot generation)) 1))
+        value)))
+
+  ;;; The element H names, lent for as long as the pool is.
+  (at [(pool (ref (Pool T))) (h (Handle T))] (-> (ref T))
+    (unsafe (lend (field (live pool h) value))))
+
+  ;;; The element H names, lent to be changed for as long as the pool is.
+  (at-mut [(pool (mut (Pool T))) (h (Handle T))] (-> (mut T))
+    (unsafe (lend-mut (field (live pool h) value)))))
+
+(impl [T] Drop (Pool T)
+  (drop [(self (mut (Pool T)))] (-> void)
+    (unsafe
+      (for i (range 0 (.used self))
+        (let [slot (slot-at (.slots self) i)]
+          (when (load (field slot full))
+            (let [value (take! [T] (field slot value))] 0))))
+      (alloc/free (alloc/malloc-allocator) (.slots self))
+      0)))

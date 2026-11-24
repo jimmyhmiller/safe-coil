@@ -1,0 +1,13 @@
+(module case.ok-global)
+(import "safe.global" :use [defglobal with-ref with-mut Global Cell])
+(import "safe.box" :use [Box])
+(import "coil.primitive" :as primitive)
+(defstruct Pt [(x i64) (y i64)])
+(defglobal origin Pt (Pt :x 1 :y 2))
+(defglobal boxed (Box i64) (Box::new 40))
+(defn main [] (-> i64)
+  (with-mut (origin) o (set! (.x o) 5))
+  (with-mut (boxed) b (set! (mut (Box::get-mut (mut b))) 41))
+  (with-ref (origin) o
+    (with-ref (boxed) b
+      (+ (.x o) (primitive/load (Box::get b))))))

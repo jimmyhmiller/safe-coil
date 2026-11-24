@@ -684,9 +684,13 @@
         content (pointee t)
         q (place-of (mut cx) arg)]
     (cond (head-is? arg `mut) (eval (mut cx) arg (WExcl))
+          ; a raw pointer passed for a reference parameter becomes a reference
+          (raw-type? t)
+            (do (when (ref-type? param)
+                  (need-unsafe! cx arg "a reference made from a raw pointer"))
+                (eval (mut cx) arg (WValue)))
           (head-is? param `ref) (eval (mut cx) arg (WShared))
           (raw-type? param) (eval (mut cx) arg (WValue))
-          (raw-type? t) (eval (mut cx) arg (WValue))
           (and (primitive/code-sym? t) (scalar-name? t)) (eval (mut cx) arg (WValue))
           (primitive/code-eq param `unknown)
             ; taken by value or lent: an owner is checked as moved and as lent
@@ -815,8 +819,11 @@
                     (fresh)))
               (fresh))
         (primitive/code-vector? e)
-          (do (need-unsafe! cx e "an array")
-              (eval-parts (mut cx) e 0))
+          ; a vector the compiler gave no type is a list of type arguments
+          (if (primitive/code-eq (type-of e) `unknown-type)
+              (fresh)
+              (do (need-unsafe! cx e "an array")
+                  (eval-parts (mut cx) e 0)))
         (not (primitive/code-list? e)) (fresh)
         (= (len e) 0) (fresh)
         (expanded-by? e `(safe.core.unsafe))

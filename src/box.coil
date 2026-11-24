@@ -1,0 +1,43 @@
+;;; An owner of one value on the heap.
+(module safe.box)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "safe.core" :use [unsafe lend lend-mut])
+
+;;; A value of type T on the heap, freed when its box leaves scope. A box cannot
+;;; be copied: naming one moves it.
+(defstruct Box [T] [(at (ptr T))])
+
+(impl [T] (Box T)
+  ;;; A box holding VALUE.
+  (new [(value T)] (-> (Box T))
+    (unsafe
+      (let [at (alloc/unwrap-ptr (alloc/create [T] (alloc/malloc-allocator)))]
+        (store! at value)
+        (Box :at at))))
+
+  ;;; The value, lent for as long as the box is.
+  (get [(box (ref (Box T)))] (-> (ref T))
+    (unsafe (lend (load (field box at)))))
+
+  ;;; The value, lent to be changed for as long as the box is.
+  (get-mut [(box (mut (Box T)))] (-> (mut T))
+    (unsafe (lend-mut (load (field box at)))))
+
+  ;;; The value, taken out of the box, which is freed.
+  (into [(box (Box T))] (-> T)
+    (unsafe
+      (let [held (manually-drop box)
+            at (load (field (field held value) at))
+            value (take! [T] at)]
+        (alloc/destroy (alloc/malloc-allocator) at)
+        (forget held)
+        value))))
+
+(impl [T] Drop (Box T)
+  (drop [(self (mut (Box T)))] (-> void)
+    (unsafe
+      (let [at (load (field self at))]
+        (let [value (take! [T] at)] 0)
+        (alloc/destroy (alloc/malloc-allocator) at)
+        0))))
