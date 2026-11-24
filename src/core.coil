@@ -1,0 +1,8 @@
+;;; What safe Coil code is written with besides the language itself.
+(module safe.core)
+
+;;; `(unsafe FORM…)`: the forms may follow raw memory. Every other rule still
+;;; applies inside. The checker recognizes the `do` this expands to by the macro
+;;; that produced it.
+(defn unsafe [(first Code) & (rest Code)] (-> Code)
+  `(do ~first ~@rest))
