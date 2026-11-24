@@ -1,0 +1,69 @@
+;;; A growable list that owns its elements.
+(module safe.vec)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "safe.core" :use [unsafe lend lend-mut])
+
+;;; A list of T. It owns its elements: they are freed with it. An index out of
+;;; range stops the program.
+(defstruct Vec [T] [(items (slice T)) (count i64)])
+
+(defn room [T] [(count i64)] (-> (slice T))
+  (unsafe
+    (match (alloc/alloc [T] (alloc/malloc-allocator) count)
+      (Some [memory] memory)
+      (None [] (panic "safe: out of memory")))))
+
+;;; Where element I of V is. An index out of range stops the program.
+(defn slot [T] [(v (ref (Vec T))) (i i64)] (-> (ptr T))
+  (unsafe
+    (when (or (< i 0) (>= i (.count v)))
+      (panic "safe: index {} is out of range for a Vec of {}" i (.count v)))
+    (primitive/index (data (.items v)) i)))
+
+(impl [T] (Vec T)
+  ;;; An empty list.
+  (new [] (-> (Vec T))
+    (unsafe (Vec :items (room [T] 4) :count 0)))
+
+  ;;; How many elements it holds.
+  (len [(v (ref (Vec T)))] (-> i64)
+    (.count v))
+
+  ;;; Add VALUE at the end.
+  (push! [(v (mut (Vec T))) (value T)] (-> void)
+    (unsafe
+      (when (= (.count v) (len (.items v)))
+        (let [bigger (room [T] (* 2 (len (.items v))))]
+          (for i (range 0 (.count v))
+            (store! (primitive/index (data bigger) i)
+                    (take! [T] (primitive/index (data (.items v)) i))))
+          (alloc/free (alloc/malloc-allocator) (.items v))
+          (set! (.items v) bigger)))
+      (store! (primitive/index (data (.items v)) (.count v)) value)
+      (set! (.count v) (+ (.count v) 1))
+      0))
+
+  ;;; Take the last element off, or None when there is none.
+  (pop! [(v (mut (Vec T)))] (-> (Option T))
+    (unsafe
+      (if (= (.count v) 0)
+          (None [T])
+          (do (set! (.count v) (- (.count v) 1))
+              (Some (take! [T] (primitive/index (data (.items v)) (.count v))))))))
+
+  ;;; Element I, lent for as long as the list is.
+  (at [(v (ref (Vec T))) (i i64)] (-> (ref T))
+    (unsafe (lend (slot v i))))
+
+  ;;; Element I, lent to be changed for as long as the list is.
+  (at-mut [(v (mut (Vec T))) (i i64)] (-> (mut T))
+    (unsafe (lend-mut (slot v i)))))
+
+(impl [T] Drop (Vec T)
+  (drop [(self (mut (Vec T)))] (-> void)
+    (unsafe
+      (for i (range 0 (.count self))
+        (let [value (take! [T] (primitive/index (data (.items self)) i))] 0))
+      (alloc/free (alloc/malloc-allocator) (.items self))
+      0)))

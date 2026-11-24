@@ -1,0 +1,9 @@
+(module case.bad-vec-push-while-lent)
+(import "coil.primitive" :as primitive)
+(import "safe.vec" :use [Vec])
+(defn main [] (-> i64)
+  (let [(mut v) (Vec::new [i64])]
+    (Vec::push! (mut v) 1)
+    (let [first (Vec::at v 0)]
+      (Vec::push! (mut v) 2)
+      (primitive/load first))))

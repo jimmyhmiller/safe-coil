@@ -1,0 +1,17 @@
+(module case.ok-vec)
+(import "coil.primitive" :as primitive)
+(import "safe.vec" :use [Vec])
+(import "safe.box" :use [Box])
+(defn total [(v (ref (Vec i64)))] (-> i64)
+  (let [(mut sum) 0]
+    (for i (range 0 (Vec::len v)) (set! sum (+ sum (primitive/load (Vec::at v i)))))
+    sum))
+(defn main [] (-> i64)
+  (let [(mut v) (Vec::new [i64])
+        (mut boxes) (Vec::new [(Box i64)])]
+    (for i (range 0 20) (Vec::push! (mut v) i) (Vec::push! (mut boxes) (Box::new i)))
+    (set! (mut (Vec::at-mut (mut v) 0)) 10)
+    (println "{} {}" (total v) (primitive/load (Box::get (Vec::at boxes 19))))
+    (match (Vec::pop! (mut boxes))
+      (Some [b] (Box::into b))
+      (None [] 0))))

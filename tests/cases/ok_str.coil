@@ -1,0 +1,17 @@
+(module case.ok-str)
+(import "safe.str" :use [Str])
+(import "safe.vec" :use [Vec])
+(defstruct Person [(name Str) (age i64)])
+(defn describe [(p (ref Person))] (-> Str)
+  (let [(mut out) (Str::copy (field p name))]
+    (Str::push-text! (mut out) " is ")
+    (Str::push-int! (mut out) (.age p))
+    out))
+(defn main [] (-> i64)
+  (let [(mut people) (Vec::new [Person])]
+    (Vec::push! (mut people) (Person :name (Str::from "Ada") :age 36))
+    (Vec::push! (mut people) (Person :name (Str::from "Grace") :age -1))
+    (for i (range 0 (Vec::len people))
+      (let [line (describe (Vec::at people i))]
+        (println "{} ({} bytes)" line (Str::len line))))
+    (if (Str::eq? (field (Vec::at people 0) name) (Str::from "Ada")) 7 0)))
