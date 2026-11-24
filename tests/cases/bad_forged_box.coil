@@ -1,0 +1,6 @@
+(module case.bad-forged-box)
+(import "coil.primitive" :as primitive)
+(import "safe.box" :use [Box])
+(defn main [] (-> i64)
+  (let [b (Box :at (primitive/cast (ptr i64) 16))]
+    (primitive/load (Box::get b))))

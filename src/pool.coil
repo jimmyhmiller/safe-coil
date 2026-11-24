@@ -37,7 +37,7 @@
 (impl [T] (Pool T)
   ;;; An empty pool.
   (new [] (-> (Pool T))
-    (Pool :slots (room [T] 4) :used 0))
+    (unsafe (Pool :slots (room [T] 4) :used 0)))
 
   ;;; Put VALUE in the pool. The handle names it until it is removed.
   (insert! [(pool (mut (Pool T))) (value T)] (-> (Handle T))

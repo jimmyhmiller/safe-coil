@@ -216,44 +216,70 @@
 (defn owner-type? [(cx (ref Cx)) (t Code)] (-> bool)
   (not (copy-type? cx t 0)))
 
-(defn raw-parts? [(cx (ref Cx)) (t Code) (depth i64)] (-> bool)
+;;; Is the struct or sum type T declared in a module being checked?
+(defn checked-type? [(cx (ref Cx)) (t Code)] (-> bool)
+  (let [name (if (primitive/code-list? t) (get t 0) t)]
+    (and (primitive/code-sym? name)
+         (let [text (meta/source name)
+               (mut dot) -1]
+           (for [i 0 (len text)]
+             (when (= (get text i) #\.) (set! dot i)))
+           (and (> dot 0) (name-in? (primitive/code-symbol (substr text 0 dot)) (.user cx)))))))
+
+(defn raw-parts? [(cx (ref Cx)) (t Code) (depth i64) (inside bool)] (-> bool)
   (match (primitive/code-type-shape t)
     (primitive/StructShape []
       (block :any
         (for [i 0 (primitive/code-field-count t)]
-          (when (raw-carrying? cx (primitive/code-field-type t i) (+ depth 1))
+          (when (raw-in? cx (primitive/code-field-type t i) (+ depth 1) inside)
             (return-from :any true)))
         false))
     (primitive/SumShape []
       (block :any
         (for [v 0 (primitive/code-variant-count t)]
           (for [i 0 (primitive/code-variant-fields t v)]
-            (when (raw-carrying? cx (primitive/code-variant-field-type t v i) (+ depth 1))
+            (when (raw-in? cx (primitive/code-variant-field-type t v i) (+ depth 1) inside)
               (return-from :any true))))
         false))
     (primitive/UnknownShape [] true)))
 
 ;;; Can a value of T hold raw memory, at any depth? Unknown types can, and an
-;;; array counts: the library reads one without checking the index.
-(defn raw-carrying? [(cx (ref Cx)) (t Code) (depth i64)] (-> bool)
+;;; array counts: the library reads one without checking the index. Unless
+;;; INSIDE, a struct or sum of a checked module does not count: safe code cannot
+;;; put raw memory in one (see `raw-field?`), so what it holds is what its
+;;; module's `unsafe` code put there.
+(defn raw-in? [(cx (ref Cx)) (t Code) (depth i64) (inside bool)] (-> bool)
   (cond (> depth 16) true
         (primitive/code-sym? t)
           (cond (scalar-name? t) false
                 (name-in? t (.tparams cx)) false
-                :else (raw-parts? cx t depth))
+                (and (not inside) (checked-type? cx t)) false
+                :else (raw-parts? cx t depth inside))
         (raw-type? t) true
-        (ref-type? t) (raw-carrying? cx (get t 1) (+ depth 1))
+        (ref-type? t) (raw-in? cx (get t 1) (+ depth 1) inside)
         ; an array is indexed without a bounds check
         (head-is? t `array) true
         (not (primitive/code-list? t)) true
-        :else (raw-parts? cx t depth)))
+        (and (not inside) (checked-type? cx t)) false
+        :else (raw-parts? cx t depth inside)))
 
-;;; Can a value of any of the TYPES hold raw memory?
-(defn any-raw-carrying? [(cx (ref Cx)) (types Code)] (-> bool)
-  (block :any
-    (for t (iter types)
-      (when (raw-carrying? cx t 0) (return-from :any true)))
-    false))
+(defn raw-carrying? [(cx (ref Cx)) (t Code) (depth i64)] (-> bool)
+  (raw-in? cx t depth false))
+
+;;; Is T itself raw memory? A field of such a type is filled and changed only
+;;; inside `unsafe`, so that a type's own code decides what its pointers are.
+(defn raw-field? [(t Code)] (-> bool)
+  (or (raw-type? t) (head-is? t `array)))
+
+;;; Has the struct type T a field that is itself raw memory?
+(defn struct-holds-raw? [(t Code)] (-> bool)
+  (match (primitive/code-type-shape t)
+    (primitive/StructShape []
+      (block :any
+        (for [i 0 (primitive/code-field-count t)]
+          (when (raw-field? (primitive/code-field-type t i)) (return-from :any true)))
+        false))
+    (_ false)))
 
 ;;; A parameter type of a library function, with its own type parameters made
 ;;; harmless: a bare name that is no number and no struct or sum is one of them.
@@ -570,6 +596,16 @@
       (_ 0))
     `unknown-type))
 
+;;; Has the variant the form E names, of the sum type SUM, a field that is itself
+;;; raw memory?
+(defn variant-holds-raw? [(sum Code) (e Code)] (-> bool)
+  (block :any
+    (for [k 0 64]
+      (let [t (payload-type sum e k)]
+        (when (primitive/code-eq t `unknown-type) (return-from :any false))
+        (when (raw-field? t) (return-from :any true))))
+    false))
+
 ;;; A match on a temporary consumes it, and each arm owns what it binds. A match
 ;;; on a place copies out the plain parts of the payload and lends the arm the
 ;;; parts that own something, where they lie: the place stays lent to those
@@ -692,6 +728,8 @@
 
 (defn eval-mut [(cx (mut Cx)) (e Code)] (-> Res)
   (let [q (place-of (mut cx) (get e 1))]
+    (when (and (field-form? (get e 1)) (raw-field? (pointee (type-of (get e 1)))))
+      (need-unsafe! cx e "an exclusive reference to a field that is raw memory"))
     (if (= (len q) 1)
         (use-place (mut cx) e (get q 0) (WExcl))
         (eval (mut cx) (get e 1) (WExcl)))))
@@ -715,6 +753,8 @@
             (eval (mut cx) target (WValue))
             0)
         (let [q (place-of (mut cx) target)]
+          (when (and (field-form? target) (raw-field? (pointee (type-of target))))
+            (need-unsafe! cx e "a store to a field that is raw memory"))
           (if (= (len q) 1)
               (check-write! cx e (get q 0) "written")
               (do (eval (mut cx) target (WExcl)) 0))))
@@ -761,6 +801,19 @@
         (_ `(unknown))))
     (_ `(unknown))))
 
+;;; The result type the function or method declares, or `unknown`.
+(defn callee-result [(kind primitive/DeclKind) (name Code) (signature Code)] (-> Code)
+  (match kind
+    (primitive/MethodDecl []
+      (if (and (primitive/code-list? signature) (> (len signature) 1)) (get signature 1) `unknown))
+    (primitive/FunctionDecl []
+      (match (meta/declaration name)
+        (primitive/Answer [form]
+          (let [arrow (arrow-index form)]
+            (if (and (> arrow 0) (> (len (get form arrow)) 1)) (get (get form arrow) 1) `unknown)))
+        (_ `unknown)))
+    (_ `unknown)))
+
 (defn checked-module? [(cx (ref Cx)) (module Code)] (-> bool)
   (name-in? module (.user cx)))
 
@@ -770,16 +823,44 @@
 
 ;;; One argument of a call, for a parameter of type PARAM (`unknown` when the
 ;;; declaration could not be read).
-(defn eval-arg [(cx (mut Cx)) (arg Code) (param Code)] (-> Res)
+;;; What the type parameter NAME stands for, as a one-element list, found by
+;;; laying the declared type PATTERN over the type ACTUAL; `()` if it does not
+;;; appear or the two differ in shape.
+(defn bound-to [(pattern Code) (actual Code) (name Code)] (-> Code)
+  (cond (primitive/code-sym? pattern)
+          (if (primitive/code-eq pattern name) `(~actual) `())
+        (and (primitive/code-list? pattern) (primitive/code-list? actual) (= (len pattern) (len actual)))
+          (block :found
+            (for [i 0 (len pattern)]
+              (let [b (bound-to (get pattern i) (get actual i) name)]
+                (when (= (len b) 1) (return-from :found b))))
+            `())
+        :else `()))
+
+;;; A raw pointer of type POINTER is passed for the parameter PARAM, `(ref T)` with
+;;; T a type parameter of the callee. Coil either lends the name that holds the
+;;; pointer (T is the pointer type) or makes a reference to what it points at.
+;;; The call's own type says which, when the declared RESULT mentions T.
+(defn lends-the-name? [(param Code) (pointer Code) (result Code) (call Code)] (-> bool)
+  (let [t (pointee param)]
+    (and (primitive/code-sym? t)
+         (let [b (bound-to result (type-of call) t)]
+           (and (= (len b) 1) (primitive/code-eq (get b 0) pointer))))))
+
+(defn eval-arg [(cx (mut Cx)) (arg Code) (param Code) (result Code) (call Code)] (-> Res)
   (let [t (type-of arg)
         content (pointee t)
         q (place-of (mut cx) arg)]
     (cond (head-is? arg `mut) (eval (mut cx) arg (WExcl))
           ; a raw pointer passed for a reference parameter becomes a reference
           (raw-type? content)
-            (do (when (and (ref-type? param) (not (raw-type? (pointee param))))
-                  (need-unsafe! cx arg "a reference made from a raw pointer"))
-                (eval (mut cx) arg (WValue)))
+            (cond (not (ref-type? param)) (eval (mut cx) arg (WValue))
+                  ; the parameter is a reference to a raw pointer: the name is lent
+                  (or (raw-type? (pointee param)) (lends-the-name? param content result call))
+                    (eval (mut cx) arg (WShared))
+                  :else
+                    (do (need-unsafe! cx arg "a reference made from a raw pointer")
+                        (eval (mut cx) arg (WValue))))
           (head-is? param `ref) (eval (mut cx) arg (WShared))
           (raw-type? param) (eval (mut cx) arg (WValue))
           (and (primitive/code-sym? t) (scalar-name? t)) (eval (mut cx) arg (WValue))
@@ -819,7 +900,8 @@
         (let [arg (get e i)]
           (unless (or (primitive/code-keyword? arg) (type-arguments? arg))
             (guard-raw-flow! cx e arg)
-            (let [r (eval-arg (mut cx) arg (if known (get params (- i 1 skipped)) `unknown))
+            (let [r (eval-arg (mut cx) arg (if known (get params (- i 1 skipped)) `unknown)
+                              (callee-result kind name signature) e)
                   carried (.loans (use-value arg r (WShared)))]
               (hold! (mut cx) -1 carried)
               ; The result borrows from what was passed by reference. Plain data
@@ -863,13 +945,17 @@
     (primitive/Declared [module kind name signature]
       (match kind
         (primitive/StructDecl []
-          (do (for [i 1 (len e)]
+          (do (when (struct-holds-raw? (pointee (type-of e)))
+                (need-unsafe! cx e "building a struct that holds raw memory"))
+              (for [i 1 (len e)]
                 (unless (primitive/code-keyword? (get e i))
                   (guard-raw-flow! cx e (get e i))
                   (eval (mut cx) (get e i) (WValue))))
               (fresh)))
         (primitive/VariantDecl []
-          (do (for [i 1 (len e)]
+          (do (when (variant-holds-raw? (pointee (type-of e)) e)
+                (need-unsafe! cx e "building a variant that holds raw memory"))
+              (for [i 1 (len e)]
                 (unless (primitive/code-keyword? (get e i))
                   (guard-raw-flow! cx e (get e i))
                   (eval (mut cx) (get e i) (WValue))))
@@ -889,8 +975,9 @@
         (cond (arithmetic? head) (eval-parts (mut cx) e 1)
               (primitive-named? head `(sizeof alignof offsetof)) (fresh)
               (primitive-named? head `(zeroed))
-                (do (unless (copy-type? cx (pointee (type-of e)) 0)
-                      (need-unsafe! cx e "a zeroed owner"))
+                (do (unless (and (copy-type? cx (pointee (type-of e)) 0)
+                                 (not (raw-in? cx (pointee (type-of e)) 0 true)))
+                      (need-unsafe! cx e "a zeroed owner or raw pointer"))
                     (fresh))
               :else
                 (do (need-unsafe! cx e (text3 "`" (meta/source head) "`, which the rules do not cover,"))

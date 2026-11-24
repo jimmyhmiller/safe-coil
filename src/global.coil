@@ -69,7 +69,7 @@
   (let [cell (primitive/fresh-identifier "cell")]
     `(do (def ~cell (primitive/alloc-static (Cell ~type) (primitive/zeroed (Cell ~type))))
          (defn ~name [] (-> (Global ~type))
-           (let [global (Global :cell ~cell)]
+           (let [global (unsafe (Global :cell ~cell))]
              (unless (ready? global) (fill! global ~init))
              global)))))
 
