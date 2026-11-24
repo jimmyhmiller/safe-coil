@@ -1,0 +1,13 @@
+(module case.ok-match-lends-payload)
+(import "coil.primitive" :as primitive)
+(import "safe.box" :use [Box])
+(import "safe.core" :use [move])
+(defsum Two (A [(b (Box i64)) (n i64)]) (B [(v i64)]))
+(defn inside [(t (ref Two))] (-> i64)
+  (match t (A [b n] (+ n (primitive/load (Box::get b)))) (B [v] v)))
+(defn main [] (-> i64)
+  (let [(mut t) (A (Box::new 3) 4)]
+    (match t
+      (A [b n] (do (set! (mut (Box::get-mut (mut b))) 7) 0))
+      (B [v] v))
+    (+ (inside t) (match (move t) (A [b n] (Box::into b)) (B [v] v)))))

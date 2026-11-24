@@ -22,3 +22,13 @@
           old (take! [T] raw)]
       (store! raw value)
       old)))
+
+;;; PLACE, lent: a reference to it as a value, for a `let` or a result.
+(defn borrow [T] [(place (ref T))] (-> (ref T)) place)
+
+;;; PLACE, lent exclusively: `(borrow-mut (mut place))`.
+(defn borrow-mut [T] [(place (mut T))] (-> (mut T)) place)
+
+;;; VALUE, as a temporary. `(match (move x) …)` consumes x, so each arm owns what
+;;; it binds; a match on a name lends an owned payload to its arm instead.
+(defn move [T] [(value T)] (-> T) value)
