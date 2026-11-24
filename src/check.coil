@@ -882,6 +882,8 @@
         (mut positional) true
         ; explicit type arguments, `(f [T] x)`, come before the first argument
         (mut skipped) 0
+        ; and how many of them come before the argument being looked at
+        (mut before) 0
         loans (len (.loans cx))
         (mut all) (no-loans)
         external (not (checked-module? cx module))]
@@ -898,16 +900,17 @@
             (do (fail! e (text3 "safe: cannot read the declaration of `" (meta/source name) "`; calling it is allowed only inside (unsafe …)")) 0)))
       (for [i 1 (len e)]
         (let [arg (get e i)]
+          (when (type-arguments? arg) (set! before (+ before 1)))
           (unless (or (primitive/code-keyword? arg) (type-arguments? arg))
             (guard-raw-flow! cx e arg)
-            (let [r (eval-arg (mut cx) arg (if known (get params (- i 1 skipped)) `unknown)
+            (let [r (eval-arg (mut cx) arg (if known (get params (- i 1 before)) `unknown)
                               (callee-result kind name signature) e)
                   carried (.loans (use-value arg r (WShared)))]
               (hold! (mut cx) -1 carried)
               ; The result borrows from what was passed by reference. Plain data
               ; taken by value is the callee's own for the call: a checked callee
               ; cannot return a reference to it.
-              (when (or (not known) (head-is? arg `mut) (ref-type? (get params (- i 1 skipped))))
+              (when (or (not known) (head-is? arg `mut) (ref-type? (get params (- i 1 before))))
                 (set! all (union all carried))))))))
     (drop-loans-to! (mut cx) loans)
     ; a reference that is thrown away still may not outlive what it refers to
@@ -1006,6 +1009,8 @@
           (and (= (len e) 2) (form-is? e `load)) (eval-load (mut cx) e want)
           (and (= (len e) 3) (form-is? e `cast)) (eval-cast (mut cx) e)
           (or (head-is? e `quote) (head-is? e `quasiquote)) (fresh)
+          ; a function's address is plain data; calling through it needs `unsafe`
+          (form-is? e `fnptr-of) (fresh)
           ; a function literal captures nothing: its body is a function of its own,
           ; and its value is a function pointer, which only `unsafe` code can call
           (or (head-is? e `fn*) (head-is? e `fn))

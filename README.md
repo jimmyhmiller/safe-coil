@@ -113,10 +113,9 @@ run fails if the checker accepts anything the model refuses.
 checker at a time and requires `diff.py` to find a program the weakened checker
 wrongly accepts.
 
-On the model's 99 cases and 4000 random programs (seed 7), 3112 can be written
-as Coil. The compiler refuses 821 of them itself. Of the other 2291, the checker
-and the model agree on 2274 (1715 accepted, 559 refused), the checker refuses 14
-the model accepts, and it accepts none the model refuses. Three more are the
+On the model's 99 cases and 4000 random programs (seed 7), 3357 can be written
+as Coil. The compiler refuses 1025 of them itself. On the other 2332 the checker
+and the model agree on every one: 1748 accepted, 581 refused, and 3 that are the
 exclusive-reference case below. All nine weakenings are caught, eight of them by
 a hand-written case.
 

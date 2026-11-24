@@ -201,9 +201,11 @@
                                             ~@witness-params] (-> i64)
                                            0))]
       `(let [~@binders]
-         (~witness (primitive/fnptr-of ~@callee) ~@witness-args)
+         ; lends each name once to check its type; a name may hold a raw pointer
+         (unsafe (~witness (primitive/fnptr-of ~@callee) ~@witness-args))
          (let [running (start (primitive/fnptr-of ~worker) ~@addresses)]
            (~@second-callee ~@direct)
            (finish running)
-           ~@forgotten
+           ; the thread took these values; this one must not drop them again
+           (unsafe ~@forgotten 0)
            0)))))
