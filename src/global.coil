@@ -2,10 +2,14 @@
 ;;; the scope is entered.
 (module safe.global)
 (import "coil.primitive" :as primitive)
+(import "coil.atomic" :as atomic)
 (import "safe.core" :use [unsafe lend lend-mut])
 
-;;; A global's storage. `value` holds a value once `ready`.
-(defstruct Cell [T] [(readers i64) (writer bool) (ready bool) (value T)])
+;;; A global's storage. `borrowers` is how it is lent: 0 not at all, N > 0 to N
+;;; shared borrowers, -1 exclusively. `filled` is 0 before the first use, 1 while
+;;; the first user computes the value, 2 once `value` holds it. Both are changed
+;;; atomically: two threads may use one global.
+(defstruct Cell [T] [(borrowers i64) (filled i64) (value T)])
 
 ;;; A global of type T, made by `defglobal`. Plain data: it names the storage.
 (defstruct Global [T] [(cell (ptr (Cell T)))])
@@ -16,29 +20,42 @@
 ;;; The global, lent exclusively for as long as this lives.
 (defstruct Exclusive [T] [(cell (ptr (Cell T)))])
 
-(defn ready? [T] [(g (Global T))] (-> bool)
-  (unsafe (load (field (.cell g) ready))))
+;;; Is it this caller's job to compute G's first value? True for exactly one
+;;; caller, which must then `fill!` it. Any other waits until that is done.
+(defn first-use? [T] [(g (Global T))] (-> bool)
+  (unsafe
+    (let [filled (field (.cell g) filled)]
+      (if (= (atomic/cas filled 0 1) 0)
+          true
+          (do (while (!= (atomic/read filled) 2) 0)
+              false)))))
 
 (defn fill! [T] [(g (Global T)) (value T)] (-> void)
   (unsafe
     (store! (field (.cell g) value) value)
-    (store! (field (.cell g) ready) true)
+    (atomic/store (field (.cell g) filled) 2)
     0))
 
 ;;; Lend G shared. Stops the program if it is lent exclusively.
 (defn share [T] [(g (Global T))] (-> (Shared T))
   (unsafe
-    (when (load (field (.cell g) writer))
-      (panic "safe: a global was read while it is lent exclusively"))
-    (store! (field (.cell g) readers) (+ (load (field (.cell g) readers)) 1))
-    (Shared :cell (.cell g))))
+    (let [borrowers (field (.cell g) borrowers)
+          (mut seen) (atomic/read borrowers)]
+      (while (block :retry
+               (when (< seen 0)
+                 (panic "safe: a global was read while it is lent exclusively"))
+               (let [was (atomic/cas borrowers seen (+ seen 1))]
+                 (if (= was seen)
+                     false
+                     (do (set! seen was) true))))
+        0)
+      (Shared :cell (.cell g)))))
 
 ;;; Lend G exclusively. Stops the program if it is lent at all.
 (defn claim [T] [(g (Global T))] (-> (Exclusive T))
   (unsafe
-    (when (or (load (field (.cell g) writer)) (> (load (field (.cell g) readers)) 0))
+    (when (!= (atomic/cas (field (.cell g) borrowers) 0 -1) 0)
       (panic "safe: a global was lent exclusively while it is lent"))
-    (store! (field (.cell g) writer) true)
     (Exclusive :cell (.cell g))))
 
 (impl [T] (Shared T)
@@ -52,14 +69,13 @@
 (impl [T] Drop (Shared T)
   (drop [(self (mut (Shared T)))] (-> void)
     (unsafe
-      (let [cell (load (field self cell))]
-        (store! (field cell readers) (- (load (field cell readers)) 1))
-        0))))
+      (atomic/sub (field (load (field self cell)) borrowers) 1)
+      0)))
 
 (impl [T] Drop (Exclusive T)
   (drop [(self (mut (Exclusive T)))] (-> void)
     (unsafe
-      (store! (field (load (field self cell)) writer) false)
+      (atomic/store (field (load (field self cell)) borrowers) 0)
       0)))
 
 ;;; `(defglobal NAME TYPE INIT)`: a global NAME of TYPE. INIT is evaluated the
@@ -70,7 +86,7 @@
     `(do (def ~cell (primitive/alloc-static (Cell ~type) (primitive/zeroed (Cell ~type))))
          (defn ~name [] (-> (Global ~type))
            (let [global (unsafe (Global :cell ~cell))]
-             (unless (ready? global) (fill! global ~init))
+             (when (first-use? global) (fill! global ~init))
              global)))))
 
 ;;; `(with-ref GLOBAL NAME BODY…)`: NAME is a shared reference to the global's

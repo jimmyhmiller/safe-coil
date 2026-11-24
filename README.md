@@ -48,6 +48,9 @@ adds the rest of the model:
 - **Match.** A `match` on a name lends the parts of the payload that own something
   to the arm, where they lie. The matched place stays lent to those names, so the
   variant cannot be replaced under them. `(match (move x) …)` consumes x instead.
+- **Raw fields.** A struct or variant with a field that is itself raw memory is
+  built only inside `unsafe`, and such a field is changed only there. So a type
+  like `Box` holds the pointer its own code put in it, never one safe code made up.
 - **Raw memory.** A raw pointer is plain data anywhere. It is followed only inside
   `(unsafe …)`: a load, a store, a field behind one, a reference made from one, a
   call of an `extern`, a call through a function pointer or a trait object.
@@ -71,10 +74,26 @@ operations are allowed.
 | `safe.box` | `(Box T)`, an owner of one heap value: `Box::new`, `get`, `get-mut`, `into` |
 | `safe.pool` | `(Pool T)`, a collection that owns its elements, and `(Handle T)`, plain data checked when it is used: `insert!`, `remove!`, `at`, `at-mut` |
 | `safe.global` | `defglobal`, `with-ref`, `with-mut`: a global lent for a scope, with exclusivity checked when the scope is entered |
-| `safe.par` | not built: a use of `par` is a compile error (see the file for why) |
+| `safe.vec` | `(Vec T)`, a growable list that owns its elements: `push!`, `pop!`, `len`, `at`, `at-mut`. An index out of range stops the program |
+| `safe.str` | `Str`, text that owns its bytes: `Str::from "…"`, `len`, `byte`, `push!`, `push-text!`, `push-int!`, `append!`, `eq?`, `copy`. It prints with `{}` |
+| `safe.par` | `(par (f a…) (g b…))`: two calls at once, on two threads |
 
-A stale handle and a global entered while it is already lent stop the program
-with a message. They are the two checks made at run time.
+A stale handle, an index out of range and a global entered while it is already
+lent stop the program with a message. They are the checks made at run time.
+
+`examples/calc.coil` is Coil's calculator example (a lexer, a recursive-descent
+parser into a boxed tree, an evaluator) in safe Coil, with no `unsafe` in it.
+
+### par
+
+`(par (fill (mut p) (borrow base) (Box::new 10) 2) (count-up (mut n) 1000))`
+runs the first call on a new thread and the second on this one, and returns when
+both have. An argument is written as the callee takes it: `(mut place)`,
+`(borrow place)`, or a value, which is moved or copied to its call. Every
+argument of both calls is bound to a name before either starts, so the checker
+sees their loans together, as the arguments of one call: nothing lent
+exclusively to one call can reach the other. A global's borrow count is atomic.
+The first call takes at most eight arguments.
 
 ## Testing
 
@@ -113,17 +132,12 @@ Found by the differential run:
 - **The compiler's move rule is stricter.** An `if` or `match` whose branches do
   not move the same owners is refused by the compiler; the model treats the owner
   as moved afterwards.
-- **A name holding a raw pointer cannot be lent to a generic function outside
-  `unsafe`.** This is all 14 of the programs the checker refuses and the model
-  accepts. Coil turns a raw pointer passed for a reference parameter into a
-  reference to its pointee, and the checker cannot tell that from lending the
-  name itself when the parameter's type is a type parameter.
 - **Plain data passed by value counts as lent for the call.** The model copies
   it. Coil passes a pointer to the caller's storage.
 
 Model programs Coil cannot express, which `diff.py` skips: views (Coil refuses a
-reference in a struct), `match-ref`/`match-mut` on a plain-data payload (Coil
-copies it into the arm), and `par`.
+reference in a struct) and `match-ref`/`match-mut` on a plain-data payload (Coil
+copies it into the arm).
 
 ## The model
 
@@ -186,11 +200,12 @@ These are sound and simple. The model should be relaxed first, then the checker.
 
 ## What is left out
 
-- `par`, in the library. The model has it; Coil's safe library does not yet.
-- Arrays, slices and strings as safe types. They are raw memory to the checker,
-  so reading one needs `unsafe`. The model stands a pool in for indexed storage
-  and a view for a slice.
-- `return` from the middle of a function, detached threads, trait objects and
+- Slices and arrays as safe types. They are raw memory to the checker, so the
+  library's `ArrayList` and `HashMap` need `unsafe`; `Vec` and `Str` are the
+  safe ones. There is no borrowed view of part of a `Vec` or `Str`: the model's
+  view has no Coil form, because Coil refuses a reference in a struct.
+- Detached threads. `par` is two calls that both finish before anything else runs.
+- `return` from the middle of a function, trait objects and
   function pointers: outside the model, and refused or `unsafe`-only in the checker.
 - What is inside `unsafe`: the rules say which operations need it and that the
   other rules still hold there, and make no claim about a program that uses it.

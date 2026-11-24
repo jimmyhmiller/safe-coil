@@ -8,8 +8,8 @@
 ;;   - a view: Coil does not let a struct hold a reference;
 ;;   - `match-ref` and `match-mut` on a sum with a plain-data payload: Coil
 ;;     copies such a payload into the arm and lends only the parts that own
-;;     something;
-;;   - `par`: the safe library has no threads yet.
+;;     something.
+
 (require "rules.rkt")
 (provide program->coil)
 
@@ -290,7 +290,8 @@
                            (cond [(mut? τp) (format "(mut ~a)" (exclusive Σ Γ e1))]
                                  [(ref? τp) (shared Σ Γ e1)]
                                  [else (plain Σ Γ e1)])))))])]
-    [`(par ,_ ,_) (bail "par")]
+    ;; `par` reads how each argument is passed from how it is written
+    [`(par ,c1 ,c2) (format "(par ~a ~a)" (par-call Σ Γ c1) (par-call Σ Γ c2))]
     [`(with ,w ,g ,x ,e1)
      (match (decl Σ 'global g)
        [`(global ,_ ,σ ,_)
@@ -306,6 +307,25 @@
      (format "(alloc/box! (alloc/malloc-allocator) ~a ~a)" (coil-type (type-of Σ Γ e1)) (plain Σ Γ e1))]
     [`(free ,e1) (unit-after (format "(alloc/destroy (alloc/malloc-allocator) ~a)" (plain Σ Γ e1)))]
     [_ (bail "an ill-typed program")]))
+
+(define (par-call Σ Γ c)
+  (match c
+    [`(call ,f ,σs ,es ...)
+     (match (decl Σ 'defn f)
+       [`(defn ,_ ,Ts ,params ,_ ,_)
+        (unless (and (= (length Ts) (length σs)) (= (length params) (length es)))
+          (bail "an ill-typed program"))
+        (format "(~a~a~a)" (fn-name f)
+                (if (null? σs) "" (format " [~a]" (string-join (map coil-type σs))))
+                (string-append*
+                 (for/list ([p params] [e1 es])
+                   (define τp (subst (cadr p) Ts σs))
+                   (format " ~a"
+                           (cond [(mut? τp) (format "(mut ~a)" (exclusive Σ Γ e1))]
+                                 [(ref? τp)
+                                  (let ([text (shared Σ Γ e1)])
+                                    (if (string-prefix? text "(borrow ") text (format "(borrow ~a)" text)))]
+                                 [else (plain Σ Γ e1)])))))])]))
 
 (define (constructor name args)
   (if (null? args) name (format "~a [~a]" name (string-join (map coil-type args)))))
@@ -369,6 +389,7 @@
              "(import \"safe.box\" :use [Box])\n"
              "(import \"safe.pool\" :use [Pool Handle])\n"
              "(import \"safe.global\" :use [defglobal with-ref with-mut Global Cell])\n"
+             "(import \"safe.par\" :use [par])\n"
              (string-append*
               (for/list ([d ds] #:unless (and (eq? (car d) 'defn) (memq (cadr d) (unwritten))))
                 (define text (declaration ds d))

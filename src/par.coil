@@ -1,16 +1,209 @@
-;;; Two calls at once. Not built yet.
+;;; Two calls at once.
 ;;;
-;;; The model's rule is that the arguments of both calls are checked as the
-;;; arguments of one, so nothing lent exclusively to one call reaches the other.
-;;; The checker gets that rule for free once `par` binds every argument to a name
-;;; before either call starts. What is missing is the run-time half: a thread's
-;;; entry point takes its arguments through a struct, whose field types a macro
-;;; cannot know because it runs before the program is typed. It needs a transform
-;;; that reads the checked types. Until then a use of `par` is a compile error,
-;;; and `safe.global` counts its borrowers with plain integers, which is right
-;;; only while safe code cannot start a thread.
+;;; `(par (f a b) (g c d))` runs `(f a b)` on a new thread and `(g c d)` on this
+;;; one, and returns when both have. An argument is written as the callee takes
+;;; it: `(mut place)` for an exclusive reference, `(borrow place)` for a shared
+;;; one, and anything else is a value, which is moved or copied to its call.
+;;;
+;;; Every argument of both calls is bound to a name before either call starts.
+;;; That is the whole rule for the checker: the names hold their loans together,
+;;; as the arguments of one call would, so nothing lent exclusively to one call
+;;; can reach the other.
+;;;
+;;; The first call's arguments cross to its thread as addresses. The thread's
+;;; entry point is a function `par` adds to the caller's module; it takes each
+;;; argument's type from the callee's parameter, and a second added function
+;;; makes the compiler check that the caller's arguments have those same types.
 (module safe.par)
+(export par)
 (import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.alloc" :as alloc)
+(import "coil.thread" :use [Thread])
+(import "coil.meta" :as meta)
+(import "coil.str" :use [substr])
+(import "safe.core" :use [unsafe lend lend-mut move])
+
+;;; The most arguments the first call of a `par` can take.
+(const SLOTS 8)
+
+;;; A call running on its own thread, and the addresses of its arguments.
+(defstruct Running [(thread Thread) (slots (slice (ptr i8)))])
+
+(defn address-mut [T] [(place (mut T))] (-> (ptr i8))
+  (primitive/cast (ptr i8) (mut place)))
+
+(defn address-ref [T] [(place (ref T))] (-> (ptr i8))
+  (primitive/cast (ptr i8) place))
+
+(defn no-address [] (-> (ptr i8))
+  (primitive/cast (ptr i8) 0))
+
+;;; Argument I of the call whose arguments RAW holds.
+(defn slot [(raw (ptr i8)) (i i64)] (-> (ptr i8))
+  (unsafe (load (primitive/index (primitive/cast (ptr (ptr i8)) raw) i))))
+
+(defn as-ref [T] [(address (ptr i8))] (-> (ref T))
+  (unsafe (lend (primitive/cast (ptr T) address))))
+
+(defn as-mut [T] [(address (ptr i8))] (-> (mut T))
+  (unsafe (lend-mut (primitive/cast (ptr T) address))))
+
+;;; The value at ADDRESS, moved out: its owner must forget it.
+(defn as-value [T] [(address (ptr i8))] (-> T)
+  (unsafe (take! [T] (primitive/cast (ptr T) address))))
+
+;;; Start BODY on a new thread, handing it the eight addresses.
+(defn start [(body (fnptr (cc/C) [(ptr i8)] (ptr i8)))
+             (a0 (ptr i8)) (a1 (ptr i8)) (a2 (ptr i8)) (a3 (ptr i8))
+             (a4 (ptr i8)) (a5 (ptr i8)) (a6 (ptr i8)) (a7 (ptr i8))] (-> Running)
+  (unsafe
+    (let [slots (match (alloc/alloc [(ptr i8)] (alloc/malloc-allocator) SLOTS)
+                  (Some [memory] memory)
+                  (None [] (panic "safe: out of memory")))
+          (mut running) (Running :thread (primitive/zeroed Thread) :slots slots)]
+      (store! (primitive/index (data slots) 0) a0)
+      (store! (primitive/index (data slots) 1) a1)
+      (store! (primitive/index (data slots) 2) a2)
+      (store! (primitive/index (data slots) 3) a3)
+      (store! (primitive/index (data slots) 4) a4)
+      (store! (primitive/index (data slots) 5) a5)
+      (store! (primitive/index (data slots) 6) a6)
+      (store! (primitive/index (data slots) 7) a7)
+      (when (!= (Thread::spawn (mut (.thread running)) body (primitive/cast (ptr i8) (data slots)))
+                (: 0 i32))
+        (panic "safe: a thread could not be started"))
+      running)))
+
+;;; Wait for the call to finish.
+(defn finish [(running Running)] (-> void)
+  (unsafe
+    (let [(mut thread) (.thread running)]
+      (Thread::join (mut thread))
+      (alloc/free (alloc/malloc-allocator) (.slots running))
+      0)))
+
+;;; What a thread's entry point returns.
+(defn done [] (-> (ptr i8))
+  (primitive/cast (ptr i8) 0))
+
+;;; ---- the macro ---------------------------------------------------------------
+
+(defn headed? [(form Code) (name (slice u8))] (-> bool)
+  (and (primitive/code-list? form)
+       (> (len form) 0)
+       (primitive/code-sym? (get form 0))
+       (let [text (meta/source (get form 0))
+             n (len name)]
+         (or (= text name)
+             (and (> (len text) n)
+                  (= (substr text (- (len text) n) (len text)) name)
+                  (= (get text (- (len text) n 1)) #\/))))))
+
+;;; Is FORM a place as written: a name, or a field of one?
+(defn place? [(form Code)] (-> bool)
+  (or (primitive/code-sym? form)
+      (and (primitive/code-list? form)
+           (> (len form) 1)
+           (primitive/code-sym? (get form 0))
+           (let [text (meta/source (get form 0))]
+             (or (= text "field") (and (> (len text) 1) (= (get text 0) #\.))))
+           (place? (get form 1)))))
+
+;;; Where a call's arguments begin: after its name and any type arguments.
+(defn first-argument [(call Code)] (-> i64)
+  (if (and (> (len call) 1) (primitive/code-vector? (get call 1))) 2 1))
 
 (defn par [(first Code) (second Code)] (-> Code)
-  (primitive/error "safe: par is not built yet: safe Coil has no way to run two calls at once"))
+  (unless (and (primitive/code-list? first) (> (len first) 0)
+               (primitive/code-list? second) (> (len second) 0))
+    (primitive/error "par: expected two calls, (par (f …) (g …))"))
+  (when (> (- (len first) (first-argument first)) SLOTS)
+    (primitive/error "par: the first call takes at most eight arguments"))
+  (let [(mut binders) (primitive/code-list-new)
+        ; the first call: how the thread reads each argument, where each lies,
+        ; and what the type witness takes and is given
+        (mut read) (primitive/code-list-new)
+        (mut addresses) (primitive/code-list-new)
+        (mut forgotten) (primitive/code-list-new)
+        (mut type-names) (primitive/code-list-new)
+        (mut callee-types) (primitive/code-list-new)
+        (mut witness-params) (primitive/code-list-new)
+        (mut witness-args) (primitive/code-list-new)
+        ; the second call's arguments, as this thread passes them
+        (mut direct) (primitive/code-list-new)
+        result-type (primitive/fresh-identifier "R")
+        ; the thread entry point's parameter: one name, shared by every template
+        raw (primitive/fresh-identifier "raw")
+        (mut count) 0]
+    (for i (range (first-argument first) (len first))
+      (let [arg (get first i)
+            name (primitive/fresh-identifier "argument")
+            type (primitive/fresh-identifier "A")
+            parameter (primitive/fresh-identifier "parameter")]
+        (push! (mut type-names) type)
+        (cond (headed? arg "mut")
+                (do (if (place? (get arg 1))
+                        (do (push! (mut binders) `(mut ~name)) (push! (mut binders) arg))
+                        (do (push! (mut binders) name) (push! (mut binders) (get arg 1))))
+                    (push! (mut read) `(mut (as-mut (slot ~raw ~count))))
+                    (push! (mut addresses) `(address-mut (mut ~name)))
+                    (push! (mut callee-types) `(mut ~type))
+                    (push! (mut witness-params) `(~parameter (mut ~type)))
+                    (push! (mut witness-args) `(mut ~name)))
+              (headed? arg "borrow")
+                (do (push! (mut binders) name)
+                    (push! (mut binders) arg)
+                    (push! (mut read) `(as-ref (slot ~raw ~count)))
+                    (push! (mut addresses) `(address-ref ~name))
+                    (push! (mut callee-types) `(ref ~type))
+                    (push! (mut witness-params) `(~parameter (ref ~type)))
+                    (push! (mut witness-args) name))
+              :else
+                ; a value of its own, which the thread takes and this one forgets
+                (do (push! (mut binders) `(mut ~name))
+                    (push! (mut binders) `(move ~arg))
+                    (push! (mut read) `(as-value (slot ~raw ~count)))
+                    (push! (mut addresses) `(address-mut (mut ~name)))
+                    (push! (mut forgotten) `(forget ~name))
+                    (push! (mut callee-types) type)
+                    (push! (mut witness-params) `(~parameter (ref ~type)))
+                    (push! (mut witness-args) name)))
+        (set! count (+ count 1))))
+    (for i (range count SLOTS)
+      (push! (mut addresses) `(no-address)))
+    (for i (range (first-argument second) (len second))
+      (let [arg (get second i)
+            name (primitive/fresh-identifier "argument")]
+        (cond (headed? arg "mut")
+                (do (if (place? (get arg 1))
+                        (do (push! (mut binders) `(mut ~name)) (push! (mut binders) arg))
+                        (do (push! (mut binders) name) (push! (mut binders) (get arg 1))))
+                    (push! (mut direct) `(mut ~name)))
+              (headed? arg "borrow")
+                (do (push! (mut binders) name)
+                    (push! (mut binders) arg)
+                    (push! (mut direct) name))
+              :else
+                (do (push! (mut binders) `(mut ~name))
+                    (push! (mut binders) `(move ~arg))
+                    (push! (mut direct) name)))))
+    (let [callee `(~@(primitive/code-slice first 0 (first-argument first)))
+          second-callee `(~@(primitive/code-slice second 0 (first-argument second)))
+          site (primitive/code-call-site)
+          worker (primitive/code-hoist `(worker ~site)
+                                       `(defn _ :cc (cc/C) [(~raw (ptr i8))] (-> (ptr i8))
+                                          (~@callee ~@read)
+                                          (done)))
+          witness (primitive/code-hoist `(witness ~site)
+                                        `(defn _ [~@type-names ~result-type]
+                                           [(callee (fnptr (cc/C) [~@callee-types] ~result-type))
+                                            ~@witness-params] (-> i64)
+                                           0))]
+      `(let [~@binders]
+         (~witness (primitive/fnptr-of ~@callee) ~@witness-args)
+         (let [running (start (primitive/fnptr-of ~worker) ~@addresses)]
+           (~@second-callee ~@direct)
+           (finish running)
+           ~@forgotten
+           0)))))
