@@ -101,7 +101,10 @@ is already lent stop the program with a message. They are the checks made at
 run time.
 
 Each module exports only what safe code may call. The functions it uses inside
-(the ones that trust their arguments) cannot be named from outside it.
+(the ones that trust their arguments) cannot be named from outside it. Every
+type works for an element with no size, such as a struct with no fields:
+`safe.mem` is the allocation the library shares, and it gives such a type an
+address nothing is read from.
 
 ### Loops
 
