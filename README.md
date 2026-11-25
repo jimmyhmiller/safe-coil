@@ -209,13 +209,12 @@ run fails if the checker accepts anything the model refuses.
 checker at a time and requires `diff.py` to find a program the weakened checker
 wrongly accepts.
 
-On the model's 118 cases and 4000 random programs (seed 7), 4020 can be written
-as Coil. The compiler refuses 1663 of them itself. On the other 2357 the checker
-accepts nothing the model refuses: 1611 accepted by both, 710 refused by both,
-32 refused only by the checker, each for one of the differences below, and
-four that are the exclusive-reference case below, of which the checker accepts
-one. All nineteen weakenings are
-caught, by a hand-written case or by the differential run.
+On the model's 118 cases and 4000 random programs (seed 7), 4030 can be written
+as Coil. The compiler refuses 1726 of them itself. On the other 2304 the checker
+accepts nothing the model refuses: 1588 accepted by both, 687 refused by both,
+and 29 refused only by the checker, each for one of the differences below. All
+nineteen weakenings are caught, by a hand-written case or by the differential
+run.
 
 `tests/run.py` has 100 hand-written cases. Every `ok_` case and both examples
 also run clean under `--sanitize=address` and `--sanitize=thread`.

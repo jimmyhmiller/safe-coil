@@ -490,10 +490,16 @@
            (match (build 'unit) [`(with ,_ ,g . ,_) (set! entered (cons g entered))] [_ (void)])
            (build (loop (sub1 n) (cons (cons x τx) env) (cons (cons x τx) held)))]
           [_
+           ;; Half the time only some of the references are read afterwards,
+           ;; the newest among them: a loan lasts while its holder is named, so
+           ;; one that is not named again is where that rule can go wrong.
+           (define readers
+             (cond [(or (null? held) (zero? (random 2))) held]
+                   [else (cons (car held) (filter (λ (_) (zero? (random 2))) (cdr held)))]))
            (if (null? held)
                (gen-expr env sigs τ (sub1 d))
                `(seq ,(disturb env)
-                     ,(for/fold ([tail (gen-expr env sigs τ (sub1 d))]) ([h held])
+                     ,(for/fold ([tail (gen-expr env sigs τ (sub1 d))]) ([h readers])
                         `(seq ,(reads-through (car h) env) ,tail))))])))
     (for/fold ([body body]) ([o (reverse owned)])
       `(let ([,(car o) ,(caddr o)]) ,body)))
