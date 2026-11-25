@@ -1,0 +1,9 @@
+(module case.bad-par-shared-place)
+(import "safe.par" :use [par])
+(defn count-up [(n (mut i64)) (to i64)] (-> void)
+  (while (< n to) (set! n (+ n 1))))
+(defn main [] (-> i64)
+  (let [(mut n) 0]
+    (par (count-up (mut n) 1000)
+         (count-up (mut n) 1000))
+    n))

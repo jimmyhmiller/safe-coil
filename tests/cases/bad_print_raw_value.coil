@@ -1,0 +1,5 @@
+(module case.bad-print-raw-value)
+(defn show [(s (slice u8))] (-> i64)
+  (println "{}" s)
+  0)
+(defn main [] (-> i64) (show "text"))

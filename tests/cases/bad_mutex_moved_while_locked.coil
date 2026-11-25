@@ -1,0 +1,9 @@
+(module case.bad-mutex-moved-while-locked)
+(import "safe.sync" :use [Mutex Guard])
+(defn eat [(m (Mutex i64))] (-> i64) 0)
+(defn main [] (-> i64)
+  (let [m (Mutex::new 1)
+        (mut g) (Mutex::lock m)]
+    (eat m)
+    (set! (mut (Guard::get-mut (mut g))) 2)
+    0))

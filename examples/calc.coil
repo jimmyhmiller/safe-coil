@@ -1,0 +1,175 @@
+;;; Coil's calculator example (coil/src/examples/calc.coil), in safe Coil.
+;;;
+;;; A program is `;`-separated statements. A statement is `v=EXPR` (assign a
+;;; single-letter variable) or EXPR, where EXPR is + - * / over integers,
+;;; variables and parentheses. Each statement's value is printed.
+;;;
+;;;   coil run examples/calc.coil --use safe.check    => 3 / 13 / 26 / 27 / 27
+;;;
+;;; What changed from the original: the source text is a `Str` and the tokens a
+;;; `Vec`, both checked on every index; the tree's nodes are boxes, freed with
+;;; the tree, where the original leaked raw pointers; and the variables are a
+;;; `Vec` of 26 numbers where it used a `HashMap`. Nothing here is `unsafe`.
+(module example.calc)
+(import "coil.primitive" :as primitive)
+(import "safe.core" :use [replace!])
+(import "safe.box" :use [Box])
+(import "safe.vec" :use [Vec])
+(import "safe.str" :use [Str])
+
+(defsum Tok
+  (Number [(value i64)])
+  (Name [(name i64)])  ; a single letter
+  (Op [(op i64)])  ; the operator's character
+  (Open)
+  (Close)
+  (Assign)
+  (Semi)
+  (End))
+
+(defn digit? [(c i64)] (-> bool)
+  (and (>= c #\0) (<= c #\9)))
+
+(defn letter? [(c i64)] (-> bool)
+  (and (>= c #\a) (<= c #\z)))
+
+(defn char-at [(s (ref Str)) (i i64)] (-> i64)
+  (primitive/cast i64 (Str::byte s i)))
+
+(defn lex [(s (ref Str))] (-> (Vec Tok))
+  (let [(mut tokens) (Vec::new [Tok])
+        (mut i) 0]
+    (while (< i (Str::len s))
+      (let [c (char-at s i)]
+        (cond (= c #\space) (set! i (+ i 1))
+              (digit? c)
+                (let [(mut value) 0]
+                  (while (and (< i (Str::len s)) (digit? (char-at s i)))
+                    (set! value (+ (* value 10) (- (char-at s i) #\0)))
+                    (set! i (+ i 1)))
+                  (Vec::push! (mut tokens) (Number value)))
+              :else
+                (do
+                  (Vec::push! (mut tokens)
+                              (cond (letter? c) (Name c)
+                                    (= c #\() (Open)
+                                    (= c #\)) (Close)
+                                    (= c #\=) (Assign)
+                                    (= c #\;) (Semi)
+                                    :else (Op c)))
+                  (set! i (+ i 1))))))
+    (Vec::push! (mut tokens) (End))
+    tokens))
+
+(defsum Ast
+  (Lit [(value i64)])
+  (Var [(name i64)])
+  (Bin [(op i64) (left (Box Ast)) (right (Box Ast))])
+  (Let [(name i64) (value (Box Ast))]))
+
+(defstruct Parser [(tokens (Vec Tok)) (pos i64)])
+
+;;; The token I places ahead; the last token is End, and stays End past it.
+(defn peek-at [(p (ref Parser)) (ahead i64)] (-> Tok)
+  (let [last (- (Vec::len (field p tokens)) 1)
+        at (+ (.pos p) ahead)]
+    (primitive/load (Vec::at (field p tokens) (if (> at last) last at)))))
+
+(defn peek [(p (ref Parser))] (-> Tok)
+  (peek-at p 0))
+
+(defn advance! [(p (mut Parser))] (-> void)
+  (set! (.pos p) (+ (.pos p) 1)))
+
+;;; The next token's operator character if it is `a` or `b`, else 0.
+(defn peek-op [(p (ref Parser)) (a i64) (b i64)] (-> i64)
+  (match (peek p)
+    (Op [op] (if (or (= op a) (= op b)) op 0))
+    (_ 0)))
+
+;;; primary = NUMBER | NAME | '(' expr ')'
+(defn parse-primary [(p (mut Parser))] (-> Ast)
+  (let [token (peek p)]
+    (advance! (mut p))
+    (match token
+      (Number [v] (Lit v))
+      (Name [n] (Var n))
+      (Open []
+            (let [e (parse-expr (mut p))]
+              (advance! (mut p))  ; )
+              e))
+      (_ (Lit 0)))))  ; malformed input evaluates to 0
+
+;;; term = primary (('*' | '/') primary)*
+(defn parse-term [(p (mut Parser))] (-> Ast)
+  (let [(mut left) (parse-primary (mut p))]
+    (loop (let [op (peek-op p #\* #\/)]
+            (when (= op 0) (break))
+            (advance! (mut p))
+            ; an owner cannot be moved out of a loop's variable and put back, so
+            ; the tree so far is swapped out for a placeholder
+            (let [right (parse-primary (mut p))
+                  so-far (replace! (mut left) (Lit 0))]
+              (set! left (Bin :op op :left (Box::new so-far) :right (Box::new right))))))
+    left))
+
+;;; expr = term (('+' | '-') term)*
+(defn parse-expr [(p (mut Parser))] (-> Ast)
+  (let [(mut left) (parse-term (mut p))]
+    (loop (let [op (peek-op p #\+ #\-)]
+            (when (= op 0) (break))
+            (advance! (mut p))
+            ; an owner cannot be moved out of a loop's variable and put back, so
+            ; the tree so far is swapped out for a placeholder
+            (let [right (parse-term (mut p))
+                  so-far (replace! (mut left) (Lit 0))]
+              (set! left (Bin :op op :left (Box::new so-far) :right (Box::new right))))))
+    left))
+
+;;; stmt = NAME '=' expr | expr
+(defn parse-statement [(p (mut Parser))] (-> Ast)
+  (match (peek p)
+    (Name [n]
+          (match (peek-at p 1)
+            (Assign []
+                    (advance! (mut p))
+                    (advance! (mut p))
+                    (Let :name n :value (Box::new (parse-expr (mut p)))))
+            (_ (parse-expr (mut p)))))
+    (_ (parse-expr (mut p)))))
+
+(defn eval [(n (ref Ast)) (env (mut (Vec i64)))] (-> i64)
+  (match n
+    (Lit [v] v)
+    (Var [name] (primitive/load (Vec::at env (- name #\a))))
+    (Bin [op left right]
+         (let [x (eval (Box::get left) (mut env))
+               y (eval (Box::get right) (mut env))]
+           (cond (= op #\+) (+ x y)
+                 (= op #\-) (- x y)
+                 (= op #\*) (* x y)
+                 (= y 0) 0
+                 :else (/ x y))))
+    (Let [name value]
+         (let [v (eval (Box::get value) (mut env))]
+           (set! (mut (Vec::at-mut (mut env) (- name #\a))) v)
+           v))))
+
+(defn end? [(p (ref Parser))] (-> bool)
+  (match (peek p) (End [] true) (_ false)))
+
+(defn run [(src (ref Str))] (-> i64)
+  (let [(mut p) (Parser :tokens (lex src) :pos 0)
+        (mut env) (Vec::new [i64])
+        (mut last) 0]
+    (for i (range 0 26) (Vec::push! (mut env) 0))
+    (while (not (end? p))
+      (let [statement (parse-statement (mut p))]
+        (set! last (eval statement (mut env))))
+      (println "{}" last)
+      (match (peek p) (Semi [] (advance! (mut p))) (_ 0)))
+    last))
+
+(defn main [] (-> i64)
+  (run (Str::from "1+2; 3+2*5; (3+10)*2; x=27; x"))
+  0)

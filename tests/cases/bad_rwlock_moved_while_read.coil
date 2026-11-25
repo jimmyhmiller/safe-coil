@@ -1,0 +1,9 @@
+(module case.bad-rwlock-moved-while-read)
+(import "coil.primitive" :as primitive)
+(import "safe.sync" :use [RwLock Reading])
+(import "safe.box" :use [Box])
+(defn main [] (-> i64)
+  (let [l (RwLock::new 1)
+        reading (RwLock::read l)
+        gone (Box::new l)]
+    (primitive/load (Reading::get reading))))

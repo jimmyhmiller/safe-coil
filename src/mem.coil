@@ -1,0 +1,24 @@
+;;; Heap memory for the library's own types. What these give back is raw memory:
+;;; plain data to safe code, followed only inside `unsafe`.
+(module safe.mem)
+(export room release)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "safe.core" :use [unsafe])
+
+;;; Room for COUNT values of T, holding none yet. Running out of memory stops the
+;;; program. A type with no size needs no memory, and Coil's allocator refuses
+;;; to give it any: its room is an address nothing is ever read from.
+(defn room [T] [(count i64)] (-> (slice T))
+  (unsafe
+    (if (= (primitive/sizeof T) 0)
+        (slice::new [T] (primitive/cast (ptr T) (primitive/alignof T)) count)
+        (match (alloc/alloc [T] (alloc/malloc-allocator) count)
+          (Some [memory] memory)
+          (None [] (panic "safe: out of memory"))))))
+
+;;; Give back what `room` gave. The values it held must have been taken out.
+(defn release [T] [(memory (slice T))] (-> void)
+  (unsafe
+    (alloc/free (alloc/malloc-allocator) memory)
+    0))

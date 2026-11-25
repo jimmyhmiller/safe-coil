@@ -1,0 +1,5 @@
+(module case.bad-temporary-leaves-block)
+(import "coil.primitive" :as primitive)
+(import "safe.box" :use [Box])
+(defn main [] (-> i64)
+  (primitive/load (block :made (Box::get (Box::new 5)))))

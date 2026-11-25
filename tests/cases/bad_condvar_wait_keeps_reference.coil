@@ -1,0 +1,11 @@
+(module case.bad-condvar-wait-keeps-reference)
+(import "coil.primitive" :as primitive)
+(import "safe.sync" :use [Mutex Guard Condvar])
+(defn main [] (-> i64)
+  (let [m (Mutex::new 1)
+        c (Condvar::new)
+        (mut held) (Mutex::lock m)
+        value (Guard::get-mut (mut held))]
+    (Guard::wait (mut held) c)
+    (set! value 2)
+    0))

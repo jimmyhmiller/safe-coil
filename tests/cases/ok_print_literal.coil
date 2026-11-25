@@ -1,0 +1,4 @@
+(module case.ok-print-literal)
+(defn main [] (-> i64)
+  (println "{} {}" "text" 5)
+  0)

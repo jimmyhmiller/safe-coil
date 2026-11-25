@@ -1,0 +1,12 @@
+(module case.bad-guard-to-par-thread)
+(import "safe.sync" :use [Mutex Guard])
+(import "safe.par" :use [par])
+(defn bump [(g (mut (Guard i64)))] (-> i64)
+  (set! (mut (Guard::get-mut (mut g))) 2)
+  0)
+(defn idle [] (-> i64) 0)
+(defn main [] (-> i64)
+  (let [m (Mutex::new 1)
+        (mut g) (Mutex::lock m)]
+    (par (bump (mut g)) (idle))
+    0))

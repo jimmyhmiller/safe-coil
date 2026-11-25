@@ -1,0 +1,6 @@
+(module case.bad-guard-outlives-mutex)
+(import "safe.sync" :use [Mutex Guard])
+(defn hold [] (-> (Guard i64))
+  (let [m (Mutex::new 1)]
+    (Mutex::lock m)))
+(defn main [] (-> i64) 0)

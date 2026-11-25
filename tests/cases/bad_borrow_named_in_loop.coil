@@ -1,0 +1,12 @@
+(module case.bad-borrow-named-in-loop)
+(import "coil.primitive" :as primitive)
+(import "safe.vec" :use [Vec])
+(defn main [] (-> i64)
+  (let [(mut v) (Vec::new [i64])
+        (mut sum) 0]
+    (Vec::push! (mut v) 1)
+    (let [first (Vec::at v 0)]
+      (for i (range 0 3)
+        (set! sum (+ sum (primitive/load first)))
+        (Vec::push! (mut v) i)))
+    sum))

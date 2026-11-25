@@ -1,0 +1,11 @@
+(module case.ok-box)
+(import "safe.box" :use [Box])
+(defstruct Pt [(x i64) (y i64)])
+(defn bump [(p (mut Pt))] (-> void) (set! (.x p) (+ (.x p) 1)))
+(defn main [] (-> i64)
+  (let [(mut b) (Box::new (Pt :x 1 :y 2))
+        n (Box::new 40)]
+    (bump (mut (Box::get-mut (mut b))))
+    (let [r (Box::get b)]
+      (println "{} {}" (.x r) (Box::into n)))
+    (.x (Box::into b))))

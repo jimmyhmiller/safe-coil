@@ -1,0 +1,108 @@
+;;; Text that owns its bytes.
+(module safe.str)
+(export Str)
+(import "coil.primitive" :as primitive)
+(import "coil.fmt" :use [Display Formatter display-fmt])
+(import "safe.core" :use [unsafe Each])
+(import "safe.vec" :use [Vec Slice])
+
+;;; A string of bytes, UTF-8 by convention. It owns them: they are freed with it.
+;;; Text between quotes is a slice, which is raw memory; `(Str::from "…")` copies
+;;; one into a string safe code can keep, pass and print.
+(defstruct Str [(bytes (Vec u8))])
+
+(impl Str
+  ;;; An empty string.
+  (new [] (-> Str)
+    (Str :bytes (Vec::new [u8])))
+
+  ;;; A copy of TEXT.
+  (from [(text (slice u8))] (-> Str)
+    (let [(mut s) (Str::new)]
+      (Str::push-text! (mut s) text)
+      s))
+
+  ;;; How many bytes it holds.
+  (len [(s (ref Str))] (-> i64)
+    (Vec::len (field s bytes)))
+
+  ;;; Byte I. An index out of range stops the program.
+  (byte [(s (ref Str)) (i i64)] (-> u8)
+    (primitive/load (Vec::at (field s bytes) i)))
+
+  ;;; Add one byte at the end.
+  (push! [(s (mut Str)) (b u8)] (-> void)
+    (Vec::push! (mut (.bytes s)) b))
+
+  ;;; Add a copy of TEXT at the end.
+  (push-text! [(s (mut Str)) (text (slice u8))] (-> void)
+    (for i (range 0 (unsafe (len text)))
+      (Str::push! (mut s) (unsafe (get text i)))))
+
+  ;;; Add a copy of MORE at the end.
+  (append! [(s (mut Str)) (more (ref Str))] (-> void)
+    (for i (range 0 (Str::len more))
+      (Str::push! (mut s) (Str::byte more i))))
+
+  ;;; The bytes from FROM up to TO, lent shared. A range that is not inside the
+  ;;; string stops the program.
+  (slice [(s (ref Str)) (from i64) (to i64)] (-> (Slice u8))
+    (Vec::slice (field s bytes) from to))
+
+  ;;; A copy of the bytes PART covers.
+  (from-slice [(part (ref (Slice u8)))] (-> Str)
+    (let [(mut s) (Str::new)]
+      (Str::push-slice! (mut s) part)
+      s))
+
+  ;;; Add a copy of the bytes PART covers at the end.
+  (push-slice! [(s (mut Str)) (part (ref (Slice u8)))] (-> void)
+    (for i (range 0 (Slice::len part))
+      (Str::push! (mut s) (primitive/load (Slice::at part i)))))
+
+  ;;; Add N in decimal at the end.
+  (push-int! [(s (mut Str)) (n i64)] (-> void)
+    (if (< n 0)
+        (do (Str::push! (mut s) #\-)
+            ; the digits of a negative number, without negating it: the least one has no positive
+            (when (< n -9) (Str::push-int! (mut s) (- 0 (/ n 10))))
+            (Str::push! (mut s) (primitive/cast u8 (+ 48 (- 0 (% n 10))))))
+        (do (when (> n 9) (Str::push-int! (mut s) (/ n 10)))
+            (Str::push! (mut s) (primitive/cast u8 (+ 48 (% n 10)))))))
+
+  ;;; Do A and B hold the same bytes?
+  (eq? [(a (ref Str)) (b (ref Str))] (-> bool)
+    (and (= (Str::len a) (Str::len b))
+         (block :same
+           (for i (range 0 (Str::len a))
+             (when (!= (Str::byte a i) (Str::byte b i)) (return-from :same false)))
+           true)))
+
+  ;;; A copy, with bytes of its own.
+  (copy [(s (ref Str))] (-> Str)
+    (let [(mut out) (Str::new)]
+      (Str::append! (mut out) s)
+      out)))
+
+;;; `each` over a string visits its bytes.
+(impl Each Str
+  (count [(xs (ref Str))] (-> i64) (Str::len xs))
+  (item [(xs (ref Str)) (i i64)] (-> (ref u8)) (Vec::at (field xs bytes) i)))
+
+;;; Strings are equal when their bytes are.
+(impl Eq Str
+  (= [(a (ref Str)) (b (ref Str))] (-> bool)
+    (Str::eq? a b)))
+
+;;; FNV-1a over the bytes.
+(impl Hash Str
+  (hash [(s (ref Str))] (-> i64)
+    (let [(mut h) -3750763034362895579]
+      (for i (range 0 (Str::len s))
+        (set! h (primitive/imul (primitive/ixor h (primitive/cast i64 (Str::byte s i))) 1099511628211)))
+      h)))
+
+(impl Display Str
+  (display-fmt [(s (ref Str)) (f (ptr Formatter))] (-> i64)
+    (unsafe
+      (display-fmt (slice::new [u8] (data (.items (.bytes s))) (Str::len s)) f))))

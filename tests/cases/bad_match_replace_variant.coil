@@ -1,0 +1,10 @@
+(module case.bad-match-replace-variant)
+(import "coil.primitive" :as primitive)
+(import "safe.box" :use [Box])
+(defsum Two (A [(b (Box i64)) (n i64)]) (B [(v i64)]))
+(defn poke [(t (mut Two))] (-> void) (set! t (B 9)))
+(defn main [] (-> i64)
+  (let [(mut t) (A (Box::new 3) 4)]
+    (match t
+      (A [b n] (do (poke (mut t)) (primitive/load (Box::get b))))
+      (B [v] v))))

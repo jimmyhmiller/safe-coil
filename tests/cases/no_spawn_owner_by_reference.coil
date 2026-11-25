@@ -1,0 +1,9 @@
+(module case.no-spawn-owner-by-reference)
+(import "safe.core" :use [borrow])
+(import "safe.thread" :use [spawn Task])
+(import "safe.vec" :use [Vec])
+(defn count [(v (Vec i64))] (-> i64) (Vec::len v))
+(defn main [] (-> i64)
+  (let [v (Vec::new [i64])
+        t (spawn (count (borrow v)))]
+    (Task::join t)))

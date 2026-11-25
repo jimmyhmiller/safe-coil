@@ -1,0 +1,39 @@
+(module case.ok-rwlock)
+(import "coil.primitive" :as primitive)
+(import "safe.core" :use [each])
+(import "safe.thread" :use [spawn spawn-do Task])
+(import "safe.sync" :use [Arc Mutex Guard Condvar RwLock Reading Writing])
+(import "safe.vec" :use [Vec])
+(defstruct Gate [(open (Mutex bool)) (opened Condvar)])
+(defn wait-then-sum [(gate (Arc Gate)) (numbers (Arc (RwLock (Vec i64))))] (-> i64)
+  (let [g (Arc::get gate)
+        (mut held) (Mutex::lock (field g open))]
+    (while (not (primitive/load (Guard::get held)))
+      (Guard::wait (mut held) (field g opened))))
+  (let [reading (RwLock::read (Arc::get numbers))
+        (mut sum) 0]
+    (each [n (Reading::get reading)] (set! sum (+ sum (primitive/load n))))
+    sum))
+(defn fill! [(numbers (Arc (RwLock (Vec i64)))) (from i64) (count i64)] (-> void)
+  (for i (range 0 count)
+    (let [(mut writing) (RwLock::write (Arc::get numbers))]
+      (Vec::push! (mut (Writing::get-mut (mut writing))) (+ from i))))
+  0)
+(defn main [] (-> i64)
+  (let [gate (Arc::new (Gate :open (Mutex::new false) :opened (Condvar::new)))
+        numbers (Arc::new (RwLock::new (Vec::new [i64])))
+        one (spawn (wait-then-sum (Arc::clone gate) (Arc::clone numbers)))
+        two (spawn (wait-then-sum (Arc::clone gate) (Arc::clone numbers)))
+        a (spawn-do (fill! (Arc::clone numbers) 0 500))
+        b (spawn-do (fill! (Arc::clone numbers) 500 500))]
+    (Task::join a)
+    (Task::join b)
+    (let [g (Arc::get gate)]
+      (let [(mut held) (Mutex::lock (field g open))]
+        (set! (Guard::get-mut (mut held)) true))
+      (Condvar::notify-all (field g opened)))
+    (println "{} {}" (Task::join one) (Task::join two))
+    (let [first (RwLock::read (Arc::get numbers))
+          second (RwLock::read (Arc::get numbers))]
+      (println "{} {}" (Vec::len (Reading::get first)) (Vec::len (Reading::get second))))
+    0))

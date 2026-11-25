@@ -1,0 +1,105 @@
+;;; Globals safe code can change: lent for a scope, with exclusivity checked when
+;;; the scope is entered.
+(module safe.global)
+(export defglobal with-ref with-mut Global)
+(import "coil.primitive" :as primitive)
+(import "coil.atomic" :as atomic)
+(import "safe.core" :use [unsafe lend lend-mut])
+
+;;; A global's storage. `borrowers` is how it is lent: 0 not at all, N > 0 to N
+;;; shared borrowers, -1 exclusively. `filled` is 0 before the first use, 1 while
+;;; the first user computes the value, 2 once `value` holds it. Both are changed
+;;; atomically: two threads may use one global.
+(defstruct Cell [T] [(borrowers i64) (filled i64) (value T)])
+
+;;; A global of type T, made by `defglobal`. Plain data: it names the storage.
+(defstruct Global [T] [(cell (ptr (Cell T)))])
+
+;;; The global, lent shared for as long as this lives.
+(defstruct Shared [T] [(cell (ptr (Cell T)))])
+
+;;; The global, lent exclusively for as long as this lives.
+(defstruct Exclusive [T] [(cell (ptr (Cell T)))])
+
+;;; Is it this caller's job to compute G's first value? True for exactly one
+;;; caller, which must then `fill!` it. Any other waits until that is done.
+(defn first-use? [T] [(g (Global T))] (-> bool)
+  (unsafe
+    (let [filled (field (.cell g) filled)]
+      (if (= (atomic/cas filled 0 1) 0)
+          true
+          (do (while (!= (atomic/read filled) 2) 0)
+              false)))))
+
+(defn fill! [T] [(g (Global T)) (value T)] (-> void)
+  (unsafe
+    (store! (field (.cell g) value) value)
+    (atomic/store (field (.cell g) filled) 2)
+    0))
+
+;;; Lend G shared. Stops the program if it is lent exclusively.
+(defn share [T] [(g (Global T))] (-> (Shared T))
+  (unsafe
+    (let [borrowers (field (.cell g) borrowers)
+          (mut seen) (atomic/read borrowers)]
+      (while (block :retry
+               (when (< seen 0)
+                 (panic "safe: a global was read while it is lent exclusively"))
+               (let [was (atomic/cas borrowers seen (+ seen 1))]
+                 (if (= was seen)
+                     false
+                     (do (set! seen was) true))))
+        0)
+      (Shared :cell (.cell g)))))
+
+;;; Lend G exclusively. Stops the program if it is lent at all.
+(defn claim [T] [(g (Global T))] (-> (Exclusive T))
+  (unsafe
+    (when (!= (atomic/cas (field (.cell g) borrowers) 0 -1) 0)
+      (panic "safe: a global was lent exclusively while it is lent"))
+    (Exclusive :cell (.cell g))))
+
+(impl [T] (Shared T)
+  (get [(lent (ref (Shared T)))] (-> (ref T))
+    (unsafe (lend (field (load (field lent cell)) value)))))
+
+(impl [T] (Exclusive T)
+  (get-mut [(lent (mut (Exclusive T)))] (-> (mut T))
+    (unsafe (lend-mut (field (load (field lent cell)) value)))))
+
+(impl [T] Drop (Shared T)
+  (drop [(self (mut (Shared T)))] (-> void)
+    (unsafe
+      (atomic/sub (field (load (field self cell)) borrowers) 1)
+      0)))
+
+(impl [T] Drop (Exclusive T)
+  (drop [(self (mut (Exclusive T)))] (-> void)
+    (unsafe
+      (atomic/store (field (load (field self cell)) borrowers) 0)
+      0)))
+
+;;; `(defglobal NAME TYPE INIT)`: a global NAME of TYPE. INIT is evaluated the
+;;; first time the global is used. `(NAME)` is the global, for `with-ref` and
+;;; `with-mut`.
+(defn defglobal [(name Code) (type Code) (init Code)] (-> Code)
+  (let [cell (primitive/fresh-identifier "cell")]
+    `(do (def ~cell (primitive/alloc-static (Cell ~type) (primitive/zeroed (Cell ~type))))
+         (defn ~name [] (-> (Global ~type))
+           (let [global (unsafe (Global :cell ~cell))]
+             (when (first-use? global) (fill! global ~init))
+             global)))))
+
+;;; `(with-ref GLOBAL NAME BODY…)`: NAME is a shared reference to the global's
+;;; value for BODY. It cannot leave BODY.
+(defn with-ref [(global Code) (name Code) & (body Code)] (-> Code)
+  `(let [lent (share ~global)
+         ~name (Shared::get lent)]
+     ~@body))
+
+;;; `(with-mut GLOBAL NAME BODY…)`: NAME is an exclusive reference to the global's
+;;; value for BODY. It cannot leave BODY.
+(defn with-mut [(global Code) (name Code) & (body Code)] (-> Code)
+  `(let [(mut lent) (claim ~global)
+         ~name (Exclusive::get-mut (mut lent))]
+     ~@body))

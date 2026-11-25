@@ -1,0 +1,398 @@
+;;; What threads share: an owner with many holders, a lock, a lock for many
+;;; readers or one writer, something to wait on, and a channel.
+(module safe.sync)
+(export Arc Mutex Guard with-lock Condvar RwLock Reading Writing Channel)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.atomic" :as atomic)
+(import "coil.sync" :as sync)
+(import "coil.thread" :as thread)
+(import "safe.core" :use [unsafe lend lend-mut View])
+(import "safe.mem" :as mem)
+
+(defn must [T] [(memory (Option (slice T)))] (-> (slice T))
+  (match memory
+    (Some [m] m)
+    (None [] (panic "safe: out of memory"))))
+
+(defn one [T] [] (-> (ptr T))
+  (unsafe (data (must (alloc/alloc [T] (alloc/malloc-allocator) 1)))))
+
+(defn free-one [T] [(at (ptr T))] (-> void)
+  (unsafe
+    (alloc/free (alloc/malloc-allocator) (slice::new [T] at 1))
+    0))
+
+(defn sure [(done (Result i64 sync/SyncError))] (-> void)
+  (match done
+    (Ok [_] 0)
+    (Err [_] (panic "safe: a lock failed"))))
+
+;;; ---- Arc ---------------------------------------------------------------------
+
+;;; A value and how many `Arc`s hold it.
+(defstruct Held [T] [(holders i64) (value T)])
+
+;;; One holder of a shared value. `Arc::clone` makes another, for another thread
+;;; or another owner; the value is freed when its last holder is. A holder lends
+;;; the value shared only, so what changes behind an `Arc` is a `Mutex`.
+(defstruct Arc [T] [(held (ptr (Held T)))])
+
+(impl [T] (Arc T)
+  ;;; VALUE, held by one `Arc`.
+  (new [(value T)] (-> (Arc T))
+    (unsafe
+      (let [held (one [(Held T)])]
+        (store! (field held holders) 1)
+        (store! (field held value) value)
+        (Arc :held held))))
+
+  ;;; Another holder of the same value.
+  (clone [(a (ref (Arc T)))] (-> (Arc T))
+    (unsafe
+      (atomic/add (field (.held a) holders) 1)
+      (Arc :held (.held a))))
+
+  ;;; The value, lent for as long as this holder is.
+  (get [(a (ref (Arc T)))] (-> (ref T))
+    (unsafe (lend (field (.held a) value)))))
+
+(impl [T] Drop (Arc T)
+  (drop [(self (mut (Arc T)))] (-> void)
+    (unsafe
+      (when (= (atomic/sub (field (.held self) holders) 1) 1)
+        (let [last (take! [T] (field (.held self) value))]
+          0)
+        (free-one (.held self)))
+      0)))
+
+;;; ---- Mutex -------------------------------------------------------------------
+
+;;; A value one thread at a time may reach. `owner` is the thread that holds the
+;;; lock, or 0.
+(defstruct Mutex [T] [(lock (ptr sync/Mutex)) (owner i64) (value T)])
+
+;;; A held lock. While it lives, its mutex is lent to it; the lock is given up
+;;; when it is dropped. It is a view: a local, never stored and never sent to
+;;; another thread.
+(defstruct Guard [T] [(mutex (ptr (Mutex T)))])
+
+(impl [T] View (Guard T))
+
+(impl [T] (Mutex T)
+  ;;; VALUE, behind a lock.
+  (new [(value T)] (-> (Mutex T))
+    (unsafe
+      (let [lock (one [sync/Mutex])]
+        (match (sync/Mutex::init lock)
+          (Ok [_] 0)
+          (Err [_] (panic "safe: a lock could not be made")))
+        (Mutex :lock lock :owner 0 :value value))))
+
+  ;;; Wait for the lock and hold it for as long as the result lives. A thread
+  ;;; that asks for a lock it already holds stops the program.
+  (lock [(m (ref (Mutex T)))] (-> (Guard T))
+    (unsafe
+      (let [at (primitive/cast (ptr (Mutex T)) m)
+            me (thread/current-id)]
+        (when (= (atomic/read (field at owner)) me)
+          (panic "safe: a thread asked for a lock it already holds"))
+        (sure (sync/Mutex::lock! (load (field at lock))))
+        (atomic/store (field at owner) me)
+        (Guard :mutex at)))))
+
+(impl [T] Drop (Mutex T)
+  (drop [(self (mut (Mutex T)))] (-> void)
+    (unsafe
+      (sure (sync/Mutex::destroy! (.lock self)))
+      (free-one (.lock self))
+      0)))
+
+(impl [T] (Guard T)
+  ;;; The value behind the lock.
+  (get [(g (ref (Guard T)))] (-> (ref T))
+    (unsafe (lend (field (load (field g mutex)) value))))
+
+  ;;; The value behind the lock, to be changed.
+  (get-mut [(g (mut (Guard T)))] (-> (mut T))
+    (unsafe (lend-mut (field (load (field g mutex)) value)))))
+
+(impl [T] Drop (Guard T)
+  (drop [(self (mut (Guard T)))] (-> void)
+    (unsafe
+      (let [at (load (field self mutex))]
+        (atomic/store (field at owner) 0)
+        (sure (sync/Mutex::unlock! (load (field at lock))))
+        0))))
+
+;;; `(with-lock MUTEX NAME BODY…)`: wait for the lock, and NAME is an exclusive
+;;; reference to the value behind it for BODY. The lock is given up when BODY
+;;; ends. NAME cannot leave BODY.
+(defn with-lock [(mutex Code) (name Code) & (body Code)] (-> Code)
+  `(let [(mut guard) (Mutex::lock ~mutex)
+         ~name (Guard::get-mut (mut guard))]
+     ~@body))
+
+;;; ---- Condvar -----------------------------------------------------------------
+
+;;; Something threads wait on until another thread says a value has changed.
+(defstruct Condvar [(ready (ptr sync/Condition))])
+
+(impl Condvar
+  ;;; A new one, with nobody waiting.
+  (new [] (-> Condvar)
+    (unsafe
+      (let [ready (one [sync/Condition])]
+        (match (sync/Condition::init ready)
+          (Ok [_] 0)
+          (Err [_] (panic "safe: a lock could not be made")))
+        (Condvar :ready ready))))
+
+  ;;; Wake one thread that waits here, if any does.
+  (notify-one [(c (ref Condvar))] (-> void)
+    (unsafe (sure (sync/Condition::notify-one! (.ready c)))))
+
+  ;;; Wake every thread that waits here.
+  (notify-all [(c (ref Condvar))] (-> void)
+    (unsafe (sure (sync/Condition::notify-all! (.ready c))))))
+
+(impl Drop Condvar
+  (drop [(self (mut Condvar))] (-> void)
+    (unsafe
+      (sure (sync/Condition::destroy! (.ready self)))
+      (free-one (.ready self))
+      0)))
+
+(impl [T] (Guard T)
+  ;;; Give the lock up, sleep until CONDVAR is notified, and hold the lock again.
+  ;;; The guard is lent exclusively meanwhile, so no reference to the value is
+  ;;; kept across the wait. A wait can end with nothing notified: wait in a loop
+  ;;; that looks at the value.
+  (wait [(g (mut (Guard T))) (condvar (ref Condvar))] (-> void)
+    (unsafe
+      (let [at (load (field g mutex))]
+        (atomic/store (field at owner) 0)
+        (sure (sync/Condition::wait! (.ready condvar) (load (field at lock))))
+        (atomic/store (field at owner) (thread/current-id))
+        0))))
+
+;;; ---- RwLock ------------------------------------------------------------------
+
+;;; Who holds a read-write lock: `readers` threads reading, or the thread
+;;; `writer` writing (0 when none is).
+(defstruct Holders
+  [(lock sync/Mutex) (changed sync/Condition) (readers i64) (writer i64)])
+
+;;; A value many threads may read at once, or one may change.
+(defstruct RwLock [T] [(holders (ptr Holders)) (value T)])
+
+;;; A held read lock. While it lives nobody writes. It is a view.
+(defstruct Reading [T] [(of (ptr (RwLock T)))])
+
+;;; A held write lock. While it lives nobody else reads or writes. It is a view.
+(defstruct Writing [T] [(of (ptr (RwLock T)))])
+
+(impl [T] View (Reading T))
+(impl [T] View (Writing T))
+
+(impl [T] (RwLock T)
+  ;;; VALUE, behind a read-write lock.
+  (new [(value T)] (-> (RwLock T))
+    (unsafe
+      (let [holders (one [Holders])]
+        (match (sync/Mutex::init (field holders lock))
+          (Ok [_] 0)
+          (Err [_] (panic "safe: a lock could not be made")))
+        (match (sync/Condition::init (field holders changed))
+          (Ok [_] 0)
+          (Err [_] (panic "safe: a lock could not be made")))
+        (store! (field holders readers) 0)
+        (store! (field holders writer) 0)
+        (RwLock :holders holders :value value))))
+
+  ;;; Wait until nobody writes, and read for as long as the result lives. A
+  ;;; thread that holds the write lock and asks to read stops the program.
+  (read [(l (ref (RwLock T)))] (-> (Reading T))
+    (unsafe
+      (let [at (primitive/cast (ptr (RwLock T)) l)
+            holders (load (field at holders))]
+        (sure (sync/Mutex::lock! (field holders lock)))
+        (when (= (load (field holders writer)) (thread/current-id))
+          (panic "safe: a thread asked to read a lock it holds for writing"))
+        (while (!= (load (field holders writer)) 0)
+          (sure (sync/Condition::wait! (field holders changed) (field holders lock))))
+        (store! (field holders readers) (+ (load (field holders readers)) 1))
+        (sure (sync/Mutex::unlock! (field holders lock)))
+        (Reading :of at))))
+
+  ;;; Wait until nobody reads or writes, and hold the lock alone for as long as
+  ;;; the result lives. A thread that holds the write lock and asks again stops
+  ;;; the program; one that holds a read lock and asks to write waits for ever.
+  (write [(l (ref (RwLock T)))] (-> (Writing T))
+    (unsafe
+      (let [at (primitive/cast (ptr (RwLock T)) l)
+            holders (load (field at holders))]
+        (sure (sync/Mutex::lock! (field holders lock)))
+        (when (= (load (field holders writer)) (thread/current-id))
+          (panic "safe: a thread asked for a lock it already holds"))
+        (while (or (!= (load (field holders writer)) 0) (> (load (field holders readers)) 0))
+          (sure (sync/Condition::wait! (field holders changed) (field holders lock))))
+        (store! (field holders writer) (thread/current-id))
+        (sure (sync/Mutex::unlock! (field holders lock)))
+        (Writing :of at)))))
+
+(impl [T] Drop (RwLock T)
+  (drop [(self (mut (RwLock T)))] (-> void)
+    (unsafe
+      (sure (sync/Condition::destroy! (field (.holders self) changed)))
+      (sure (sync/Mutex::destroy! (field (.holders self) lock)))
+      (free-one (.holders self))
+      0)))
+
+(impl [T] (Reading T)
+  ;;; The value behind the lock.
+  (get [(r (ref (Reading T)))] (-> (ref T))
+    (unsafe (lend (field (load (field r of)) value)))))
+
+(impl [T] Drop (Reading T)
+  (drop [(self (mut (Reading T)))] (-> void)
+    (unsafe
+      (let [holders (load (field (load (field self of)) holders))]
+        (sure (sync/Mutex::lock! (field holders lock)))
+        (store! (field holders readers) (- (load (field holders readers)) 1))
+        (sure (sync/Condition::notify-all! (field holders changed)))
+        (sure (sync/Mutex::unlock! (field holders lock)))
+        0))))
+
+(impl [T] (Writing T)
+  ;;; The value behind the lock.
+  (get [(w (ref (Writing T)))] (-> (ref T))
+    (unsafe (lend (field (load (field w of)) value))))
+
+  ;;; The value behind the lock, to be changed.
+  (get-mut [(w (mut (Writing T)))] (-> (mut T))
+    (unsafe (lend-mut (field (load (field w of)) value)))))
+
+(impl [T] Drop (Writing T)
+  (drop [(self (mut (Writing T)))] (-> void)
+    (unsafe
+      (let [holders (load (field (load (field self of)) holders))]
+        (sure (sync/Mutex::lock! (field holders lock)))
+        (store! (field holders writer) 0)
+        (sure (sync/Condition::notify-all! (field holders changed)))
+        (sure (sync/Mutex::unlock! (field holders lock)))
+        0))))
+
+;;; ---- Channel -----------------------------------------------------------------
+
+;;; A queue between threads. `items` is a ring: the oldest of its `count` values
+;;; is at `head`. `handles` is how many `Channel`s name it.
+(defstruct Queue [T]
+  [(lock sync/Mutex) (ready sync/Condition)
+   (items (slice T)) (head i64) (count i64)
+   (closed bool) (handles i64)])
+
+;;; One end of a queue of T between threads. Every `Channel` made by
+;;; `Channel::clone` names the same queue, and any of them sends and receives.
+;;; The queue is freed, with what is left in it, when its last `Channel` is.
+(defstruct Channel [T] [(queue (ptr (Queue T)))])
+
+(defn slots [T] [(count i64)] (-> (slice T))
+  (mem/room [T] count))
+
+;;; Take the oldest value. The caller holds the lock and has seen `count` > 0.
+(defn take-oldest [T] [(q (ptr (Queue T)))] (-> T)
+  (unsafe
+    (let [head (load (field q head))
+          value (take! [T] (primitive/index (data (load (field q items))) head))]
+      (store! (field q head) (% (+ head 1) (len (load (field q items)))))
+      (store! (field q count) (- (load (field q count)) 1))
+      value)))
+
+(impl [T] (Channel T)
+  ;;; A new, empty queue, and one `Channel` on it.
+  (new [] (-> (Channel T))
+    (unsafe
+      (let [q (one [(Queue T)])]
+        (match (sync/Mutex::init (field q lock))
+          (Ok [_] 0)
+          (Err [_] (panic "safe: a lock could not be made")))
+        (match (sync/Condition::init (field q ready))
+          (Ok [_] 0)
+          (Err [_] (panic "safe: a lock could not be made")))
+        (store! (field q items) (slots [T] 8))
+        (store! (field q head) 0)
+        (store! (field q count) 0)
+        (store! (field q closed) false)
+        (store! (field q handles) 1)
+        (Channel :queue q))))
+
+  ;;; Another `Channel` on the same queue.
+  (clone [(c (ref (Channel T)))] (-> (Channel T))
+    (unsafe
+      (atomic/add (field (.queue c) handles) 1)
+      (Channel :queue (.queue c))))
+
+  ;;; Put VALUE at the end of the queue. False, and VALUE is dropped, when the
+  ;;; queue is closed.
+  (send! [(c (ref (Channel T))) (value T)] (-> bool)
+    (unsafe
+      (let [q (.queue c)]
+        (sure (sync/Mutex::lock! (field q lock)))
+        (if (load (field q closed))
+            (do (sure (sync/Mutex::unlock! (field q lock)))
+                (let [unsent value] false))
+            (do (when (= (load (field q count)) (len (load (field q items))))
+                  (let [old (load (field q items))
+                        n (len old)
+                        bigger (slots [T] (* 2 n))]
+                    (for i (range 0 n)
+                      (store! (primitive/index (data bigger) i)
+                              (take! [T] (primitive/index (data old) (% (+ (load (field q head)) i) n)))))
+                    (mem/release old)
+                    (store! (field q items) bigger)
+                    (store! (field q head) 0)))
+                (let [items (load (field q items))]
+                  (store! (primitive/index (data items) (% (+ (load (field q head)) (load (field q count))) (len items)))
+                          value))
+                (store! (field q count) (+ (load (field q count)) 1))
+                (sure (sync/Condition::notify-one! (field q ready)))
+                (sure (sync/Mutex::unlock! (field q lock)))
+                true)))))
+
+  ;;; Take the oldest value, waiting for one if the queue is empty. None once
+  ;;; the queue is closed and empty.
+  (recv [(c (ref (Channel T)))] (-> (Option T))
+    (unsafe
+      (let [q (.queue c)]
+        (sure (sync/Mutex::lock! (field q lock)))
+        (while (and (= (load (field q count)) 0) (not (load (field q closed))))
+          (sure (sync/Condition::wait! (field q ready) (field q lock))))
+        (let [got (if (> (load (field q count)) 0)
+                      (Some (take-oldest q))
+                      (None [T]))]
+          (sure (sync/Mutex::unlock! (field q lock)))
+          got))))
+
+  ;;; Close the queue: nothing more is sent, and every waiting `recv` wakes.
+  (close! [(c (ref (Channel T)))] (-> void)
+    (unsafe
+      (let [q (.queue c)]
+        (sure (sync/Mutex::lock! (field q lock)))
+        (store! (field q closed) true)
+        (sure (sync/Condition::notify-all! (field q ready)))
+        (sure (sync/Mutex::unlock! (field q lock)))
+        0))))
+
+(impl [T] Drop (Channel T)
+  (drop [(self (mut (Channel T)))] (-> void)
+    (unsafe
+      (let [q (.queue self)]
+        (when (= (atomic/sub (field q handles) 1) 1)
+          (while (> (load (field q count)) 0)
+            (let [left (take-oldest q)] 0))
+          (mem/release (load (field q items)))
+          (sure (sync/Condition::destroy! (field q ready)))
+          (sure (sync/Mutex::destroy! (field q lock)))
+          (free-one q))
+        0))))

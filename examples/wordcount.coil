@@ -1,0 +1,59 @@
+;;; Count words on four threads into one shared table. No `unsafe`.
+;;;
+;;;   coil run examples/wordcount.coil --use safe.check
+(module example.wordcount)
+(import "coil.primitive" :as primitive)
+(import "safe.str" :use [Str])
+(import "safe.vec" :use [Vec])
+(import "safe.map" :use [Map])
+(import "safe.thread" :use [spawn Task])
+(import "safe.sync" :use [Arc Mutex with-lock Channel])
+
+;;; Add one to WORD's count in TABLE.
+(defn count! [(table (mut (Map Str i64))) (word (ref Str))] (-> void)
+  (if (Map::has? table word)
+      (let [n (primitive/load (Map::at table word))]
+        (set! (mut (Map::at-mut (mut table) word)) (+ n 1)))
+      (do (Map::insert! (mut table) (Str::copy word) 1) 0)))
+
+;;; Count the words of every line that arrives on LINES into TOTALS. How many
+;;; words this thread saw.
+(defn work [(lines (Channel Str)) (totals (Arc (Mutex (Map Str i64))))] (-> i64)
+  (let [(mut seen) 0]
+    (loop
+      (match (Channel::recv lines)
+        (None [] (break))
+        (Some [line]
+          (let [(mut word) (Str::new)]
+            (for i (range 0 (+ (Str::len line) 1))
+              (let [b (if (< i (Str::len line)) (Str::byte line i) #\space)]
+                (if (= b #\space)
+                    (when (> (Str::len word) 0)
+                      (with-lock (Arc::get totals) table
+                        (count! (mut table) word))
+                      (set! seen (+ seen 1))
+                      (set! word (Str::new)))
+                    (Str::push! (mut word) b))))
+            0))))
+    seen))
+
+(defn main [] (-> i64)
+  (let [totals (Arc::new (Mutex::new (Map::new [Str i64])))
+        lines (Channel::new [Str])
+        (mut workers) (Vec::new [(Task i64)])
+        (mut seen) 0]
+    (for i (range 0 4)
+      (Vec::push! (mut workers) (spawn (work (Channel::clone lines) (Arc::clone totals)))))
+    (for i (range 0 1000)
+      (Channel::send! lines (Str::from "the quick brown fox jumps over the lazy dog"))
+      (Channel::send! lines (Str::from "the dog barks and the fox runs")))
+    (Channel::close! lines)
+    (loop
+      (match (Vec::pop! (mut workers))
+        (None [] (break))
+        (Some [worker] (set! seen (+ seen (Task::join worker))))))
+    (with-lock (Arc::get totals) table
+      (println "{} words, {} different" seen (Map::len table))
+      (println "the: {}" (primitive/load (Map::at table (Str::from "the"))))
+      (println "fox: {}" (primitive/load (Map::at table (Str::from "fox")))))
+    0))

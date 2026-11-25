@@ -1,0 +1,10 @@
+(module case.bad-pool-two-elements)
+(import "safe.pool" :use [Pool Handle])
+(defstruct Pt [(x i64) (y i64)])
+(defn both [(a (mut Pt)) (b (mut Pt))] (-> void) (set! (.x a) (.x b)))
+(defn main [] (-> i64)
+  (let [(mut pool) (Pool::new [Pt])
+        a (Pool::insert! (mut pool) (Pt :x 1 :y 2))
+        b (Pool::insert! (mut pool) (Pt :x 3 :y 4))]
+    (both (mut (Pool::at-mut (mut pool) a)) (mut (Pool::at-mut (mut pool) b)))
+    0))

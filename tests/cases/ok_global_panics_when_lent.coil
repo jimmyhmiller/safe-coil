@@ -1,0 +1,8 @@
+(module case.ok-global-panics-when-lent)
+(import "safe.global" :use [defglobal with-ref with-mut Global])
+(defglobal counter i64 5)
+(defn main [] (-> i64)
+  (with-mut (counter) c (set! c 6))
+  (with-ref (counter) a
+    (with-ref (counter) b
+      (with-mut (counter) c (set! c 7)))))

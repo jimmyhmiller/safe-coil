@@ -1,0 +1,8 @@
+(module case.bad-box-reference-outlives)
+(import "safe.box" :use [Box])
+(import "coil.primitive" :as primitive)
+(defn main [] (-> i64)
+  (let [(mut b) (Box::new 1)
+        r (Box::get b)]
+    (set! b (Box::new 2))
+    (primitive/load r)))

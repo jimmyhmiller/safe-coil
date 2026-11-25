@@ -1,0 +1,1365 @@
+;;; The rules of safe Coil, as a checker. A program that imports this module, or is
+;;; compiled with `--use safe.check`, has every function its own modules define
+;;; checked against the rules worked out in `model/rules.rkt`.
+;;;
+;;; What the compiler already does is left to it: types, use of a moved owner,
+;;; writing through a shared reference, and keeping references out of structs,
+;;; sums and containers. This checker adds what it does not do:
+;;;
+;;; - a loan lives as long as the scope of the local that holds it, and nothing
+;;;   reads, writes, moves or lends a place against the loans alive on it;
+;;; - a reference never leaves the scope of what it refers to;
+;;; - a reference a call returns borrows from every argument of that call;
+;;; - raw memory is followed only inside `(unsafe …)`, and a form the rules do not
+;;;   cover is refused outside it.
+(module safe.check)
+; `--use safe.check` imports every exported name into the program. The checker
+; is the only one the program needs.
+(export safe-check)
+(import "coil.primitive" :as primitive)
+(import "coil.meta" :as meta)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.str" :use *)
+
+;;; ---- the state of one function's check ------------------------------------
+
+;;; A local in scope. A value local owns its storage, the place `(loc SERIAL)`. A
+;;; reference local refers to storage elsewhere, the place `(deref (loc SERIAL))`,
+;;; and holds the loans its initializer carried.
+(defstruct Local
+  [(binder Code)
+   (serial i64)
+   (reference bool)
+   ;;; the compiler's identity for it, 0 until a use has shown it
+   (bid i64)])
+
+;;; A loan alive: HOLDER (a local's serial, or -1 for a call argument still being
+;;; passed) has PLACE lent, shared or exclusive.
+(defstruct Loan [(holder i64) (place Code) (excl bool)])
+
+;;; What the consumer of an expression does with it.
+(defsum Want
+  ;;; nothing
+  (WDiscard)
+  ;;; takes a value: a copy, or a move of an owner
+  (WValue)
+  ;;; takes a shared reference
+  (WShared)
+  ;;; takes an exclusive reference
+  (WExcl)
+  ;;; binds it to a `let` name, which copies, moves or aliases by the compiler's rule
+  (WBind [(mutable bool)]))
+
+;;; What an expression produced: the loans its value carries, a list of
+;;; `(PLACE shr)` and `(PLACE mut)`, and whether the value is a fresh one that
+;;; refers to nothing.
+(defstruct Res [(loans Code) (fresh bool)])
+
+;;; A `block*` or `loop` a `break` can leave to.
+(defstruct Target
+  [(label Code)
+   (is-loop bool)
+   ;;; how many locals were in scope where it began
+   (depth i64)
+   (want Want)
+   (loans Code)
+   (fresh bool)])
+
+(defstruct Cx
+  [(locals (ArrayList Local))
+   (loans (ArrayList Loan))
+   (targets (ArrayList Target))
+   ;;; inside `(unsafe …)`
+   (unsafe bool)
+   (serial i64)
+   ;;; the function's type parameters, a list of symbols
+   (tparams Code)
+   ;;; the names of the modules being checked
+   (user Code)
+   ;;; the form being checked and the forms it is inside, outermost first
+   (path (ArrayList Code))
+   ;;; the locals that hold their loans until their scope ends: views that are
+   ;;; dropped, whose drop may use what they borrowed
+   (pinned (ArrayList i64))])
+
+;;; ---- small things ------------------------------------------------------------
+
+(defn fail! [(node Code) (message (slice u8))] (-> i64)
+  (primitive/report node message)
+  0)
+
+(defn text2 [(a (slice u8)) (b (slice u8))] (-> (slice u8))
+  (let [(mut sb) (StrBuf::new (meta/expansion-allocator))]
+    (push-str! (mut sb) a)
+    (push-str! (mut sb) b)
+    (str sb)))
+
+(defn text3 [(a (slice u8)) (b (slice u8)) (c (slice u8))] (-> (slice u8))
+  (text2 (text2 a b) c))
+
+(defn head-is? [(e Code) (name Code)] (-> bool)
+  (and (primitive/code-list? e)
+       (> (len e) 0)
+       (primitive/code-sym? (get e 0))
+       (primitive/code-eq (get e 0) name)))
+
+;;; The name HEAD spells, without the module alias before a `/`.
+(defn base-name [(head Code)] (-> Code)
+  (let [text (meta/source head)
+        (mut start) 0]
+    (for [i 0 (len text)]
+      (when (and (= (get text i) #\/) (< (+ i 1) (len text))) (set! start (+ i 1))))
+    (primitive/code-symbol (substr text start (len text)))))
+
+;;; Is E a form whose head spells the core form or primitive NAME, under any alias
+;;; of its module? The compiler reads these heads itself, so no function of the
+;;; program can be called by one.
+(defn form-is? [(e Code) (name Code)] (-> bool)
+  (and (primitive/code-list? e)
+       (> (len e) 0)
+       (primitive/code-sym? (get e 0))
+       (primitive/code-eq (base-name (get e 0)) name)))
+
+(defn name-in? [(name Code) (names Code)] (-> bool)
+  (block :found
+    (for n (iter names)
+      (when (primitive/code-eq n name) (return-from :found true)))
+    false))
+
+(defn literal? [(node Code)] (-> bool)
+  (not (or (primitive/code-list? node) (primitive/code-sym? node) (primitive/code-vector? node))))
+
+(defn no-loans [] (-> Code) `())
+
+(defn fresh [] (-> Res) (Res :loans (no-loans) :fresh true))
+
+(defn carrying [(loans Code)] (-> Res) (Res :loans loans :fresh false))
+
+(defn union [(a Code) (b Code)] (-> Code)
+  (let [(mut out) (primitive/code-list-new)]
+    (for x (iter a) (push! (mut out) x))
+    (for x (iter b) (unless (name-in? x a) (push! (mut out) x)))
+    `(~@out)))
+
+(defn temporary-loan [] (-> Code) `(((tmp) shr)))
+
+;;; A loan on a temporary that owns something. Coil drops such a temporary when
+;;; the statement it was made in ends, and keeps it for a `let` bound to a
+;;; reference. So a reference into one is used freely in its statement, and
+;;; must not leave it: not as a function's result, not as the value of a block
+;;; or a `break`, and not held by a view that a `let` binds.
+(defn dropped-loan [] (-> Code) `(((dropped) shr)))
+
+(defn into-dropped? [(loans Code)] (-> bool)
+  (block :found
+    (for l (iter loans)
+      (when (head-is? (place-root (get l 0)) `dropped) (return-from :found true)))
+    false))
+
+;;; LOANS are about to be kept: by a name, by a call's result, by a match arm.
+(defn refuse-dropped! [(node Code) (loans Code)] (-> i64)
+  (if (into-dropped? loans)
+      (fail! node "safe: this keeps a reference into a temporary past the statement it was made in; bind the temporary to a name")
+      0))
+
+;;; The value of an expression that is one of two. When only one is a fresh
+;;; value, the whole may refer to it: a temporary of this frame.
+(defn join [(a Res) (b Res)] (-> Res)
+  (let [both (union (.loans a) (.loans b))]
+    (Res :loans (if (= (.fresh a) (.fresh b)) both (union both (temporary-loan)))
+         :fresh (and (.fresh a) (.fresh b)))))
+
+;;; ---- types ------------------------------------------------------------------
+
+(defn type-of [(node Code)] (-> Code)
+  (match (primitive/type-of node)
+    (primitive/TypeIs [t] t)
+    (_ `unknown-type)))
+
+(defn ref-type? [(t Code)] (-> bool)
+  (or (head-is? t `ref) (head-is? t `mut)))
+
+(defn raw-type? [(t Code)] (-> bool)
+  (or (head-is? t `ptr) (head-is? t `slice) (head-is? t `fnptr) (head-is? t `dyn)))
+
+(defn pointee [(t Code)] (-> Code)
+  (if (ref-type? t) (get t 1) t))
+
+;;; Is T a raw pointer, or a place that holds one? A local declared `(mut q)`
+;;; that holds a raw pointer is typed as the place, and following it is the same
+;;; act as following the pointer.
+(defn raw-held? [(t Code)] (-> bool)
+  (raw-type? (pointee t)))
+
+(defn scalar-name? [(t Code)] (-> bool)
+  (name-in? t `(i8 i16 i32 i64 u8 u16 u32 u64 isize usize f32 f64 bool void ! never)))
+
+;;; A value that is one machine word or a few, read out of its place when it is
+;;; named: a number, a bool, a raw pointer.
+(defn word-type? [(t Code)] (-> bool)
+  (or (and (primitive/code-sym? t) (scalar-name? t)) (raw-type? t)))
+
+(defn has-drop? [(t Code)] (-> bool)
+  (match (primitive/code-type-traits t)
+    (primitive/TraitsAre [names] (name-in? `coil.core.Drop names))
+    (primitive/TraitsUnknown [] true)))
+
+;;; Is T a view: a struct its module marked with the trait `safe.core.View`? A
+;;; view stands for the references it was made from. It is a local, an argument
+;;; or a result, and is never stored.
+(defn view-type? [(t Code)] (-> bool)
+  (and (or (primitive/code-list? t) (and (primitive/code-sym? t) (not (scalar-name? t))))
+       (not (ref-type? t))
+       (not (raw-type? t))
+       (not (head-is? t `array))
+       (not (primitive/code-eq t `unknown-type))
+       (match (primitive/code-type-traits t)
+         (primitive/TraitsAre [names] (name-in? `safe.core.View names))
+         (primitive/TraitsUnknown [] false))))
+
+;;; Does every part of T satisfy PART? T is a struct or a sum; anything else is
+;;; not known to.
+(defn copy-parts? [(cx (ref Cx)) (t Code) (depth i64)] (-> bool)
+  (match (primitive/code-type-shape t)
+    (primitive/StructShape []
+      (block :all
+        (for [i 0 (primitive/code-field-count t)]
+          (unless (copy-type? cx (primitive/code-field-type t i) (+ depth 1))
+            (return-from :all false)))
+        true))
+    (primitive/SumShape []
+      (block :all
+        (for [v 0 (primitive/code-variant-count t)]
+          (for [i 0 (primitive/code-variant-fields t v)]
+            (unless (copy-type? cx (primitive/code-variant-field-type t v i) (+ depth 1))
+              (return-from :all false))))
+        true))
+    (primitive/UnknownShape [] false)))
+
+;;; Do T's values own nothing, so that naming one copies it? A type parameter
+;;; may stand for an owner. A type nested deeper than any real one is not
+;;; followed further, and counts as an owner.
+(defn copy-type? [(cx (ref Cx)) (t Code) (depth i64)] (-> bool)
+  (cond (> depth 16) false
+        (primitive/code-sym? t)
+          (cond (scalar-name? t) true
+                (name-in? t (.tparams cx)) false
+                (has-drop? t) false
+                :else (copy-parts? cx t depth))
+        (raw-type? t) true
+        (ref-type? t) false
+        (head-is? t `array) (copy-type? cx (get t 1) (+ depth 1))
+        (not (primitive/code-list? t)) false
+        (has-drop? t) false
+        :else (copy-parts? cx t depth)))
+
+(defn owner-type? [(cx (ref Cx)) (t Code)] (-> bool)
+  (not (copy-type? cx t 0)))
+
+;;; Is the struct or sum type T declared in a module being checked?
+(defn checked-type? [(cx (ref Cx)) (t Code)] (-> bool)
+  (let [name (if (primitive/code-list? t) (get t 0) t)]
+    (and (primitive/code-sym? name)
+         (let [text (meta/source name)
+               (mut dot) -1]
+           (for [i 0 (len text)]
+             (when (= (get text i) #\.) (set! dot i)))
+           (and (> dot 0) (name-in? (primitive/code-symbol (substr text 0 dot)) (.user cx)))))))
+
+(defn raw-parts? [(cx (ref Cx)) (t Code) (depth i64) (inside bool)] (-> bool)
+  (match (primitive/code-type-shape t)
+    (primitive/StructShape []
+      (block :any
+        (for [i 0 (primitive/code-field-count t)]
+          (when (raw-in? cx (primitive/code-field-type t i) (+ depth 1) inside)
+            (return-from :any true)))
+        false))
+    (primitive/SumShape []
+      (block :any
+        (for [v 0 (primitive/code-variant-count t)]
+          (for [i 0 (primitive/code-variant-fields t v)]
+            (when (raw-in? cx (primitive/code-variant-field-type t v i) (+ depth 1) inside)
+              (return-from :any true))))
+        false))
+    (primitive/UnknownShape [] true)))
+
+;;; Can a value of T hold raw memory, at any depth? Unknown types can, and an
+;;; array counts: the library reads one without checking the index. Unless
+;;; INSIDE, a struct or sum of a checked module does not count: safe code cannot
+;;; put raw memory in one (see `raw-field?`), so what it holds is what its
+;;; module's `unsafe` code put there.
+(defn raw-in? [(cx (ref Cx)) (t Code) (depth i64) (inside bool)] (-> bool)
+  (cond (> depth 16) true
+        (primitive/code-sym? t)
+          (cond (scalar-name? t) false
+                (name-in? t (.tparams cx)) false
+                (and (not inside) (checked-type? cx t)) false
+                :else (raw-parts? cx t depth inside))
+        (raw-type? t) true
+        (ref-type? t) (raw-in? cx (get t 1) (+ depth 1) inside)
+        ; an array is indexed without a bounds check
+        (head-is? t `array) true
+        (not (primitive/code-list? t)) true
+        (and (not inside) (checked-type? cx t)) false
+        :else (raw-parts? cx t depth inside)))
+
+(defn raw-carrying? [(cx (ref Cx)) (t Code) (depth i64)] (-> bool)
+  (raw-in? cx t depth false))
+
+;;; Is T itself raw memory? A field of such a type is filled and changed only
+;;; inside `unsafe`, so that a type's own code decides what its pointers are.
+(defn raw-field? [(t Code)] (-> bool)
+  (or (raw-type? t) (head-is? t `array)))
+
+;;; Has the struct type T a field that is itself raw memory?
+(defn struct-holds-raw? [(t Code)] (-> bool)
+  (match (primitive/code-type-shape t)
+    (primitive/StructShape []
+      (block :any
+        (for [i 0 (primitive/code-field-count t)]
+          (when (raw-field? (primitive/code-field-type t i)) (return-from :any true)))
+        false))
+    (_ false)))
+
+;;; A parameter type of a library function, with its own type parameters made
+;;; harmless: a bare name that is no number and no struct or sum is one of them.
+(defn parameter-raw? [(cx (ref Cx)) (t Code)] (-> bool)
+  (cond (primitive/code-sym? t)
+          (cond (scalar-name? t) false
+                (match (primitive/code-type-shape t) (primitive/UnknownShape [] true) (_ false)) false
+                :else (raw-carrying? cx t 0))
+        (raw-type? t) true
+        (or (ref-type? t) (head-is? t `array)) (parameter-raw? cx (get t 1))
+        (not (primitive/code-list? t)) true
+        :else
+          (or (raw-carrying? cx (get t 0) 0)
+              (block :any
+                (for [i 1 (len t)]
+                  (when (parameter-raw? cx (get t i)) (return-from :any true)))
+                false))))
+
+(defn any-raw-parameter? [(cx (ref Cx)) (types Code)] (-> bool)
+  (block :any
+    (for t (iter types)
+      (when (parameter-raw? cx t) (return-from :any true)))
+    false))
+
+;;; Is an argument of the call E raw memory, or something that holds some?
+(defn any-raw-argument? [(cx (ref Cx)) (e Code)] (-> bool)
+  (block :any
+    (for [i 1 (len e)]
+      (let [arg (get e i)]
+        (unless (or (primitive/code-keyword? arg) (literal? arg)
+                    (primitive/code-eq (type-of arg) `unknown-type))
+          (when (raw-carrying? cx (pointee (type-of arg)) 0) (return-from :any true)))))
+    false))
+
+;;; ---- places and loans ---------------------------------------------------------
+;;;
+;;; A place is `(loc N)`, a local's own storage; `(ext N)`, what parameter N was
+;;; lent by the caller; `(tmp)`, a temporary of the function's frame; `(deref Q)`,
+;;; what the reference at Q refers to; or `(fld Q NAME)`.
+
+(defn place-root [(q Code)] (-> Code)
+  (if (or (head-is? q `deref) (head-is? q `fld)) (place-root (get q 1)) q))
+
+(defn through-deref? [(q Code)] (-> bool)
+  (cond (head-is? q `deref) true
+        (head-is? q `fld) (through-deref? (get q 1))
+        :else false))
+
+;;; Is A the place B, or one B is inside?
+(defn prefix? [(a Code) (b Code)] (-> bool)
+  (or (primitive/code-eq a b)
+      (and (or (head-is? b `deref) (head-is? b `fld)) (prefix? a (get b 1)))))
+
+(defn overlap? [(a Code) (b Code)] (-> bool)
+  (or (prefix? a b) (prefix? b a)))
+
+(defn shared-loan [(q Code)] (-> Code) `((~q shr)))
+
+(defn excl-loan [(q Code)] (-> Code) `((~q mut)))
+
+(defn loan-place [(l Code)] (-> Code) (get l 0))
+
+(defn loan-excl? [(l Code)] (-> bool) (primitive/code-eq (get l 1) `mut))
+
+;;; Is some loan alive on any part of Q? Only exclusive ones count unless ANY.
+;;; ---- how long a loan counts ---------------------------------------------------
+;;;
+;;; A loan counts while its holder is still named by code that runs later. The
+;;; forms that run later are read off `path`: in each form the one being checked
+;;; is inside, whatever is written after it. A loop runs again and an assignment
+;;; may use its place after its value, so everything in one of those counts.
+
+(defn names? [(code Code) (binder Code)] (-> bool)
+  (cond (primitive/code-sym? code) (primitive/bound-identifier=? binder code)
+        (or (primitive/code-list? code) (primitive/code-vector? code))
+          (block :found
+            (for part (iter code)
+              (when (names? part binder) (return-from :found true)))
+            false)
+        :else false))
+
+;;; Is BINDER named in NODE after CHILD, the first part of NODE written as CHILD
+;;; is? SEEN says whether CHILD has been passed.
+(defn names-after? [(node Code) (child Code) (binder Code) (seen (mut bool))] (-> bool)
+  (cond (and (not seen) (primitive/code-eq node child)) (do (set! seen true) false)
+        (primitive/code-sym? node) (and seen (primitive/bound-identifier=? binder node))
+        (or (primitive/code-list? node) (primitive/code-vector? node))
+          (block :found
+            (for part (iter node)
+              (when (names-after? part child binder (mut seen)) (return-from :found true)))
+            false)
+        :else false))
+
+;;; Does every part of FORM count as running later than any part of it?
+(defn runs-again? [(form Code)] (-> bool)
+  (and (primitive/code-list? form)
+       (> (len form) 0)
+       (primitive/code-sym? (get form 0))
+       (let [text (meta/source (base-name (get form 0)))]
+         (or (= text "loop")
+             (and (> (len text) 0) (= (get text (- (len text) 1)) #\!))))))
+
+(defn named-later? [(cx (ref Cx)) (binder Code)] (-> bool)
+  (block :found
+    (for [k 0 (- (len (.path cx)) 1)]
+      (let [parent (get (.path cx) k)
+            child (get (.path cx) (+ k 1))
+            (mut seen) false]
+        (when (if (runs-again? parent)
+                  (names? parent binder)
+                  (or (names-after? parent child binder (mut seen))
+                      ; CHILD is not written in PARENT as it stands: all of it counts
+                      (and (not seen) (names? parent binder))))
+          (return-from :found true))))
+    false))
+
+;;; Does the loan a holder has still count? A call's argument being passed
+;;; (holder -1) does. A local does while it is named later, when it is pinned,
+;;; and when a holder that counts borrowed through it: that one reaches what
+;;; this one borrowed.
+(defn holder-counts? [(cx (ref Cx)) (holder i64) (depth i64)] (-> bool)
+  (if (< holder 0)
+      true
+      (block :found
+        (for [i 0 (len (.pinned cx))]
+          (when (= (get (.pinned cx) i) holder) (return-from :found true)))
+        (for [i 0 (len (.locals cx))]
+          (let [l (get (.locals cx) i)]
+            (when (and (= (.serial l) holder) (named-later? cx (.binder l)))
+              (return-from :found true))))
+        ; a chain of borrows is no longer than the locals in scope
+        (when (< depth (len (.locals cx)))
+          (for [i 0 (len (.loans cx))]
+            (let [l (get (.loans cx) i)
+                  root (place-root (.place l))]
+              (when (and (!= (.holder l) holder)
+                         (head-is? root `loc)
+                         (= (primitive/code-int (get root 1)) holder)
+                         (holder-counts? cx (.holder l) (+ depth 1)))
+                (return-from :found true)))))
+        false)))
+
+(defn lent? [(cx (ref Cx)) (q Code) (any bool)] (-> bool)
+  (block :found
+    (for [i 0 (len (.loans cx))]
+      (let [l (get (.loans cx) i)]
+        (when (and (or any (.excl l))
+                   (overlap? (.place l) q)
+                   (holder-counts? cx (.holder l) 0))
+          (return-from :found true))))
+    false))
+
+(defn check-read! [(cx (ref Cx)) (node Code) (q Code)] (-> i64)
+  (if (lent? cx q false)
+      (fail! node "safe: this is read while it is lent exclusively")
+      0))
+
+(defn check-write! [(cx (ref Cx)) (node Code) (q Code) (what (slice u8))] (-> i64)
+  (if (lent? cx q true)
+      (fail! node (text3 "safe: this is " what " while it is lent"))
+      0))
+
+(defn hold! [(cx (mut Cx)) (holder i64) (loans Code)] (-> i64)
+  (for l (iter loans)
+    (push! (mut (.loans cx)) (Loan :holder holder :place (loan-place l) :excl (loan-excl? l))))
+  0)
+
+(defn loans-of [(cx (ref Cx)) (holder i64)] (-> Code)
+  (let [(mut out) (primitive/code-list-new)]
+    (for [i 0 (len (.loans cx))]
+      (let [l (get (.loans cx) i)]
+        (when (= (.holder l) holder)
+          (push! (mut out) (if (.excl l) `(~(.place l) mut) `(~(.place l) shr))))))
+    `(~@out)))
+
+(defn drop-loans-to! [(cx (mut Cx)) (count i64)] (-> i64)
+  (while (> (len (.loans cx)) count) (pop! (mut (.loans cx))))
+  0)
+
+;;; ---- locals -------------------------------------------------------------------
+
+(defn push-local! [(cx (mut Cx)) (binder Code) (reference bool)] (-> i64)
+  (let [serial (+ (.serial cx) 1)]
+    (set! (.serial cx) serial)
+    (push! (mut (.locals cx)) (Local :binder binder :serial serial :reference reference :bid 0))
+    serial))
+
+;;; The index of the local the symbol SYM names, or -1. A macro's names and the
+;;; program's may be spelled alike, so the binder is found as the compiler finds
+;;; it, and the identity the compiler gave the use must agree with the last one.
+(defn find-local [(cx (mut Cx)) (sym Code)] (-> i64)
+  (let [(mut i) (- (len (.locals cx)) 1)
+        (mut found) -1]
+    (while (and (>= i 0) (< found 0))
+      (when (primitive/bound-identifier=? (.binder (get (.locals cx) i)) sym)
+        (set! found i))
+      (set! i (- i 1)))
+    (when (>= found 0)
+      (let [l (get (.locals cx) found)
+            bid (primitive/binding-of sym)]
+        (cond (= (.bid l) 0) (do (set! (mut (.locals cx)) found (Local :binder (.binder l) :serial (.serial l) :reference (.reference l) :bid bid)) 0)
+              (!= (.bid l) bid) (fail! sym "safe: internal error: this name was matched to the wrong local")
+              :else 0)))
+    found))
+
+(defn local-place [(l Local)] (-> Code)
+  (if (.reference l) `(deref (loc ~(.serial l))) `(loc ~(.serial l))))
+
+;;; The local L leaves scope while a value carrying LOANS leaves with it. A loan
+;;; on L's own storage cannot leave. A loan on what L refers to becomes L's
+;;; loans.
+(defn exit-local [(cx (ref Cx)) (node Code) (l Local) (loans Code)] (-> Code)
+  (let [(mut out) (primitive/code-list-new)
+        own `(loc ~(.serial l))]
+    (for x (iter loans)
+      (cond (not (primitive/code-eq (place-root (loan-place x)) own)) (do (push! (mut out) x) 0)
+            (and (.reference l) (through-deref? (loan-place x)))
+              (do (for held (iter (loans-of cx (.serial l)))
+                    (push! (mut out) held))
+                  0)
+            :else
+              (fail! node (text3 "safe: a reference to `" (meta/source (.binder l)) "` would outlive it"))))
+    (union `() `(~@out))))
+
+;;; End every scope begun since there were LOCALS locals and LOANS loans alive.
+(defn exit-scopes! [(cx (mut Cx)) (node Code) (locals i64) (loans i64) (carried Code)] (-> Code)
+  (let [(mut out) carried]
+    (while (> (len (.locals cx)) locals)
+      (let [l (get (.locals cx) (- (len (.locals cx)) 1))]
+        (set! out (exit-local cx node l out))
+        (pop! (mut (.locals cx)))))
+    (drop-loans-to! (mut cx) loans)
+    out))
+
+;;; ---- which code may use raw memory --------------------------------------------
+
+(defn expanded-by? [(node Code) (macros Code)] (-> bool)
+  (match (primitive/code-macro-of node)
+    (primitive/ExpandedBy [q] (name-in? q macros))
+    (_ false)))
+
+;;; The library macros whose own code is taken on trust, as the library's
+;;; functions are: what they generate may follow raw memory. Code the program
+;;; wrote inside a use of one is checked as usual.
+(defn trusted? [(node Code)] (-> bool)
+  (expanded-by? node
+                `(coil.print.print coil.print.println coil.fmt.fmt coil.panic.panic coil.panic.unreachable
+                  coil.assert.assert coil.assert.assert-eq)))
+
+(defn raw-ok? [(cx (ref Cx)) (node Code)] (-> bool)
+  (or (.unsafe cx) (trusted? node)))
+
+(defn need-unsafe! [(cx (ref Cx)) (node Code) (what (slice u8))] (-> i64)
+  (if (raw-ok? cx node)
+      0
+      (fail! node (text3 "safe: " what " is allowed only inside (unsafe …)"))))
+
+;;; CHILD is handed to trusted code, PARENT. Raw memory the program made must
+;;; not reach it outside `unsafe`: the trusted code will follow it.
+(defn guard-raw-flow! [(cx (ref Cx)) (parent Code) (child Code)] (-> i64)
+  (if (and (trusted? parent)
+           (not (.unsafe cx))
+           (not (primitive/code-macro? child))
+           (not (literal? child))
+           (raw-carrying? cx (type-of child) 0))
+      (fail! child "safe: raw memory is handed to library code; that is allowed only inside (unsafe …)")
+      0))
+
+;;; ---- expressions ----------------------------------------------------------------
+
+;;; The place the expression E names, as a one-element list, or `()` when it
+;;; names none: a local, or a field of a place.
+(defn place-of [(cx (mut Cx)) (e Code)] (-> Code)
+  (cond (primitive/code-sym? e)
+          (if (> (primitive/binding-of e) 0)
+              (let [i (find-local (mut cx) e)]
+                (if (>= i 0)
+                    `(~(local-place (get (.locals cx) i)))
+                    (do (fail! e "safe: internal error: no local in scope has this name") `())))
+              `())
+        (field-form? e)
+          (let [base (place-of (mut cx) (field-base e))]
+            (if (and (= (len base) 1) (not (raw-held? (type-of (field-base e)))))
+                `((fld ~(get base 0) ~(field-name e)))
+                `()))
+        :else `()))
+
+;;; `(.NAME BASE)` or `(field BASE NAME)`.
+(defn dot-name? [(s Code)] (-> bool)
+  (and (primitive/code-sym? s)
+       (let [text (meta/source s)]
+         (and (> (len text) 1) (= (get text 0) #\.) (!= (get text 1) #\.)))))
+
+(defn field-form? [(e Code)] (-> bool)
+  (and (primitive/code-list? e)
+       (or (and (= (len e) 2) (dot-name? (get e 0)))
+           (and (= (len e) 3) (form-is? e `field)))))
+
+(defn field-base [(e Code)] (-> Code)
+  (get e 1))
+
+(defn field-name [(e Code)] (-> Code)
+  (if (form-is? e `field)
+      (get e 2)
+      (primitive/code-symbol (substr (meta/source (get e 0)) 1 (len (meta/source (get e 0)))))))
+
+;;; The place Q is used as NODE says, by a consumer that wants WANT.
+(defn use-place [(cx (mut Cx)) (node Code) (q Code) (want Want)] (-> Res)
+  (let [t (type-of node)
+        content (pointee t)]
+    (match want
+      (WDiscard [] (fresh))
+      (WValue []
+        (do (if (owner-type? cx content)
+                (check-write! cx node q "moved")
+                (check-read! cx node q))
+            (if (view-type? content)
+                ; a view taken out of a local takes that local's loans with it;
+                ; one copied from anywhere else is tied to where it was
+                (Res :loans (if (head-is? q `loc) (loans-of cx (primitive/code-int (get q 1))) (shared-loan q))
+                     :fresh true)
+                (fresh))))
+      (WShared []
+        (do (check-read! cx node q)
+            (carrying (shared-loan q))))
+      (WExcl []
+        (do (check-write! cx node q "lent exclusively")
+            (carrying (excl-loan q))))
+      (WBind [mutable]
+        (cond (not (ref-type? t)) (use-place (mut cx) node q (WValue))
+              (owner-type? cx content) (use-place (mut cx) node q (WValue))
+              mutable (use-place (mut cx) node q (WValue))
+              (word-type? content) (use-place (mut cx) node q (WValue))
+              :else (use-place (mut cx) node q (WShared)))))))
+
+;;; A value that is no place is used by a consumer that wants WANT: a fresh
+;;; aggregate taken by reference is a temporary of this frame.
+(defn use-value [(cx (ref Cx)) (node Code) (r Res) (want Want)] (-> Res)
+  (match want
+    (WDiscard [] r)
+    ; a view keeps the loans of what it was made from
+    (WValue [] (if (view-type? (pointee (type-of node))) (Res :loans (.loans r) :fresh true) (fresh)))
+    (WBind [_] r)
+    (_ (if (and (.fresh r) (not (word-type? (pointee (type-of node)))))
+           (carrying (union (if (owner-type? cx (pointee (type-of node))) (dropped-loan) (temporary-loan))
+                            (.loans r)))
+           r))))
+
+(defn eval-seq [(cx (mut Cx)) (forms Code) (from i64) (want Want)] (-> Res)
+  (let [n (len forms)
+        (mut out) (fresh)]
+    (for [i from n]
+      (set! out (eval (mut cx) (get forms i) (if (= i (- n 1)) want (WDiscard)))))
+    (if (<= n from) (fresh) out)))
+
+;;; Evaluate every element of E from FROM on as a value, for a form whose own
+;;; meaning the rules do not cover: its parts are still checked.
+(defn eval-parts [(cx (mut Cx)) (e Code) (from i64)] (-> Res)
+  (for [i from (len e)]
+    (let [part (get e i)]
+      (unless (primitive/code-keyword? part)
+        (eval (mut cx) part (WValue)))))
+  (fresh))
+
+(defn eval-let [(cx (mut Cx)) (e Code) (want Want)] (-> Res)
+  (let [binds (get e 1)
+        locals (len (.locals cx))
+        loans (len (.loans cx))]
+    (for [k 0 (/ (len binds) 2)]
+      (let [binder (get binds (* k 2))
+            init (get binds (+ (* k 2) 1))
+            mutable (head-is? binder `mut)
+            name (if mutable (get binder 1) binder)]
+        (if (primitive/code-sym? name)
+            (do (guard-raw-flow! cx e init)
+                (let [r (eval (mut cx) init (WBind mutable))
+                      serial (push-local! (mut cx) name (not (.fresh r)))]
+                  ; a value of its own that is dropped: a view, when it holds loans
+                  (when (and (.fresh r)
+                             (owner-type? cx (pointee (if (primitive/code-eq (type-of init) `unknown-type)
+                                                          (type-of name)
+                                                          (type-of init)))))
+                    (push! (mut (.pinned cx)) serial))
+                  ; a `let` bound to a reference keeps the temporaries of its
+                  ; initializer; one bound to a view does not
+                  (unless (ref-type? (type-of init))
+                    (refuse-dropped! init (.loans r)))
+                  (hold! (mut cx) serial (.loans r))))
+            (fail! binder "safe: this binding form is not covered by the rules"))))
+    (let [r (eval-seq (mut cx) e 2 want)]
+      (Res :loans (exit-scopes! (mut cx) e locals loans (.loans r)) :fresh (.fresh r)))))
+
+(defn eval-if [(cx (mut Cx)) (e Code) (want Want)] (-> Res)
+  (eval (mut cx) (get e 1) (WValue))
+  (let [then (eval (mut cx) (get e 2) want)]
+    (if (> (len e) 3)
+        (join then (eval (mut cx) (get e 3) want))
+        then)))
+
+;;; The type of field FIELD of the variant ARM names in the sum type SUM, or
+;;; `unknown-type`.
+(defn payload-type [(sum Code) (arm Code) (field i64)] (-> Code)
+  (block :found
+    (match (primitive/code-type-shape sum)
+      (primitive/SumShape []
+        (for [v 0 (primitive/code-variant-count sum)]
+          (when (and (primitive/code-eq (primitive/code-variant-name sum v) (base-name (get arm 0)))
+                     (< field (primitive/code-variant-fields sum v)))
+            (return-from :found (primitive/code-variant-field-type sum v field)))))
+      (_ 0))
+    `unknown-type))
+
+;;; Has the variant the form E names, of the sum type SUM, a field that is itself
+;;; raw memory?
+(defn variant-holds-raw? [(sum Code) (e Code)] (-> bool)
+  (block :any
+    (for [k 0 64]
+      (let [t (payload-type sum e k)]
+        (when (primitive/code-eq t `unknown-type) (return-from :any false))
+        (when (raw-field? t) (return-from :any true))))
+    false))
+
+;;; A match on a temporary consumes it, and each arm owns what it binds. A match
+;;; on a place copies out the plain parts of the payload and lends the arm the
+;;; parts that own something, where they lie: the place stays lent to those
+;;; names, so the variant cannot be replaced under them.
+(defn eval-match [(cx (mut Cx)) (e Code) (want Want)] (-> Res)
+  (let [scrutinee (get e 1)
+        q (place-of (mut cx) scrutinee)
+        named (= (len q) 1)
+        writable (head-is? (type-of scrutinee) `mut)
+        ; a reference a call returned is matched where it points, like a name
+        lends (or named (ref-type? (type-of scrutinee)))
+        sum (pointee (type-of scrutinee))
+        lent (cond named
+                     (do (check-read! cx scrutinee (get q 0))
+                         (if writable (excl-loan (get q 0)) (shared-loan (get q 0))))
+                   lends (.loans (eval (mut cx) scrutinee (if writable (WExcl) (WShared))))
+                   :else (do (eval (mut cx) scrutinee (WValue)) (no-loans)))
+        (mut out) (fresh)
+        (mut first) true]
+    (refuse-dropped! scrutinee lent)
+    (for [i 2 (len e)]
+      (let [arm (get e i)
+            locals (len (.locals cx))
+            loans (len (.loans cx))]
+        (if (and (primitive/code-list? arm) (> (len arm) 0))
+            (let [binds? (and (> (len arm) 1) (primitive/code-vector? (get arm 1)))]
+              (when binds?
+                (for [k 0 (len (get arm 1))]
+                  (let [b (get (get arm 1) k)]
+                    (if (primitive/code-sym? b)
+                        (if (and lends (owner-type? cx (payload-type sum arm k)))
+                            (let [serial (push-local! (mut cx) b true)]
+                              (when (and named writable)
+                                (check-write! cx scrutinee (get q 0) "matched, which lends its payload exclusively,"))
+                              (hold! (mut cx) serial lent))
+                            (do (push-local! (mut cx) b false) 0))
+                        (fail! b "safe: this pattern is not covered by the rules")))))
+              (let [r (eval-seq (mut cx) arm (if binds? 2 1) want)
+                    left (Res :loans (exit-scopes! (mut cx) arm locals loans (.loans r))
+                              :fresh (.fresh r))]
+                (set! out (if first left (join out left)))
+                (set! first false)))
+            (do (fail! arm "safe: this match arm is not covered by the rules") 0))))
+    out))
+
+(defn push-target! [(cx (mut Cx)) (label Code) (is-loop bool) (want Want)] (-> i64)
+  (push! (mut (.targets cx))
+         (Target :label label :is-loop is-loop :depth (len (.locals cx)) :want want
+                 :loans (no-loans) :fresh true))
+  0)
+
+(defn pop-target! [(cx (mut Cx))] (-> Res)
+  (let [t (get (.targets cx) (- (len (.targets cx)) 1))]
+    (pop! (mut (.targets cx)))
+    (Res :loans (.loans t) :fresh (.fresh t))))
+
+(defn eval-loop [(cx (mut Cx)) (e Code) (want Want)] (-> Res)
+  (push-target! (mut cx) `() true want)
+  (eval-seq (mut cx) e 1 (WDiscard))
+  (pop-target! (mut cx)))
+
+(defn eval-block [(cx (mut Cx)) (e Code) (want Want)] (-> Res)
+  (push-target! (mut cx) (get e 1) false want)
+  (let [r (eval-seq (mut cx) e 2 want)]
+    ; a block's value leaves the statement it was made in
+    (refuse-dropped! e (.loans r))
+    (join r (pop-target! (mut cx)))))
+
+;;; The index of the target a `break` leaves to, or -1: the block named LABEL when
+;;; LABELLED, else the innermost loop.
+(defn find-target [(cx (ref Cx)) (labelled bool) (label Code)] (-> i64)
+  (let [(mut i) (- (len (.targets cx)) 1)
+        (mut found) -1]
+    (while (and (>= i 0) (< found 0))
+      (let [t (get (.targets cx) i)]
+        (when (if labelled
+                  (and (not (.is-loop t)) (primitive/code-eq (.label t) label))
+                  (.is-loop t))
+          (set! found i)))
+      (set! i (- i 1)))
+    found))
+
+(defn eval-break [(cx (mut Cx)) (e Code)] (-> Res)
+  (let [labelled (and (> (len e) 1) (primitive/code-keyword? (get e 1)))
+        label (if labelled (get e 1) `())
+        at (if labelled 2 1)
+        i (find-target cx labelled label)]
+    (if (< i 0)
+        (do (fail! e "safe: this break leaves to nothing the rules know") (fresh))
+        (let [t (get (.targets cx) i)]
+          (when (> (len e) at)
+            (let [r (eval (mut cx) (get e at) (.want t))
+                  (mut carried) (.loans r)
+                  (mut k) (- (len (.locals cx)) 1)]
+              ; a block and a loop end the statements made in them
+              (refuse-dropped! (get e at) carried)
+              (while (>= k (.depth t))
+                (set! carried (exit-local cx e (get (.locals cx) k) carried))
+                (set! k (- k 1)))
+              (set! (mut (.targets cx)) i
+                    (Target :label (.label t) :is-loop (.is-loop t) :depth (.depth t) :want (.want t)
+                            :loans (union (.loans t) carried)
+                            :fresh (and (.fresh t) (.fresh r))))))
+          (fresh)))))
+
+(defn eval-field [(cx (mut Cx)) (e Code) (want Want)] (-> Res)
+  (let [base (field-base e)]
+    (if (raw-held? (type-of base))
+        (do (need-unsafe! cx e "a field behind a raw pointer")
+            (eval (mut cx) base (WValue))
+            (fresh))
+        (let [q (place-of (mut cx) e)]
+          (if (= (len q) 1)
+              (use-place (mut cx) e (get q 0) want)
+              ; a field of a value that is no place: of what a call returned
+              (let [r (eval (mut cx) base (WShared))]
+                (match want
+                  (WDiscard [] (fresh))
+                  (WValue [] (fresh))
+                  (WBind [mutable]
+                    (if (or mutable (not (ref-type? (type-of e))) (word-type? (pointee (type-of e))))
+                        (fresh)
+                        r))
+                  (_ r))))))))
+
+(defn eval-mut [(cx (mut Cx)) (e Code)] (-> Res)
+  (let [q (place-of (mut cx) (get e 1))]
+    (when (and (field-form? (get e 1)) (raw-field? (pointee (type-of (get e 1)))))
+      (need-unsafe! cx e "an exclusive reference to a field that is raw memory"))
+    (if (= (len q) 1)
+        (use-place (mut cx) e (get q 0) (WExcl))
+        (eval (mut cx) (get e 1) (WExcl)))))
+
+;;; Does a load from, or a store to, AT follow a raw pointer? VALUE is the type
+;;; of what is loaded or stored. A place that holds a raw pointer is itself
+;;; read or assigned when the value is that pointer, and followed otherwise.
+(defn through-raw? [(at Code) (value Code)] (-> bool)
+  (let [t (type-of at)]
+    (cond (raw-type? t) true
+          (raw-type? (pointee t)) (not (primitive/code-eq (pointee value) (pointee t)))
+          :else false)))
+
+;;; `(set! PLACE VALUE)` and `(store! PLACE VALUE)`: the value is computed first.
+(defn eval-store [(cx (mut Cx)) (e Code)] (-> Res)
+  (let [target (get e 1)]
+    (guard-raw-flow! cx e (get e 2))
+    (refuse-stored-view! (get e 2))
+    (eval (mut cx) (get e 2) (WValue))
+    (if (through-raw? target (type-of (get e 2)))
+        (do (need-unsafe! cx e "a store through a raw pointer")
+            (eval (mut cx) target (WValue))
+            0)
+        (let [q (place-of (mut cx) target)]
+          (when (and (field-form? target) (raw-field? (pointee (type-of target))))
+            (need-unsafe! cx e "a store to a field that is raw memory"))
+          (if (= (len q) 1)
+              (check-write! cx e (get q 0) "written")
+              (do (eval (mut cx) target (WExcl)) 0))))
+    (fresh)))
+
+(defn eval-load [(cx (mut Cx)) (e Code) (want Want)] (-> Res)
+  (let [source (get e 1)]
+    (if (through-raw? source (type-of e))
+        (do (need-unsafe! cx e "a load through a raw pointer")
+            (eval (mut cx) source (WValue))
+            (fresh))
+        (let [q (place-of (mut cx) source)]
+          (if (= (len q) 1)
+              (use-place (mut cx) e (get q 0) (WValue))
+              (do (eval (mut cx) source (WShared)) (fresh)))))))
+
+(defn eval-cast [(cx (mut Cx)) (e Code)] (-> Res)
+  (when (ref-type? (type-of e))
+    (need-unsafe! cx e "a reference made by a cast"))
+  (eval (mut cx) (get e 2) (WValue))
+  (fresh))
+
+;;; The parameter types of the function or method the call E reaches, as the
+;;; declaration spells them, or `(unknown)`.
+(defn callee-params [(kind primitive/DeclKind) (name Code) (signature Code)] (-> Code)
+  (match kind
+    (primitive/MethodDecl []
+      (if (and (primitive/code-list? signature) (> (len signature) 0))
+          (get signature 0)
+          `(unknown)))
+    (primitive/FunctionDecl []
+      (match (meta/declaration name)
+        (primitive/Answer [form]
+          (block :found
+            (for [i 1 (len form)]
+              (when (and (head-is? (get form i) `->) (primitive/code-vector? (get form (- i 1))))
+                (let [(mut out) (primitive/code-list-new)]
+                  (for p (iter (get form (- i 1)))
+                    (if (and (primitive/code-list? p) (= (len p) 2))
+                        (push! (mut out) (get p 1))
+                        (return-from :found `(unknown))))
+                  (return-from :found `(~@out)))))
+            `(unknown)))
+        (_ `(unknown))))
+    (_ `(unknown))))
+
+;;; The result type the function or method declares, or `unknown`.
+(defn callee-result [(kind primitive/DeclKind) (name Code) (signature Code)] (-> Code)
+  (match kind
+    (primitive/MethodDecl []
+      (if (and (primitive/code-list? signature) (> (len signature) 1)) (get signature 1) `unknown))
+    (primitive/FunctionDecl []
+      (match (meta/declaration name)
+        (primitive/Answer [form]
+          (let [arrow (arrow-index form)]
+            (if (and (> arrow 0) (> (len (get form arrow)) 1)) (get (get form arrow) 1) `unknown)))
+        (_ `unknown)))
+    (_ `unknown)))
+
+(defn checked-module? [(cx (ref Cx)) (module Code)] (-> bool)
+  (name-in? module (.user cx)))
+
+;;; A vector the compiler gave no type is a list of type arguments, not an array.
+(defn type-arguments? [(e Code)] (-> bool)
+  (and (primitive/code-vector? e) (primitive/code-eq (type-of e) `unknown-type)))
+
+;;; One argument of a call, for a parameter of type PARAM (`unknown` when the
+;;; declaration could not be read).
+;;; What the type parameter NAME stands for, as a one-element list, found by
+;;; laying the declared type PATTERN over the type ACTUAL; `()` if it does not
+;;; appear or the two differ in shape.
+(defn bound-to [(pattern Code) (actual Code) (name Code)] (-> Code)
+  (cond (primitive/code-sym? pattern)
+          (if (primitive/code-eq pattern name) `(~actual) `())
+        (and (primitive/code-list? pattern) (primitive/code-list? actual) (= (len pattern) (len actual)))
+          (block :found
+            (for [i 0 (len pattern)]
+              (let [b (bound-to (get pattern i) (get actual i) name)]
+                (when (= (len b) 1) (return-from :found b))))
+            `())
+        :else `()))
+
+;;; A raw pointer of type POINTER is passed for the parameter PARAM, `(ref T)` with
+;;; T a type parameter of the callee. Coil either lends the name that holds the
+;;; pointer (T is the pointer type) or makes a reference to what it points at.
+;;; The call's own type says which, when the declared RESULT mentions T.
+(defn lends-the-name? [(param Code) (pointer Code) (result Code) (call Code)] (-> bool)
+  (let [t (pointee param)]
+    (and (primitive/code-sym? t)
+         (let [b (bound-to result (type-of call) t)]
+           (and (= (len b) 1) (primitive/code-eq (get b 0) pointer))))))
+
+;;; The last part of a type's name: `safe.sync.Guard` and `(Guard T)` are both `Guard`.
+(defn type-base [(t Code)] (-> Code)
+  (let [head (if (primitive/code-list? t) (get t 0) t)]
+    (if (primitive/code-sym? head)
+        (let [text (meta/source head)
+              (mut start) 0]
+          (for [i 0 (len text)]
+            (when (and (= (get text i) #\.) (< (+ i 1) (len text))) (set! start (+ i 1))))
+          (primitive/code-symbol (substr text start (len text))))
+        `unknown-type)))
+
+;;; A view is passed only where the callee asked for that view by name. A
+;;; parameter that is a type parameter could store it.
+(defn check-view-argument! [(arg Code) (param Code)] (-> i64)
+  (if (and (view-type? (pointee (type-of arg)))
+           (not (primitive/code-eq (type-base (pointee param)) (type-base (pointee (type-of arg))))))
+      (fail! arg "safe: a view is passed where it could be stored; it can only be a local, an argument that names its type, or a result")
+      0))
+
+;;; What a view passed as ARG, evaluated to R, lets the call's result borrow: the
+;;; loans the view itself holds when it is a local, taken by value.
+(defn view-argument-loans [(cx (mut Cx)) (arg Code) (param Code) (r Res)] (-> Code)
+  (let [q (place-of (mut cx) arg)]
+    (if (and (= (len q) 1) (head-is? (get q 0) `loc) (not (ref-type? param)))
+        (loans-of cx (primitive/code-int (get (get q 0) 1)))
+        (.loans r))))
+
+(defn eval-arg [(cx (mut Cx)) (arg Code) (param Code) (result Code) (call Code)] (-> Res)
+  (let [t (type-of arg)
+        content (pointee t)
+        q (place-of (mut cx) arg)]
+    (cond (head-is? arg `mut) (eval (mut cx) arg (WExcl))
+          ; a raw pointer passed for a reference parameter becomes a reference
+          (raw-type? content)
+            (cond (not (ref-type? param)) (eval (mut cx) arg (WValue))
+                  ; the parameter is a reference to a raw pointer: the name is lent
+                  (or (raw-type? (pointee param)) (lends-the-name? param content result call))
+                    (eval (mut cx) arg (WShared))
+                  :else
+                    (do (need-unsafe! cx arg "a reference made from a raw pointer")
+                        (eval (mut cx) arg (WValue))))
+          (head-is? param `ref) (eval (mut cx) arg (WShared))
+          (raw-type? param) (eval (mut cx) arg (WValue))
+          (and (primitive/code-sym? t) (scalar-name? t)) (eval (mut cx) arg (WValue))
+          ; a number in a place, for a parameter known to take it by value, is copied
+          (and (not (primitive/code-eq param `unknown)) (word-type? content))
+            (eval (mut cx) arg (WValue))
+          (primitive/code-eq param `unknown)
+            ; taken by value or lent: an owner is checked as moved and as lent
+            (do (when (and (= (len q) 1) (owner-type? cx content))
+                  (check-write! cx arg (get q 0) "moved"))
+                (eval (mut cx) arg (WShared)))
+          (owner-type? cx content) (eval (mut cx) arg (WValue))
+          ; plain data taken by value is read where it lies for as long as the call runs
+          :else (eval (mut cx) arg (WShared)))))
+
+(defn eval-call [(cx (mut Cx)) (e Code) (want Want) (module Code) (kind primitive/DeclKind)
+                 (name Code) (signature Code)] (-> Res)
+  (let [params (callee-params kind name signature)
+        (mut positional) true
+        ; explicit type arguments, `(f [T] x)`, come before the first argument
+        (mut skipped) 0
+        ; and how many of them come before the argument being looked at
+        (mut before) 0
+        loans (len (.loans cx))
+        (mut all) (no-loans)
+        external (not (checked-module? cx module))]
+    (for [i 1 (len e)]
+      (when (primitive/code-keyword? (get e i)) (set! positional false))
+      (when (type-arguments? (get e i)) (set! skipped (+ skipped 1))))
+    (let [; `(+ a b c)` is the two-parameter method folded over its arguments:
+          ; every argument past the first is taken as the second parameter is
+          folded (and positional
+                      (not (head-is? params `unknown))
+                      (= (len params) 2)
+                      (> (- (len e) 1 skipped) 2)
+                      (match kind (primitive/MethodDecl [] true) (_ false)))
+          params (if folded
+                     (let [(mut spread) (primitive/code-list-new)]
+                       (push! (mut spread) (get params 0))
+                       (for [i 2 (- (len e) skipped)] (push! (mut spread) (get params 1)))
+                       `(~@spread))
+                     params)
+          known (and positional
+                     (not (head-is? params `unknown))
+                     (= (len params) (- (len e) 1 skipped)))]
+      (when (and external (not (raw-ok? cx e)))
+        (if known
+            (when (or (any-raw-parameter? cx params) (any-raw-argument? cx e))
+              (fail! e (text3 "safe: `" (meta/source name) "` is library code that takes raw memory; calling it is allowed only inside (unsafe …)")))
+            (do (fail! e (text3 "safe: cannot read the declaration of `" (meta/source name) "`; calling it is allowed only inside (unsafe …)")) 0)))
+      (for [i 1 (len e)]
+        (let [arg (get e i)]
+          (when (type-arguments? arg) (set! before (+ before 1)))
+          (unless (or (primitive/code-keyword? arg) (type-arguments? arg))
+            (guard-raw-flow! cx e arg)
+            (let [param (if known (get params (- i 1 before)) `unknown)
+                  r (eval-arg (mut cx) arg param (callee-result kind name signature) e)
+                  carried (.loans (use-value cx arg r (WShared)))]
+              (check-view-argument! arg param)
+              (when (view-type? (pointee (type-of arg)))
+                (set! all (union all (view-argument-loans (mut cx) arg param r))))
+              (hold! (mut cx) -1 carried)
+              ; The result borrows from what was passed by reference. Plain data
+              ; taken by value is the callee's own for the call: a checked callee
+              ; cannot return a reference to it.
+              (when (or (not known) (head-is? arg `mut) (ref-type? (get params (- i 1 before))))
+                (set! all (union all carried))))))))
+    (drop-loans-to! (mut cx) loans)
+    ; a view over an exclusive reference gives exclusive access, so there is one of it
+    (when (and (view-type? (type-of e)) (not (owner-type? cx (type-of e))))
+      (for l (iter all)
+        (when (loan-excl? l)
+          (fail! e "safe: a view that can be copied is made from an exclusive reference; a view over one is moved, so its type needs a Drop"))))
+    ; a reference that is thrown away still may not outlive what it refers to
+    (cond (ref-type? (type-of e))
+            (match want
+              (WValue [] (fresh))
+              (_ (carrying all)))
+          ; a view is a value of its own that keeps what it was made from lent
+          (view-type? (type-of e)) (Res :loans all :fresh true)
+          :else (fresh))))
+
+;;; Is HEAD, the head of a form the compiler resolved to no declaration, one of
+;;; the primitives NAMES? A function of the program with such a name has a
+;;; declaration, so it never reaches this question; what is left is the
+;;; primitive, however its module was aliased.
+(defn primitive-named? [(head Code) (names Code)] (-> bool)
+  (name-in? (base-name head) names))
+
+;;; Arithmetic and comparison on numbers.
+(defn arithmetic? [(head Code)] (-> bool)
+  (primitive-named? head
+    `(iadd isub imul idiv irem udiv urem iand ior ixor ishl ishr inot clz ctz popcount bswap rotl
+      rotr mulhi iadd-overflow? isub-overflow? imul-overflow? fadd fsub fmul fdiv frem icmp-lt
+      icmp-le icmp-gt icmp-ge icmp-eq icmp-ne fcmp-lt fcmp-le fcmp-gt fcmp-ge fcmp-eq fcmp-ne)))
+
+;;; Is an argument of the call E a trait object? A method called on one is
+;;; reached through the raw pointers it holds.
+(defn any-trait-object? [(e Code)] (-> bool)
+  (block :any
+    (for [i 1 (len e)]
+      (when (head-is? (pointee (type-of (get e i))) `dyn) (return-from :any true)))
+    false))
+
+;;; VALUE is about to be stored: in a struct, a variant, or a place assigned to.
+(defn refuse-stored-view! [(value Code)] (-> i64)
+  (if (view-type? (pointee (type-of value)))
+      (fail! value "safe: a view is stored; it can only be a local, an argument or a result")
+      0))
+
+;;; A form headed by a name the compiler resolves to something.
+(defn eval-resolved [(cx (mut Cx)) (e Code) (want Want)] (-> Res)
+  (match (primitive/code-decl e)
+    (primitive/Declared [module kind name signature]
+      (match kind
+        (primitive/StructDecl []
+          (do (when (struct-holds-raw? (pointee (type-of e)))
+                (need-unsafe! cx e "building a struct that holds raw memory"))
+              (for [i 1 (len e)]
+                (unless (primitive/code-keyword? (get e i))
+                  (guard-raw-flow! cx e (get e i))
+                  (refuse-stored-view! (get e i))
+                  (eval (mut cx) (get e i) (WValue))))
+              (fresh)))
+        (primitive/VariantDecl []
+          (do (when (variant-holds-raw? (pointee (type-of e)) e)
+                (need-unsafe! cx e "building a variant that holds raw memory"))
+              (for [i 1 (len e)]
+                (unless (primitive/code-keyword? (get e i))
+                  (guard-raw-flow! cx e (get e i))
+                  (refuse-stored-view! (get e i))
+                  (eval (mut cx) (get e i) (WValue))))
+              (fresh)))
+        (primitive/FunctionDecl [] (eval-call (mut cx) e want module kind name signature))
+        (primitive/MethodDecl []
+          (do (when (any-trait-object? e)
+                (need-unsafe! cx e "a call through a trait object"))
+              (eval-call (mut cx) e want module kind name signature)))
+        (primitive/ExternDecl []
+          (do (need-unsafe! cx e "a call of an extern function")
+              (eval-parts (mut cx) e 1)))
+        (_ (do (need-unsafe! cx e (text3 "`" (meta/source (get e 0)) "`"))
+               (eval-parts (mut cx) e 1)))))
+    (_
+      (let [head (get e 0)]
+        (cond (arithmetic? head) (eval-parts (mut cx) e 1)
+              (primitive-named? head `(sizeof alignof offsetof)) (fresh)
+              (primitive-named? head `(zeroed))
+                (do (unless (and (copy-type? cx (pointee (type-of e)) 0)
+                                 (not (raw-in? cx (pointee (type-of e)) 0 true)))
+                      (need-unsafe! cx e "a zeroed owner or raw pointer"))
+                    (fresh))
+              :else
+                (do (need-unsafe! cx e (text3 "`" (meta/source head) "`, which the rules do not cover,"))
+                    (eval-parts (mut cx) e 1)))))))
+
+(defn eval-list [(cx (mut Cx)) (e Code) (want Want)] (-> Res)
+  (let [head (get e 0)]
+    (cond (not (primitive/code-sym? head))
+            (do (need-unsafe! cx e "a call of a computed function")
+                (eval-parts (mut cx) e 0))
+          (> (primitive/binding-of head) 0)
+            (do (need-unsafe! cx e "a call through a function pointer")
+                (eval-parts (mut cx) e 1))
+          (head-is? e `let*) (eval-let (mut cx) e want)
+          (head-is? e `do) (eval-seq (mut cx) e 1 want)
+          (head-is? e `if) (eval-if (mut cx) e want)
+          (head-is? e `match) (eval-match (mut cx) e want)
+          (head-is? e `loop) (eval-loop (mut cx) e want)
+          (head-is? e `block*) (eval-block (mut cx) e want)
+          (head-is? e `break) (eval-break (mut cx) e)
+          (head-is? e `continue) (fresh)
+          (or (head-is? e `and) (head-is? e `or) (head-is? e `not)) (eval-parts (mut cx) e 1)
+          (head-is? e `mut) (eval-mut (mut cx) e)
+          (field-form? e) (eval-field (mut cx) e want)
+          (and (= (len e) 3) (or (form-is? e `set!) (form-is? e `store!))) (eval-store (mut cx) e)
+          (and (= (len e) 2) (form-is? e `load)) (eval-load (mut cx) e want)
+          (and (= (len e) 3) (form-is? e `cast)) (eval-cast (mut cx) e)
+          (or (head-is? e `quote) (head-is? e `quasiquote)) (fresh)
+          ; a function's address is plain data; calling through it needs `unsafe`
+          (form-is? e `fnptr-of) (fresh)
+          ; a function literal captures nothing: its body is a function of its own,
+          ; and its value is a function pointer, which only `unsafe` code can call
+          (or (head-is? e `fn*) (head-is? e `fn))
+            (let [arrow (arrow-index e)]
+              (if (and (> arrow 0) (primitive/code-vector? (get e (- arrow 1))))
+                  (check-function! (.user cx) e arrow (.tparams cx))
+                  (fail! e "safe: this function form is not covered by the rules"))
+              (fresh))
+          :else (eval-resolved (mut cx) e want))))
+
+;;; Check E, whose consumer wants WANT.
+(defn eval [(cx (mut Cx)) (e Code) (want Want)] (-> Res)
+  (push! (mut (.path cx)) e)
+  (let [r (eval-form (mut cx) e want)]
+    (pop! (mut (.path cx)))
+    r))
+
+(defn eval-form [(cx (mut Cx)) (e Code) (want Want)] (-> Res)
+  (cond (primitive/code-sym? e)
+          (if (> (primitive/binding-of e) 0)
+              (let [q (place-of (mut cx) e)]
+                (if (= (len q) 1)
+                    (use-place (mut cx) e (get q 0) want)
+                    (fresh)))
+              (fresh))
+        (primitive/code-vector? e)
+          ; a vector the compiler gave no type is a list of type arguments
+          (if (primitive/code-eq (type-of e) `unknown-type)
+              (fresh)
+              (do (need-unsafe! cx e "an array")
+                  (eval-parts (mut cx) e 0)))
+        (not (primitive/code-list? e)) (fresh)
+        (= (len e) 0) (fresh)
+        (expanded-by? e `(safe.core.unsafe))
+          (let [before (.unsafe cx)]
+            (set! (.unsafe cx) true)
+            (let [r (eval-list (mut cx) e want)]
+              (set! (.unsafe cx) before)
+              r))
+        :else (use-value cx e (eval-list (mut cx) e want) want)))
+
+;;; ---- functions -------------------------------------------------------------------
+
+(defn mentions-code? [(t Code)] (-> bool)
+  (if (primitive/code-list? t)
+      (block :found
+        (for part (iter t)
+          (when (mentions-code? part) (return-from :found true)))
+        false)
+      (and (primitive/code-sym? t) (primitive/code-eq t `Code))))
+
+;;; The index of the `(-> RESULT)` of a function or method form, or -1.
+(defn arrow-index [(form Code)] (-> i64)
+  (block :found
+    (for [i 0 (len form)]
+      (when (head-is? (get form i) `->) (return-from :found i)))
+    -1))
+
+(defn type-parameter-names [(vector Code)] (-> Code)
+  (let [(mut out) (primitive/code-list-new)]
+    (for p (iter vector)
+      (cond (primitive/code-sym? p) (push! (mut out) p)
+            (and (primitive/code-list? p) (> (len p) 0) (primitive/code-sym? (get p 0)))
+              (push! (mut out) (get p 0))
+            :else 0))
+    `(~@out)))
+
+;;; Check one function or method: FORM holds `[PARAMS] (-> RESULT) BODY…` with
+;;; the arrow at ARROW. OUTER is the type parameters of an enclosing `impl`.
+(defn check-function! [(user Code) (form Code) (arrow i64) (outer Code)] (-> i64)
+  (let [params (get form (- arrow 1))
+        result (get (get form arrow) 1)
+        own (if (and (>= (- arrow 2) 0) (primitive/code-vector? (get form (- arrow 2))))
+                (type-parameter-names (get form (- arrow 2)))
+                `())
+        a (meta/expansion-allocator)
+        (mut cx) (Cx :locals (ArrayList::new [Local] a)
+                     :loans (ArrayList::new [Loan] a)
+                     :targets (ArrayList::new [Target] a)
+                     :unsafe false
+                     :serial 0
+                     :tparams (union outer own)
+                     :user user
+                     :path (ArrayList::new [Code] a)
+                     :pinned (ArrayList::new [i64] a))]
+    (if (or (mentions-code? params) (mentions-code? result))
+        ; compile-time code: it runs in the compiler, not in the program
+        0
+        (do
+          (for p (iter params)
+            (if (and (primitive/code-list? p) (= (len p) 2) (primitive/code-sym? (get p 0)))
+                (let [t (get p 1)
+                      serial (push-local! (mut cx) (get p 0) (ref-type? t))]
+                  (when (or (ref-type? t) (view-type? t))
+                    (hold! (mut cx) serial
+                           (if (head-is? t `mut) `(((ext ~serial) mut)) `(((ext ~serial) shr))))))
+                (fail! p "safe: this parameter form is not covered by the rules")))
+          (let [want (cond (head-is? result `mut) (WExcl)
+                           (head-is? result `ref) (WShared)
+                           (primitive/code-eq result `void) (WDiscard)
+                           :else (WValue))
+                _whole (push! (mut (.path cx)) form)
+                r (eval-seq (mut cx) form (+ arrow 1) want)
+                left (exit-scopes! (mut cx) form 0 0 (.loans r))]
+            (for l (iter left)
+              (when (or (head-is? (place-root (loan-place l)) `tmp)
+                        (head-is? (place-root (loan-place l)) `dropped))
+                (fail! form "safe: this returns a reference to a temporary")))
+            0)))))
+
+;;; Check the methods of an `impl` or a `deftrait` (a trait's method may have a
+;;; body). A vector written directly in the form lists type parameters.
+(defn check-impl! [(user Code) (form Code)] (-> i64)
+  (let [(mut outer) `()]
+    (for part (iter form)
+      (when (primitive/code-vector? part)
+        (set! outer (union outer (type-parameter-names part)))))
+    (for part (iter form)
+      (when (and (primitive/code-list? part) (> (len part) 0) (primitive/code-sym? (get part 0)))
+        (let [arrow (arrow-index part)]
+          (when (and (> arrow 0) (primitive/code-vector? (get part (- arrow 1))))
+            (check-function! user part arrow outer)))))
+    0))
+
+(defn check-top! [(user Code) (form Code)] (-> i64)
+  (cond (or (head-is? form `defn*) (head-is? form `defn))
+          (let [arrow (arrow-index form)]
+            (if (and (> arrow 1) (primitive/code-vector? (get form (- arrow 1))))
+                (check-function! user form arrow `())
+                (fail! form "safe: this function form is not covered by the rules")))
+        (or (head-is? form `impl) (head-is? form `deftrait)) (check-impl! user form)
+        :else 0))
+
+;;; Is the module record M one of the program's own, to be checked? This module
+;;; is the compiler's code: it runs while the program is compiled, never in it.
+;;; So does any function that takes or returns `Code` (see `check-function!`).
+(defn checked? [(m Code)] (-> bool)
+  (and (meta/user-module? m) (not (primitive/code-eq (get m 0) `safe.check))))
+
+(defn safe-check [(modules Code)] (-> Code)
+  (let [(mut user) (primitive/code-list-new)]
+    (for m (iter modules)
+      (when (checked? m) (push! (mut user) (get m 0))))
+    (let [names `(~@user)]
+      (for m (iter modules)
+        (when (checked? m)
+          (for form (iter (primitive/code-rest m))
+            (when (primitive/code-from-user? form)
+              (check-top! names form)))))))
+  `0)
+
+(checker safe-check)

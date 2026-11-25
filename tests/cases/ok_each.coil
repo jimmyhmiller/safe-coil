@@ -1,0 +1,47 @@
+(module case.ok-each)
+(import "coil.primitive" :as primitive)
+(import "safe.core" :use [each each-mut])
+(import "safe.vec" :use [Vec Slice SliceMut])
+(import "safe.str" :use [Str])
+(import "safe.map" :use [Map each-entry])
+(import "safe.box" :use [Box])
+(defn total [(v (ref (Vec i64)))] (-> i64)
+  (let [(mut sum) 0]
+    (each [x v] (set! sum (+ sum (primitive/load x))))
+    sum))
+(defn double! [(v (mut (Vec i64)))] (-> i64)
+  (each-mut [x v] (set! x (* 2 (primitive/load x))))
+  0)
+(defn main [] (-> i64)
+  (let [(mut v) (Vec::new [i64])
+        (mut names) (Vec::new [Str])]
+    (for i (range 0 5) (Vec::push! (mut v) i))
+    (double! (mut v))
+    (each-mut [x v] (set! x (+ 1 (primitive/load x))))
+    (let [(mut middle) (Vec::slice-mut (mut v) 1 4)]
+      (each-mut [x middle] (set! x (* 10 (primitive/load x))))
+      (set! (SliceMut::at-mut (mut middle) 0) 7)
+      (let [(mut inner) (SliceMut::part-mut (mut middle) 1 3)]
+        (set! (SliceMut::at-mut (mut inner) 1) 8))
+      (let [seen (SliceMut::part middle 0 2)]
+        (each [x seen] (println "{}" (primitive/load x)))))
+    (Vec::push! (mut names) (Str::from "one"))
+    (Vec::push! (mut names) (Str::from "two"))
+    (each [name names] (println "{}" name))
+    (each-mut [name names] (Str::push-text! (mut name) "!"))
+    (each [name names] (println "{}" name))
+    (println "{}" (total v))
+    (let [(mut ages) (Map::new [Str (Box i64)])
+          (mut sum) 0
+          text (Str::from "hello, world")]
+      (Map::insert! (mut ages) (Str::from "ada") (Box::new 36))
+      (Map::insert! (mut ages) (Str::from "alan") (Box::new 41))
+      (each-entry [name age ages]
+        (set! sum (+ sum (Str::len name) (primitive/load (Box::get age)))))
+      (println "{}" sum)
+      (let [word (Str::slice text 7 12)
+            copy (Str::from-slice word)
+            (mut letters) 0]
+        (each [b text] (when (!= (primitive/load b) #\,) (set! letters (+ letters 1))))
+        (println "{} {} {}" copy (Slice::len word) letters)))
+    0))

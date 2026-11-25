@@ -1,0 +1,12 @@
+(module case.ok-temporary-passed)
+(import "coil.primitive" :as primitive)
+(import "safe.box" :use [Box])
+(import "safe.vec" :use [Vec])
+(defstruct Pt [(x i64) (y i64)])
+(defn read [(b (ref (Box i64)))] (-> i64) (primitive/load (Box::get b)))
+(defn pick [(a (ref Pt)) (b (ref Pt))] (-> (ref Pt)) (if (> (.x a) (.x b)) a b))
+(defn main [] (-> i64)
+  (let [p (Pt :x 1 :y 2)
+        larger (pick p (Pt :x 3 :y 4))]
+    (println "{} {} {}" (read (Box::new 5)) (Vec::len (Vec::new [i64])) (.y larger))
+    0))

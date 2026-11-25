@@ -1,0 +1,11 @@
+(module case.bad-guard-unnamed-still-locks)
+(import "coil.primitive" :as primitive)
+(import "safe.sync" :use [Mutex Guard])
+(import "safe.box" :use [Box])
+(defn main [] (-> i64)
+  (let [m (Mutex::new 1)
+        (mut guard) (Mutex::lock m)
+        seen (primitive/load (Guard::get guard))
+        ; the guard is not named again, but it unlocks the mutex when it is dropped
+        gone (Box::new m)]
+    seen))

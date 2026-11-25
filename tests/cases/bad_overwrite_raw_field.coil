@@ -1,0 +1,7 @@
+(module case.bad-overwrite-raw-field)
+(import "coil.primitive" :as primitive)
+(import "safe.box" :use [Box])
+(defn main [] (-> i64)
+  (let [(mut b) (Box::new 1)]
+    (set! (.at b) (primitive/cast (ptr i64) 16))
+    (primitive/load (Box::get b))))

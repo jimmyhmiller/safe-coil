@@ -1,0 +1,9 @@
+(module case.no-spawn-reference)
+(import "coil.primitive" :as primitive)
+(import "safe.core" :use [borrow])
+(import "safe.thread" :use [spawn Task])
+(defn read [(n (ref i64))] (-> i64) (primitive/load n))
+(defn main [] (-> i64)
+  (let [n 5
+        t (spawn (read (borrow n)))]
+    (Task::join t)))

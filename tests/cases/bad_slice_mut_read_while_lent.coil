@@ -1,0 +1,10 @@
+(module case.bad-slice-mut-read-while-lent)
+(import "coil.primitive" :as primitive)
+(import "safe.vec" :use [Vec SliceMut])
+(defn main [] (-> i64)
+  (let [(mut v) (Vec::new [i64])]
+    (Vec::push! (mut v) 1)
+    (let [(mut a) (Vec::slice-mut (mut v) 0 1)
+          first (Vec::at v 0)]
+      (set! (SliceMut::at-mut (mut a) 0) 2)
+      (primitive/load first))))

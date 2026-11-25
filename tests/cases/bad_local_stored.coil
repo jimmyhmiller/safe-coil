@@ -1,0 +1,8 @@
+(module case.bad-local-stored)
+(import "coil.primitive" :as primitive)
+(import "safe.local" :use [deflocal with-local Local])
+(import "safe.box" :use [Box])
+(deflocal counter i64 0)
+(defn main [] (-> i64)
+  (let [kept (Box::new (counter))]
+    0))

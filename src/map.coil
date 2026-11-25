@@ -1,0 +1,196 @@
+;;; A table from keys to values that owns both.
+(module safe.map)
+(export Map each-entry)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "safe.core" :use [unsafe lend lend-mut])
+
+;;; One place in the table. `state` is 0 when it never held a pair, 1 while it
+;;; holds one, 2 after its pair was removed. `key` and `value` hold values only
+;;; while it is 1.
+(defstruct Entry [K V] [(state i64) (hash i64) (key K) (value V)])
+
+;;; A table from K to V. It owns its keys and values: they are freed with it. K
+;;; needs `Hash` and `Eq`. `count` is the pairs it holds, and `used` the places
+;;; that hold or once held one.
+(defstruct Map [K V] [(entries (slice (Entry K V))) (count i64) (used i64)])
+
+;;; COUNT empty places. COUNT is a power of two.
+(defn room [K V] [(count i64)] (-> (slice (Entry K V)))
+  (unsafe
+    (match (alloc/alloc [(Entry K V)] (alloc/malloc-allocator) count)
+      (Some [memory]
+        (do (for i (range 0 count)
+              (store! (field (primitive/index (data memory) i) state) 0))
+            memory))
+      (None [] (panic "safe: out of memory")))))
+
+;;; Where KEY's pair is in M, or -1.
+(defn find [(K Hash Eq) V] [(m (ref (Map K V))) (key (ref K))] (-> i64)
+  (unsafe
+    (let [n (len (.entries m))
+          h (hash key)]
+      (block :found
+        (for step (range 0 n)
+          (let [i (& (+ h step) (- n 1))
+                entry (primitive/index (data (.entries m)) i)
+                state (load (field entry state))]
+            (when (= state 0) (return-from :found -1))
+            (when (and (= state 1)
+                       (= (load (field entry hash)) h)
+                       (= (lend [K] (field entry key)) key))
+              (return-from :found i))))
+        -1))))
+
+;;; Put a pair whose key is not in ENTRIES into it. True when it took a place
+;;; that never held a pair.
+(defn place! [K V] [(entries (slice (Entry K V))) (h i64) (key K) (value V)] (-> bool)
+  (unsafe
+    (let [n (len entries)
+          (mut i) (& h (- n 1))]
+      (while (= (load (field (primitive/index (data entries) i) state)) 1)
+        (set! i (& (+ i 1) (- n 1))))
+      (let [entry (primitive/index (data entries) i)
+            new (= (load (field entry state)) 0)]
+        (store! (field entry state) 1)
+        (store! (field entry hash) h)
+        (store! (field entry key) key)
+        (store! (field entry value) value)
+        new))))
+
+;;; Move M's pairs to a table twice the size.
+(defn grow! [K V] [(m (mut (Map K V)))] (-> void)
+  (unsafe
+    (let [old (.entries m)
+          bigger (room [K V] (* 2 (len old)))]
+      (for i (range 0 (len old))
+        (let [entry (primitive/index (data old) i)]
+          (when (= (load (field entry state)) 1)
+            (place! bigger (load (field entry hash))
+                    (take! [K] (field entry key))
+                    (take! [V] (field entry value))))))
+      (alloc/free (alloc/malloc-allocator) old)
+      (set! (.entries m) bigger)
+      (set! (.used m) (.count m))
+      0)))
+
+;;; The pair at place I of M, which a cursor named. Any other place stops the program.
+(defn pair-at [K V] [(m (ref (Map K V))) (i i64)] (-> (ptr (Entry K V)))
+  (unsafe
+    (when (or (< i 0) (>= i (len (.entries m))))
+      (panic "safe: a cursor was used with a Map it does not belong to"))
+    (let [entry (primitive/index (data (.entries m)) i)]
+      (when (!= (load (field entry state)) 1)
+        (panic "safe: a cursor was used after its pair was removed"))
+      entry)))
+
+;;; The first place at or after I that holds a pair, or -1.
+(defn full-from [K V] [(m (ref (Map K V))) (i i64)] (-> i64)
+  (unsafe
+    (block :found
+      (for at (range i (len (.entries m)))
+        (when (= (load (field (primitive/index (data (.entries m)) at) state)) 1)
+          (return-from :found at)))
+      -1)))
+
+(impl [(K Hash Eq) V] (Map K V)
+  ;;; An empty table.
+  (new [] (-> (Map K V))
+    (unsafe (Map :entries (room [K V] 8) :count 0 :used 0)))
+
+  ;;; How many pairs it holds.
+  (len [(m (ref (Map K V)))] (-> i64)
+    (.count m))
+
+  ;;; Does it hold a pair for KEY?
+  (has? [(m (ref (Map K V))) (key (ref K))] (-> bool)
+    (>= (find m key) 0))
+
+  ;;; Give KEY the value VALUE. The value it had before, or None.
+  (insert! [(m (mut (Map K V))) (key K) (value V)] (-> (Option V))
+    (unsafe
+      (let [at (find m key)]
+        (if (>= at 0)
+            (let [entry (primitive/index (data (.entries m)) at)
+                  before (take! [V] (field entry value))
+                  spare key]
+              (store! (field entry value) value)
+              (Some before))
+            (do (when (>= (* (+ (.used m) 1) 10) (* (len (.entries m)) 7))
+                  (grow! (mut m)))
+                (let [h (hash key)]
+                  (when (place! (.entries m) h key value)
+                    (set! (.used m) (+ (.used m) 1))))
+                (set! (.count m) (+ (.count m) 1))
+                (None [V]))))))
+
+  ;;; Take KEY's pair out. Its value, or None when it has none.
+  (remove! [(m (mut (Map K V))) (key (ref K))] (-> (Option V))
+    (unsafe
+      (let [at (find m key)]
+        (if (< at 0)
+            (None [V])
+            (let [entry (primitive/index (data (.entries m)) at)
+                  gone (take! [K] (field entry key))]
+              (store! (field entry state) 2)
+              (set! (.count m) (- (.count m) 1))
+              (Some (take! [V] (field entry value))))))))
+
+  ;;; KEY's value, lent for as long as the table is. A key it does not hold
+  ;;; stops the program: ask `has?` first.
+  (at [(m (ref (Map K V))) (key (ref K))] (-> (ref V))
+    (unsafe
+      (let [at (find m key)]
+        (when (< at 0) (panic "safe: a Map was asked for a key it does not hold"))
+        (lend (field (primitive/index (data (.entries m)) at) value)))))
+
+  ;;; KEY's value, lent to be changed for as long as the table is.
+  (at-mut [(m (mut (Map K V))) (key (ref K))] (-> (mut V))
+    (unsafe
+      (let [at (find m key)]
+        (when (< at 0) (panic "safe: a Map was asked for a key it does not hold"))
+        (lend-mut (field (primitive/index (data (.entries m)) at) value)))))
+
+  ;;; A cursor on the first pair, or -1 when there is none. A cursor is a number:
+  ;;; walk the table with `first` and `next`, in no particular order.
+  (first [(m (ref (Map K V)))] (-> i64)
+    (full-from m 0))
+
+  ;;; The cursor after CURSOR, or -1 at the end.
+  (next [(m (ref (Map K V))) (cursor i64)] (-> i64)
+    (if (< cursor 0) -1 (full-from m (+ cursor 1))))
+
+  ;;; The key of the pair at CURSOR.
+  (key-at [(m (ref (Map K V))) (cursor i64)] (-> (ref K))
+    (unsafe (lend (field (pair-at m cursor) key))))
+
+  ;;; The value of the pair at CURSOR.
+  (value-at [(m (ref (Map K V))) (cursor i64)] (-> (ref V))
+    (unsafe (lend (field (pair-at m cursor) value)))))
+
+(impl [K V] Drop (Map K V)
+  (drop [(self (mut (Map K V)))] (-> void)
+    (unsafe
+      (for i (range 0 (len (.entries self)))
+        (let [entry (primitive/index (data (.entries self)) i)]
+          (when (= (load (field entry state)) 1)
+            (let [key (take! [K] (field entry key))
+                  value (take! [V] (field entry value))]
+              0))))
+      (alloc/free (alloc/malloc-allocator) (.entries self))
+      0)))
+
+;;; `(each-entry [KEY VALUE TABLE] BODY…)`: BODY once for every pair of TABLE, in
+;;; no particular order, with KEY and VALUE references to the pair's key and
+;;; value. TABLE names a place; it is lent for the whole of each turn, so BODY
+;;; cannot add to it or take from it.
+(defn each-entry [(binding Code) & (body Code)] (-> Code)
+  (unless (and (primitive/code-vector? binding) (= (len binding) 3))
+    (primitive/error "each-entry: expected (each-entry [key value table] body…)"))
+  (let [table (get binding 2)]
+    `(let [(mut cursor) (Map::first ~table)]
+       (while (>= cursor 0)
+         (let [~(get binding 0) (Map::key-at ~table cursor)
+               ~(get binding 1) (Map::value-at ~table cursor)]
+           ~@body)
+         (set! cursor (Map::next ~table cursor))))))

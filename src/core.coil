@@ -1,0 +1,73 @@
+;;; What safe Coil code is written with besides the language itself.
+(module safe.core)
+(import "coil.primitive" :as primitive)
+
+;;; `(unsafe FORM…)`: the forms may follow raw memory. Every other rule still
+;;; applies inside. The checker recognizes the `do` this expands to by the macro
+;;; that produced it.
+(defn unsafe [(first Code) & (rest Code)] (-> Code)
+  `(do ~first ~@rest))
+
+;;; What SLOT points at, lent. A raw pointer passed for a reference parameter is
+;;; the reference to its pointee, so only `unsafe` code can call these with one.
+(defn lend [T] [(slot (ref T))] (-> (ref T)) slot)
+
+(defn lend-mut [T] [(slot (mut T))] (-> (mut T)) slot)
+
+;;; Put VALUE in SLOT and give back what was there. The way to take an owner out
+;;; of a field, a box or a pool element, which cannot be moved out of.
+(defn replace! [T] [(slot (mut T)) (value T)] (-> T)
+  (unsafe
+    (let [raw (primitive/cast (ptr T) (mut slot))
+          old (take! [T] raw)]
+      (store! raw value)
+      old)))
+
+;;; PLACE, lent: a reference to it as a value, for a `let` or a result.
+(defn borrow [T] [(place (ref T))] (-> (ref T)) place)
+
+;;; PLACE, lent exclusively: `(borrow-mut (mut place))`.
+(defn borrow-mut [T] [(place (mut T))] (-> (mut T)) place)
+
+;;; VALUE, as a temporary. `(match (move x) …)` consumes x, so each arm owns what
+;;; it binds; a match on a name lends an owned payload to its arm instead.
+(defn move [T] [(value T)] (-> T) value)
+
+;;; A view: a struct that stands for the references it was made from, as a slice
+;;; of a list or a held lock does. `(impl View TYPE)` marks one. The checker then
+;;; treats a TYPE as it treats a reference: a call that returns one keeps what it
+;;; took by reference lent for as long as the view lives, and a view is a local,
+;;; an argument or a result, never stored. What a view holds inside is raw
+;;; memory its own module follows.
+(deftrait View [Self])
+
+;;; A collection whose elements are reached by position: `count` of them, and
+;;; `item` lends the one at I. An index out of range stops the program.
+(deftrait Each [Self Item]
+  (count [(xs (ref Self))] (-> i64))
+  (item [(xs (ref Self)) (i i64)] (-> (ref Item))))
+
+;;; A collection whose elements can be changed where they are.
+(deftrait EachMut [Self Item]
+  (item-mut [(xs (mut Self)) (i i64)] (-> (mut Item))))
+
+;;; `(each [NAME XS] BODY…)`: BODY once for every element of XS, in order, with
+;;; NAME a reference to the element. XS names a place; it is lent for the whole
+;;; of each turn, and BODY cannot add to it or take from it.
+(defn each [(binding Code) & (body Code)] (-> Code)
+  (unless (and (primitive/code-vector? binding) (= (len binding) 2))
+    (primitive/error "each: expected (each [name collection] body…)"))
+  `(let [total (count ~(get binding 1))]
+     (for i (range 0 total)
+       (let [~(get binding 0) (item ~(get binding 1) i)]
+         ~@body))))
+
+;;; `(each-mut [NAME XS] BODY…)`: as `each`, with NAME an exclusive reference to
+;;; the element, to change it. XS names a place that can be changed.
+(defn each-mut [(binding Code) & (body Code)] (-> Code)
+  (unless (and (primitive/code-vector? binding) (= (len binding) 2))
+    (primitive/error "each-mut: expected (each-mut [name collection] body…)"))
+  `(let [total (count ~(get binding 1))]
+     (for i (range 0 total)
+       (let [~(get binding 0) (item-mut (mut ~(get binding 1)) i)]
+         ~@body))))

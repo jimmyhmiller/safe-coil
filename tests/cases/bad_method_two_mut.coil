@@ -1,0 +1,7 @@
+(module case.bad-method-two-mut)
+(defstruct Pt [(x i64) (y i64)])
+(impl Pt (swap! [(a (mut Pt)) (b (mut Pt))] (-> void) (set! (.x a) (.x b))))
+(defn main [] (-> i64)
+  (let [(mut p) (Pt :x 2 :y 3)]
+    (Pt::swap! (mut p) (mut p))
+    0))
