@@ -212,7 +212,7 @@ that are the exclusive-reference case below, which the checker refuses too. All
 sixteen weakenings are caught, by a hand-written case or by the differential
 run.
 
-`tests/run.py` has 92 hand-written cases. Every `ok_` case and both examples
+`tests/run.py` has 95 hand-written cases. Every `ok_` case and both examples
 also run clean under `--sanitize=address` and `--sanitize=thread`.
 
 ### Where Coil and the model differ
