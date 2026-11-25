@@ -10,7 +10,8 @@ of a moved value) is set aside: the checker never saw it. For the rest, the
 checker must accept exactly what the model accepts. build/diff/results.txt lists
 every program with both verdicts.
 
-Exit status 1 if the checker accepts a program the model refuses.
+Exit status 1 if the checker accepts a program the model refuses. COIL names the
+compiler to use when it is not the `coil` on PATH.
 """
 import concurrent.futures, os, subprocess, sys
 
@@ -23,7 +24,7 @@ subprocess.run(["rm", "-rf", out], check=True)
 subprocess.run(["racket", "model/diff.rkt", out, n, seed], cwd=root, check=True)
 
 def coil(name):
-    r = subprocess.run(["coil", "check", os.path.join(out, name + ".coil"), "--use", "safe.check"],
+    r = subprocess.run([os.environ.get("COIL", "coil"), "check", os.path.join(out, name + ".coil"), "--use", "safe.check"],
                        cwd=root, capture_output=True, text=True)
     text = r.stdout + r.stderr
     errors = [l for l in text.splitlines() if l.startswith("error:")]

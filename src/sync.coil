@@ -8,6 +8,7 @@
 (import "coil.sync" :as sync)
 (import "coil.thread" :as thread)
 (import "safe.core" :use [unsafe lend lend-mut View])
+(import "safe.mem" :as mem)
 
 (defn must [T] [(memory (Option (slice T)))] (-> (slice T))
   (match memory
@@ -297,7 +298,7 @@
 (defstruct Channel [T] [(queue (ptr (Queue T)))])
 
 (defn slots [T] [(count i64)] (-> (slice T))
-  (unsafe (must (alloc/alloc [T] (alloc/malloc-allocator) count))))
+  (mem/room [T] count))
 
 ;;; Take the oldest value. The caller holds the lock and has seen `count` > 0.
 (defn take-oldest [T] [(q (ptr (Queue T)))] (-> T)
@@ -348,7 +349,7 @@
                     (for i (range 0 n)
                       (store! (primitive/index (data bigger) i)
                               (take! [T] (primitive/index (data old) (% (+ (load (field q head)) i) n)))))
-                    (alloc/free (alloc/malloc-allocator) old)
+                    (mem/release old)
                     (store! (field q items) bigger)
                     (store! (field q head) 0)))
                 (let [items (load (field q items))]
@@ -390,7 +391,7 @@
         (when (= (atomic/sub (field q handles) 1) 1)
           (while (> (load (field q count)) 0)
             (let [left (take-oldest q)] 0))
-          (alloc/free (alloc/malloc-allocator) (load (field q items)))
+          (mem/release (load (field q items)))
           (sure (sync/Condition::destroy! (field q ready)))
           (sure (sync/Mutex::destroy! (field q lock)))
           (free-one q))

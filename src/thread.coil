@@ -22,6 +22,7 @@
 (import "coil.atomic" :as atomic)
 (import "coil.thread" :use [Thread])
 (import "safe.core" :use [unsafe])
+(import "safe.mem" :as mem)
 
 (extern pthread_detach :cc (cc/C) [(ptr i8)] (-> i32))
 
@@ -33,7 +34,7 @@
   [(slots (slice (ptr i8))) (result (ptr i8)) (state i64) (thread Thread)])
 
 ;;; What a task returns when the call it runs returns nothing.
-(defsum Done (Finished []))
+(defstruct Done [])
 
 ;;; A call running on its own thread, which will return an R.
 (defstruct Task [R] [(packet (ptr Packet))])
@@ -46,7 +47,7 @@
 ;;; VALUE, moved to the heap, for a thread to take.
 (defn keep [T] [(value T)] (-> (ptr i8))
   (unsafe
-    (let [cell (must (alloc/alloc [T] (alloc/malloc-allocator) 1))]
+    (let [cell (mem/room [T] 1)]
       (store! (data cell) value)
       (primitive/cast (ptr i8) (data cell)))))
 
@@ -66,19 +67,19 @@
     (let [packet (primitive/cast (ptr Packet) raw)
           cell (primitive/cast (ptr T) (load (primitive/index (data (load (field packet slots))) i)))
           value (take! [T] cell)]
-      (alloc/free (alloc/malloc-allocator) (slice::new [T] cell 1))
+      (mem/release (slice::new [T] cell 1))
       value)))
 
 (defn release [R] [(packet (ptr Packet))] (-> void)
   (unsafe
-    (alloc/free (alloc/malloc-allocator) (slice::new [R] (primitive/cast (ptr R) (load (field packet result))) 1))
+    (mem/release (slice::new [R] (primitive/cast (ptr R) (load (field packet result))) 1))
     (alloc/free (alloc/malloc-allocator) (slice::new [Packet] packet 1))
     0))
 
 ;;; Start BODY on a new thread with the argument addresses in SLOTS.
 (defn begin [R] [(body (fnptr (cc/C) [(ptr i8)] (ptr i8))) (slots (slice (ptr i8)))] (-> (Task R))
   (unsafe
-    (let [result (must (alloc/alloc [R] (alloc/malloc-allocator) 1))
+    (let [result (mem/room [R] 1)
           packet (data (must (alloc/alloc [Packet] (alloc/malloc-allocator) 1)))]
       (store! (field packet slots) slots)
       (store! (field packet result) (primitive/cast (ptr i8) (data result)))
@@ -167,7 +168,7 @@
                                        (if quiet
                                            `(defn _ :cc (cc/C) [(~raw (ptr i8))] (-> (ptr i8))
                                               (~@callee ~@taken)
-                                              (deliver ~raw (Finished)))
+                                              (deliver ~raw (Done)))
                                            `(defn _ :cc (cc/C) [(~raw (ptr i8))] (-> (ptr i8))
                                               (deliver ~raw (~@callee ~@taken)))))
           launch (primitive/code-hoist `(spawn-launch ~site)

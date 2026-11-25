@@ -4,16 +4,11 @@
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc)
 (import "safe.core" :use [unsafe lend lend-mut View Each EachMut])
+(import "safe.mem" :use [room release])
 
 ;;; A list of T. It owns its elements: they are freed with it. An index out of
 ;;; range stops the program.
 (defstruct Vec [T] [(items (slice T)) (count i64)])
-
-(defn room [T] [(count i64)] (-> (slice T))
-  (unsafe
-    (match (alloc/alloc [T] (alloc/malloc-allocator) count)
-      (Some [memory] memory)
-      (None [] (panic "safe: out of memory")))))
 
 ;;; Part of a list, lent shared: `count` elements from `items`. It is a view: the
 ;;; list stays lent for as long as the slice lives, so it cannot grow or be
@@ -72,7 +67,7 @@
           (for i (range 0 (.count v))
             (store! (primitive/index (data bigger) i)
                     (take! [T] (primitive/index (data (.items v)) i))))
-          (alloc/free (alloc/malloc-allocator) (.items v))
+          (release (.items v))
           (set! (.items v) bigger)))
       (store! (primitive/index (data (.items v)) (.count v)) value)
       (set! (.count v) (+ (.count v) 1))
@@ -166,5 +161,5 @@
     (unsafe
       (for i (range 0 (.count self))
         (let [value (take! [T] (primitive/index (data (.items self)) i))] 0))
-      (alloc/free (alloc/malloc-allocator) (.items self))
+      (release (.items self))
       0)))

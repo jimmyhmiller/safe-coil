@@ -7,9 +7,8 @@
 ;; has nothing the program could be written with:
 ;;   - an exclusive reference read out of a view's field as a value: the model
 ;;     has no rule for it, and Coil would lend through it again instead;
-;;   - `match-ref` and `match-mut` on a sum with a plain-data payload: Coil
-;;     copies such a payload into the arm and lends only the parts that own
-;;     something.
+;;   - `match-mut` on a sum with a plain-data payload: Coil copies such a
+;;     payload into the arm and lends only the parts that own something.
 
 (require "rules.rkt")
 (provide program->coil)
@@ -306,9 +305,12 @@
     [`(,(and form (or 'match-ref 'match-mut)) ,p ,arms ...)
      (define τp (place-type Σ Γ p))
      (define k (if (eq? form 'match-ref) 'ref 'mut))
+     ;; Coil copies a plain-data payload into the arm. A shared reference to the
+     ;; copy reads what a reference to the payload would, while the scrutinee
+     ;; keeps the place lent; an exclusive one would change the copy only.
      (for ([v (or (variants-of Σ τp) (bail "an ill-typed program"))])
-       (when (copy? Σ (cadr v))
-         (bail "a match by reference on a plain-data payload")))
+       (when (and (eq? k 'mut) (copy? Σ (cadr v)))
+         (bail "a match by exclusive reference on a plain-data payload")))
      ;; a match on a name that can be written lends its payload exclusively; on a
      ;; shared reference to the same place, shared
      (define-values (before scrutinee after)
@@ -321,7 +323,10 @@
                 (match arm
                   [`((,K ,x) ,ea)
                    (define Γa (cons (cons x `(,k ,(variant-type Σ τp K))) Γ))
-                   (format " (~a [~a] ~a)" (variant-name K) (var-name x) (value Σ Γa ea))])))
+                   (if (copy? Σ (variant-type Σ τp K))
+                       (format " (~a [copied] (let [~a (borrow copied)] ~a))"
+                               (variant-name K) (var-name x) (value Σ Γa ea))
+                       (format " (~a [~a] ~a)" (variant-name K) (var-name x) (value Σ Γa ea)))])))
              after)]
     [`(pool-new ,σ) (format "(Pool::new [~a])" (coil-type σ))]
     [`(insert ,p ,e1)

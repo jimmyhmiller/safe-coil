@@ -610,6 +610,12 @@
                (pretty-write `(program ,(own-part (car found)) ,(caddr (car found))))]
         [else (printf "no counterexample\n")]))
 
+;; The programs a seed gives depend on the rules, since a function body the
+;; rules refuse is generated again. So a weakening one seed's programs happen
+;; not to exercise is looked for in the next seed's.
+(define (search-seeds n)
+  (for/or ([seed '(1 2 3 4)]) (search n seed #:quiet #t)))
+
 (define (teeth n only)
   (define (try what thunk)
     (define found (thunk))
@@ -621,10 +627,10 @@
   (define results
     (append
      (for/list ([m mutants] #:when (or (null? only) (memq (car m) only)))
-       (try (cadr m) (λ () (parameterize ([mutant (car m)]) (search n 1 #:quiet #t)))))
+       (try (cadr m) (λ () (parameterize ([mutant (car m)]) (search-seeds n)))))
      (if (or (null? only) (memq 'no-global-check only))
          (list (try "a global is entered without the run-time check"
-                    (λ () (parameterize ([check-globals? #f]) (search n 1 #:quiet #t)))))
+                    (λ () (parameterize ([check-globals? #f]) (search-seeds n)))))
          '())))
   (andmap values results))
 
