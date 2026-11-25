@@ -138,9 +138,11 @@
 
 (defn temporary-loan [] (-> Code) `(((tmp) shr)))
 
-;;; A loan on a temporary that owns something. Coil drops such a temporary as
-;;; soon as the call it was passed to returns, so nothing may keep a reference
-;;; into it.
+;;; A loan on a temporary that owns something. Coil drops such a temporary when
+;;; the statement it was made in ends, and keeps it for a `let` bound to a
+;;; reference. So a reference into one is used freely in its statement, and
+;;; must not leave it: not as a function's result, not as the value of a block
+;;; or a `break`, and not held by a view that a `let` binds.
 (defn dropped-loan [] (-> Code) `(((dropped) shr)))
 
 (defn into-dropped? [(loans Code)] (-> bool)
@@ -152,7 +154,7 @@
 ;;; LOANS are about to be kept: by a name, by a call's result, by a match arm.
 (defn refuse-dropped! [(node Code) (loans Code)] (-> i64)
   (if (into-dropped? loans)
-      (fail! node "safe: this keeps a reference into a temporary that is dropped first; bind the temporary to a name")
+      (fail! node "safe: this keeps a reference into a temporary past the statement it was made in; bind the temporary to a name")
       0))
 
 ;;; The value of an expression that is one of two. When only one is a fresh
@@ -611,7 +613,10 @@
             (do (guard-raw-flow! cx e init)
                 (let [r (eval (mut cx) init (WBind mutable))
                       serial (push-local! (mut cx) name (not (.fresh r)))]
-                  (refuse-dropped! init (.loans r))
+                  ; a `let` bound to a reference keeps the temporaries of its
+                  ; initializer; one bound to a view does not
+                  (unless (ref-type? (type-of init))
+                    (refuse-dropped! init (.loans r)))
                   (hold! (mut cx) serial (.loans r))))
             (fail! binder "safe: this binding form is not covered by the rules"))))
     (let [r (eval-seq (mut cx) e 2 want)]
@@ -711,6 +716,8 @@
 (defn eval-block [(cx (mut Cx)) (e Code) (want Want)] (-> Res)
   (push-target! (mut cx) (get e 1) false want)
   (let [r (eval-seq (mut cx) e 2 want)]
+    ; a block's value leaves the statement it was made in
+    (refuse-dropped! e (.loans r))
     (join r (pop-target! (mut cx)))))
 
 ;;; The index of the target a `break` leaves to, or -1: the block named LABEL when
@@ -739,6 +746,8 @@
             (let [r (eval (mut cx) (get e at) (.want t))
                   (mut carried) (.loans r)
                   (mut k) (- (len (.locals cx)) 1)]
+              ; a block and a loop end the statements made in them
+              (refuse-dropped! (get e at) carried)
               (while (>= k (.depth t))
                 (set! carried (exit-local cx e (get (.locals cx) k) carried))
                 (set! k (- k 1)))
@@ -999,8 +1008,6 @@
               (when (or (not known) (head-is? arg `mut) (ref-type? (get params (- i 1 before))))
                 (set! all (union all carried))))))))
     (drop-loans-to! (mut cx) loans)
-    (when (or (ref-type? (type-of e)) (view-type? (type-of e)))
-      (refuse-dropped! e all))
     ; a view over an exclusive reference gives exclusive access, so there is one of it
     (when (and (view-type? (type-of e)) (not (owner-type? cx (type-of e))))
       (for l (iter all)

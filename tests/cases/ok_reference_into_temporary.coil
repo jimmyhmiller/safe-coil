@@ -1,0 +1,14 @@
+(module case.ok-reference-into-temporary)
+(import "coil.primitive" :as primitive)
+(import "safe.box" :use [Box])
+(import "safe.map" :use [Map])
+(import "safe.str" :use [Str])
+(defn main [] (-> i64)
+  (let [(mut ages) (Map::new [Str i64])
+        r (Box::get (Box::new 5))]
+    (Map::insert! (mut ages) (Str::from "ada") 36)
+    (println "{} {} {}"
+             (primitive/load (Box::get (Box::new 7)))
+             (primitive/load r)
+             (primitive/load (Map::at ages (Str::from "ada"))))
+    0))

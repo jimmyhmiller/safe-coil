@@ -52,10 +52,8 @@
       (match (Vec::pop! (mut workers))
         (None [] (break))
         (Some [worker] (set! seen (+ seen (Task::join worker))))))
-    (let [the (Str::from "the")
-          fox (Str::from "fox")]
-      (with-lock (Arc::get totals) table
-        (println "{} words, {} different" seen (Map::len table))
-        (println "the: {}" (primitive/load (Map::at table the)))
-        (println "fox: {}" (primitive/load (Map::at table fox)))))
+    (with-lock (Arc::get totals) table
+      (println "{} words, {} different" seen (Map::len table))
+      (println "the: {}" (primitive/load (Map::at table (Str::from "the"))))
+      (println "fox: {}" (primitive/load (Map::at table (Str::from "fox")))))
     0))

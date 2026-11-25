@@ -45,11 +45,16 @@ adds the rest of the model:
   reference to a temporary.
 - **Results.** A reference a call returns borrows from every argument the call
   took by reference.
-- **Temporaries.** Coil drops a temporary that owns something as soon as the
-  call it was passed to returns. So a call's result may not borrow from one:
-  `(Box::get (Box::new 1))` is refused, and so is reading through a lock taken
-  and given up in one expression. Bind the temporary to a name first. A
-  temporary of plain data lives as long as the function's frame.
+- **Temporaries.** Coil keeps a temporary that owns something until the
+  statement it was made in ends, and a `let` bound to a reference keeps the
+  temporaries of its initializer for as long as the `let` runs. So
+  `(primitive/load (Box::get (Box::new 1)))` reads a live box, and a lock taken
+  and read in one expression is held for the read. A reference into such a
+  temporary must not leave its statement: it is not a function's result, not
+  the value of a `block` or a `break`, and not held by a view that a `let`
+  binds, since a `let` bound to anything but a reference ends its
+  initializer's temporaries. A temporary of plain data lives as long as the
+  function's frame.
 - **Match.** A `match` on a name lends the parts of the payload that own something
   to the arm, where they lie. The matched place stays lent to those names, so the
   variant cannot be replaced under them. `(match (move x) …)` consumes x instead.

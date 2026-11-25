@@ -1,0 +1,6 @@
+(module case.bad-view-bound-from-temporary)
+(import "coil.primitive" :as primitive)
+(import "safe.sync" :use [Mutex Guard])
+(defn main [] (-> i64)
+  (let [guard (Mutex::lock (Mutex::new 1))]
+    (primitive/load (Guard::get guard))))

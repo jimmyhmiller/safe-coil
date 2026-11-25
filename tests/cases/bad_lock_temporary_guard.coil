@@ -1,6 +1,0 @@
-(module case.bad-lock-temporary-guard)
-(import "coil.primitive" :as primitive)
-(import "safe.sync" :use [Mutex Guard])
-(defn main [] (-> i64)
-  (let [m (Mutex::new 1)]
-    (primitive/load (Guard::get (Mutex::lock m)))))
