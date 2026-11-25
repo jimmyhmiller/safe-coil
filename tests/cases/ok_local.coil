@@ -1,0 +1,26 @@
+(module case.ok-local)
+(import "coil.primitive" :as primitive)
+(import "safe.local" :use [deflocal with-local with-local-ref Local])
+(import "safe.thread" :use [spawn Task])
+(import "safe.box" :use [Box])
+(import "safe.vec" :use [Vec])
+(deflocal counter i64 100)
+(deflocal seen (Vec (Box i64)) (Vec::new [(Box i64)]))
+(defn note! [(n i64)] (-> i64)
+  (with-local (counter) c (set! c (+ c n)))
+  (with-local (seen) s (Vec::push! (mut s) (Box::new n)))
+  0)
+(defn work [(times i64)] (-> i64)
+  (for i (range 0 times) (note! i))
+  (with-local-ref (counter) c
+    (with-local-ref (seen) s
+      (+ (primitive/load c) (Vec::len s)))))
+(defn main [] (-> i64)
+  (note! 5)
+  (let [a (spawn (work 10))
+        b (spawn (work 20))]
+    (println "{} {}" (Task::join a) (Task::join b)))
+  (with-local-ref (counter) first
+    (with-local-ref (counter) second
+      (println "{} {}" (primitive/load first) (primitive/load second))))
+  0)

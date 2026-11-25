@@ -1,0 +1,184 @@
+;;; Thread-local values: one for each thread that uses it.
+;;;
+;;; `(deflocal NAME TYPE INIT)` declares one. Each thread gets its own value,
+;;; computed by INIT the first time that thread uses it and dropped when the
+;;; thread ends. `(with-local (NAME) x BODY…)` lends this thread's value
+;;; exclusively for BODY, and `(with-local-ref (NAME) x BODY…)` lends it shared.
+;;; Asking for it exclusively while this thread already has it lent stops the
+;;; program.
+;;;
+;;; `(NAME)` is a view: it stays on the thread that asked, since a view is never
+;;; stored and never sent.
+(module safe.local)
+(export deflocal with-local with-local-ref Local)
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.os" :as os)
+(import "coil.alloc" :as alloc)
+(import "coil.atomic" :as atomic)
+(import "safe.core" :use [unsafe lend lend-mut View])
+
+; hygiene: the declarations below are made once for the target and used by name
+(defn public-name [(name Code)] (-> Code)
+  (primitive/syntax->datum name))
+
+;;; pthread_key_t is an unsigned int on glibc and an unsigned long on Darwin. A
+;;; key is kept as an i64.
+(defn key-abi [] (-> Code)
+  (let [key (os/os-pick `u32 `u64 `u64)]
+    `(do
+       (extern ~(public-name `pthread_key_create)
+         :cc (cc/C) [(ptr ~key) (fnptr (cc/C) [(ptr i8)] void)] (-> i32))
+       (extern ~(public-name `pthread_getspecific) :cc (cc/C) [~key] (-> (ptr i8)))
+       (extern ~(public-name `pthread_setspecific) :cc (cc/C) [~key (ptr i8)] (-> i32))
+       (defn ~(public-name `key-new) [(destroy (fnptr (cc/C) [(ptr i8)] void))] (-> i64)
+         (unsafe
+           (let [(mut key) (: 0 ~key)]
+             (when (!= (pthread_key_create (mut key) destroy) (: 0 i32))
+               (panic "safe: a thread-local could not be made"))
+             (primitive/cast i64 key))))
+       (defn ~(public-name `key-get) [(key i64)] (-> (ptr i8))
+         (unsafe (pthread_getspecific (primitive/cast ~key key))))
+       (defn ~(public-name `key-set!) [(key i64) (value (ptr i8))] (-> void)
+         (unsafe
+           (when (!= (pthread_setspecific (primitive/cast ~key key) value) (: 0 i32))
+             (panic "safe: a thread-local could not be kept"))
+           0)))))
+
+(key-abi)
+
+;;; What every thread shares of one thread-local: its key, once `ready` is 2
+;;; (0 before the first use by any thread, 1 while that thread makes the key).
+(defstruct Slot [(ready i64) (key i64)])
+
+;;; One thread's value. `borrowers` is how it is lent: 0 not at all, N > 0 to N
+;;; shared borrowers, -1 exclusively. `filled` is 0 before the thread's first
+;;; use, 1 while INIT runs, 2 once `value` holds it.
+(defstruct Cell [T] [(borrowers i64) (filled i64) (value T)])
+
+;;; This thread's value of a thread-local of type T, made by `deflocal`. A view.
+(defstruct Local [T] [(cell (ptr (Cell T)))])
+
+(impl [T] View (Local T))
+
+;;; The value, lent shared for as long as this lives.
+(defstruct Shared [T] [(cell (ptr (Cell T)))])
+
+;;; The value, lent exclusively for as long as this lives.
+(defstruct Exclusive [T] [(cell (ptr (Cell T)))])
+
+(defn key-of [(slot (ptr Slot)) (destroy (fnptr (cc/C) [(ptr i8)] void))] (-> i64)
+  (unsafe
+    (let [ready (field slot ready)]
+      (if (= (atomic/cas ready 0 1) 0)
+          (do (store! (field slot key) (key-new destroy))
+              (atomic/store ready 2))
+          (while (!= (atomic/read ready) 2) 0))
+      (load (field slot key)))))
+
+;;; This thread's cell of the thread-local whose shared part is SLOT, made the
+;;; first time the thread asks. DESTROY frees a cell when its thread ends.
+(defn cell-of [T] [(slot (ptr Slot)) (destroy (fnptr (cc/C) [(ptr i8)] void))] (-> (Local T))
+  (unsafe
+    (let [key (key-of slot destroy)
+          found (key-get key)]
+      (if (!= (primitive/cast i64 found) 0)
+          (Local :cell (primitive/cast (ptr (Cell T)) found))
+          (let [cell (match (alloc/alloc [(Cell T)] (alloc/malloc-allocator) 1)
+                       (Some [memory] (data memory))
+                       (None [] (panic "safe: out of memory")))]
+            (store! (field cell borrowers) 0)
+            (store! (field cell filled) 0)
+            (key-set! key (primitive/cast (ptr i8) cell))
+            (Local :cell cell))))))
+
+;;; Is it time to compute this thread's first value? The caller then `fill!`s it.
+(defn first-use? [T] [(local (Local T))] (-> bool)
+  (unsafe
+    (let [filled (field (.cell local) filled)]
+      (cond (= (load filled) 2) false
+            (= (load filled) 1)
+              (panic "safe: a thread-local's first value reads the thread-local itself")
+            :else (do (store! filled 1) true)))))
+
+(defn fill! [T] [(local (Local T)) (value T)] (-> void)
+  (unsafe
+    (store! (field (.cell local) value) value)
+    (store! (field (.cell local) filled) 2)
+    0))
+
+;;; A thread ended: drop its value and free its cell.
+(defn destroy-cell [T] [(raw (ptr i8))] (-> void)
+  (unsafe
+    (let [cell (primitive/cast (ptr (Cell T)) raw)]
+      (when (= (load (field cell filled)) 2)
+        (let [gone (take! [T] (field cell value))] 0))
+      (alloc/free (alloc/malloc-allocator) (slice::new [(Cell T)] cell 1))
+      0)))
+
+;;; Lend the value shared. Stops the program if it is lent exclusively.
+(defn share [T] [(local (Local T))] (-> (Shared T))
+  (unsafe
+    (let [borrowers (field (.cell local) borrowers)]
+      (when (< (load borrowers) 0)
+        (panic "safe: a thread-local was read while it is lent exclusively"))
+      (store! borrowers (+ (load borrowers) 1))
+      (Shared :cell (.cell local)))))
+
+;;; Lend the value exclusively. Stops the program if it is lent at all.
+(defn claim [T] [(local (Local T))] (-> (Exclusive T))
+  (unsafe
+    (let [borrowers (field (.cell local) borrowers)]
+      (when (!= (load borrowers) 0)
+        (panic "safe: a thread-local was lent exclusively while it is lent"))
+      (store! borrowers -1)
+      (Exclusive :cell (.cell local)))))
+
+(impl [T] (Shared T)
+  (get [(lent (ref (Shared T)))] (-> (ref T))
+    (unsafe (lend (field (load (field lent cell)) value)))))
+
+(impl [T] (Exclusive T)
+  (get-mut [(lent (mut (Exclusive T)))] (-> (mut T))
+    (unsafe (lend-mut (field (load (field lent cell)) value)))))
+
+(impl [T] Drop (Shared T)
+  (drop [(self (mut (Shared T)))] (-> void)
+    (unsafe
+      (let [borrowers (field (load (field self cell)) borrowers)]
+        (store! borrowers (- (load borrowers) 1))
+        0))))
+
+(impl [T] Drop (Exclusive T)
+  (drop [(self (mut (Exclusive T)))] (-> void)
+    (unsafe
+      (store! (field (load (field self cell)) borrowers) 0)
+      0)))
+
+;;; `(deflocal NAME TYPE INIT)`: a thread-local NAME of TYPE. INIT is evaluated
+;;; on each thread the first time that thread uses it. `(NAME)` is this thread's
+;;; value, for `with-local` and `with-local-ref`.
+(defn deflocal [(name Code) (type Code) (init Code)] (-> Code)
+  (let [slot (primitive/fresh-identifier "slot")
+        destroy (primitive/fresh-identifier "destroy")]
+    `(do (def ~slot (primitive/alloc-static Slot (primitive/zeroed Slot)))
+         (defn ~destroy :cc (cc/C) [(raw (ptr i8))] (-> void)
+           (unsafe (destroy-cell [~type] raw)))
+         (defn ~name [] (-> (Local ~type))
+           (let [local (unsafe (cell-of [~type] ~slot (primitive/fnptr-of ~destroy)))]
+             (when (first-use? local) (fill! local ~init))
+             local)))))
+
+;;; `(with-local LOCAL NAME BODY…)`: NAME is an exclusive reference to this
+;;; thread's value for BODY. It cannot leave BODY.
+(defn with-local [(local Code) (name Code) & (body Code)] (-> Code)
+  `(let [(mut lent) (claim ~local)
+         ~name (Exclusive::get-mut (mut lent))]
+     ~@body))
+
+;;; `(with-local-ref LOCAL NAME BODY…)`: NAME is a shared reference to this
+;;; thread's value for BODY. It cannot leave BODY.
+(defn with-local-ref [(local Code) (name Code) & (body Code)] (-> Code)
+  `(let [lent (share ~local)
+         ~name (Shared::get lent)]
+     ~@body))

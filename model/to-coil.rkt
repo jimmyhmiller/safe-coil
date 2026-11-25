@@ -5,7 +5,8 @@
 ;;
 ;; (program->coil prog module-name) -> a string, or #f with a reason when Coil
 ;; has nothing the program could be written with:
-;;   - a view: Coil does not let a struct hold a reference;
+;;   - an exclusive reference read out of a view's field as a value: the model
+;;     has no rule for it, and Coil would lend through it again instead;
 ;;   - `match-ref` and `match-mut` on a sum with a plain-data payload: Coil
 ;;     copies such a payload into the arm and lends only the parts that own
 ;;     something.
@@ -20,6 +21,11 @@
 (define (var-name x) (format "v-~a" x))
 (define (type-name S) (format "M~a" S))
 (define (variant-name K) (format "K~a" K))
+;; A view is a Coil struct marked `View`. Coil does not let a struct hold a
+;; reference, so a field that is one is a raw pointer, read through a function
+;; that lends what it points at: `W<V>-<field>`, and `W<V>-<field>-mut` for an
+;; exclusive one.
+(define (view-name V) (format "W~a" V))
 
 ;; ---------------------------------------------------------------- types
 
@@ -34,13 +40,14 @@
     [`(task ,σ) (format "(Task ~a)" (coil-type σ))]
     [`(ref ,σ) (format "(ref ~a)" (coil-type σ))]
     [`(mut ,σ) (format "(mut ~a)" (coil-type σ))]
-    [`(view ,_) (bail "a view")]
+    [`(view ,V) (view-name V)]
     [(? symbol? T) (symbol->string T)]
     [(list S) (type-name S)]
     [(cons S args) (format "(~a ~a)" (type-name S) (string-join (map coil-type args)))]))
 
 (define (ref? τ) (match τ [`(,(or 'ref 'mut) ,_) #t] [_ #f]))
 (define (mut? τ) (match τ [`(mut ,_) #t] [_ #f]))
+(define (view? τ) (match τ [`(view ,_) #t] [_ #f]))
 
 ;; ---------------------------------------------------------------- the model's types, without its loans
 
@@ -58,6 +65,12 @@
     [`(at ,q ,_) (match (place-type Σ Γ q)
                    [`(pool ,σ) σ]
                    [_ (bail "an ill-typed program")])]))
+
+;; the view q is, when `(: q fld)` is a reference held in a view; else #f
+(define (view-reference Σ Γ q fld)
+  (match (place-type Σ Γ q)
+    [`(view ,V) (and (ref? (place-type Σ Γ `(: ,q ,fld))) V)]
+    [_ #f]))
 
 (define (place? e)
   (match e
@@ -139,7 +152,11 @@
     [`(* ,q) (match (place-type Σ Γ q)
                [`(box ,_) (format "(Box::get ~a)" (shared-place Σ Γ q))]
                [_ (shared-place Σ Γ q)])]
-    [`(: ,q ,fld) (format "(.~a ~a)" fld (shared-place Σ Γ q))]
+    [`(: ,q ,fld)
+     (define V (view-reference Σ Γ q fld))
+     (if V
+         (format "(~a-~a ~a)" (view-name V) fld (shared-place Σ Γ q))
+         (format "(.~a ~a)" fld (shared-place Σ Γ q)))]
     [`(at ,q ,x) (format "(Pool::at ~a ~a)" (shared-place Σ Γ q) (var-name x))]))
 
 ;; the place, as an expression `(mut …)` and `(set! …)` take
@@ -149,7 +166,12 @@
     [`(* ,q) (match (place-type Σ Γ q)
                [`(box ,_) (format "(Box::get-mut (mut ~a))" (written-place Σ Γ q))]
                [_ (written-place Σ Γ q)])]
-    [`(: ,q ,fld) (format "(.~a ~a)" fld (written-place Σ Γ q))]
+    [`(: ,q ,fld)
+     (define V (view-reference Σ Γ q fld))
+     (cond [(and V (mut? (place-type Σ Γ p)))
+            (format "(~a-~a-mut (mut ~a))" (view-name V) fld (written-place Σ Γ q))]
+           [V (format "(~a-~a ~a)" (view-name V) fld (shared-place Σ Γ q))]
+           [else (format "(.~a ~a)" fld (written-place Σ Γ q))])]
     [`(at ,q ,x) (format "(Pool::at-mut (mut ~a) ~a)" (written-place Σ Γ q) (var-name x))]))
 
 ;; is the place's Coil expression a reference, so that reading its value is a load?
@@ -189,9 +211,15 @@
     [`(let ,_ ,e2) (ends-in-place? e2)]
     [_ #f]))
 (define (discarded Σ Γ e)
-  (if (and (ends-in-place? e) (not (ref? (type-of Σ Γ e))))
-      (format "(move ~a)" (value Σ Γ e))
-      (value Σ Γ e)))
+  (define τ (type-of Σ Γ e))
+  (cond [(not (ends-in-place? e)) (value Σ Γ e)]
+        [(ref? τ) (value Σ Γ e)]
+        ;; a view is never passed for a type parameter; one that is moved has a
+        ;; function of its own to take it
+        [(view? τ) (if (exclusive? Σ τ)
+                       (format "(drop-~a ~a)" (view-name (cadr τ)) (value Σ Γ e))
+                       (value Σ Γ e))]
+        [else (format "(move ~a)" (value Σ Γ e))]))
 
 ;; e, whose type is a shared reference
 (define (shared Σ Γ e)
@@ -203,7 +231,8 @@
 ;; e, whose type is an exclusive reference
 (define (exclusive Σ Γ e)
   (match e
-    [(? place?) (format "(borrow-mut (mut ~a))" (written-place Σ Γ e))]
+    [(? symbol?) (format "(borrow-mut (mut ~a))" (written-place Σ Γ e))]
+    [(? place?) (bail "an exclusive reference read out of a view's field")]
     [`(mut ,p) (format "(borrow-mut (mut ~a))" (written-place Σ Γ p))]
     [_ (compound Σ Γ e)]))
 
@@ -247,7 +276,15 @@
     ;; the model computes the new value before it looks at the place
     [`(take ,p ,e1)
      (format "(let [(mut new-value) ~a] (replace! (mut ~a) new-value))" (plain Σ Γ e1) (written-place Σ Γ p))]
-    [`(new (view ,_) ,_ ...) (bail "a view")]
+    [`(new (view ,V) ,es ...)
+     (define fields (or (fields-of Σ `(view ,V)) (bail "an ill-typed program")))
+     (unless (= (length fields) (length es)) (bail "an ill-typed program"))
+     (format "(new-~a~a)" (view-name V)
+             (string-append*
+              (for/list ([f fields] [e1 es])
+                (format " ~a" (cond [(mut? (cadr f)) (format "(mut ~a)" (exclusive Σ Γ e1))]
+                                    [(ref? (cadr f)) (shared Σ Γ e1)]
+                                    [else (plain Σ Γ e1)])))))]
     [`(new ,σ ,es ...)
      (define fields (or (fields-of Σ σ) (bail "an ill-typed program")))
      (unless (= (length fields) (length es)) (bail "an ill-typed program"))
@@ -360,7 +397,36 @@
     [`(sum ,S ,Ts ((,Ks ,ts) ...))
      (format "(defsum ~a~a ~a)" (type-name S) (type-params Ts)
              (string-join (for/list ([K Ks] [t ts]) (format "(~a [(payload ~a)])" (variant-name K) (coil-type t)))))]
-    [`(view ,_ ,_) #f]
+    [`(view ,V ((,flds ,ts) ...))
+     (define W (view-name V))
+     (define moved? (ormap mut? ts))
+     (string-join
+      (append
+       (list (format "(defstruct ~a [~a])" W
+                     (string-join (for/list ([f flds] [t ts])
+                                    (format "(~a ~a)" f (if (ref? t) (format "(ptr ~a)" (coil-type (cadr t))) (coil-type t))))))
+             (format "(impl View ~a)" W))
+       ;; a view that gives exclusive access is moved, never copied
+       (if moved?
+           (list (format "(impl Drop ~a (drop [(self (mut ~a))] (-> void) 0))" W W)
+                 (format "(defn drop-~a [(v ~a)] (-> i64) 0)" W W))
+           '())
+       (list (format "(defn new-~a [~a] (-> ~a)\n  (unsafe (~a~a)))" W
+                     (string-join (for/list ([f flds] [t ts]) (format "(~a ~a)" f (coil-type t))))
+                     W W
+                     (string-append*
+                      (for/list ([f flds] [t ts])
+                        (format " :~a ~a" f
+                                (cond [(mut? t) (format "(primitive/cast (ptr ~a) (mut ~a))" (coil-type (cadr t)) f)]
+                                      [(ref? t) (format "(primitive/cast (ptr ~a) ~a)" (coil-type (cadr t)) f)]
+                                      [else f]))))))
+       (for/list ([f flds] [t ts] #:when (ref? t))
+         (format "(defn ~a-~a [(v (ref ~a))] (-> (ref ~a))\n  (unsafe (lend [~a] (.~a v))))"
+                 W f W (coil-type (cadr t)) (coil-type (cadr t)) f))
+       (for/list ([f flds] [t ts] #:when (mut? t))
+         (format "(defn ~a-~a-mut [(v (mut ~a))] (-> (mut ~a))\n  (unsafe (lend-mut [~a] (.~a v))))"
+                 W f W (coil-type (cadr t)) (coil-type (cadr t)) f)))
+      "\n")]
     [`(global ,g ,σ ,e)
      (format "(defglobal g-~a ~a ~a)" g (coil-type σ) (plain (make-Σ ds) '() e))]
     [`(defn ,f ,Ts ,params ,τr ,body)
@@ -402,7 +468,7 @@
              (format "(module ~a)\n" name)
              "(import \"coil.primitive\" :as primitive)\n"
              "(import \"coil.alloc\" :as alloc)\n"
-             "(import \"safe.core\" :use [unsafe replace! borrow borrow-mut move])\n"
+             "(import \"safe.core\" :use [unsafe replace! borrow borrow-mut move lend lend-mut View])\n"
              "(import \"safe.box\" :use [Box])\n"
              "(import \"safe.pool\" :use [Pool Handle])\n"
              "(import \"safe.global\" :use [defglobal with-ref with-mut Global])\n"

@@ -1,0 +1,7 @@
+(module case.bad-local-reference-escapes)
+(import "coil.primitive" :as primitive)
+(import "safe.local" :use [deflocal with-local-ref Local])
+(deflocal counter i64 0)
+(defn peek [] (-> (ref i64))
+  (with-local-ref (counter) c c))
+(defn main [] (-> i64) (primitive/load (peek)))

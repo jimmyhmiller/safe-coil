@@ -13,6 +13,9 @@
 ;;; - raw memory is followed only inside `(unsafe …)`, and a form the rules do not
 ;;;   cover is refused outside it.
 (module safe.check)
+; `--use safe.check` imports every exported name into the program. The checker
+; is the only one the program needs.
+(export safe-check)
 (import "coil.primitive" :as primitive)
 (import "coil.meta" :as meta)
 (import "coil.arraylist" :use [ArrayList])

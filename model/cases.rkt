@@ -57,6 +57,21 @@
     (accept "moved in one branch only: dropped where it ended up"
      ,(prog '((defn eat () ((b (box int))) int (* b)))
             '(let ([a (box 1)]) (if0 0 (call eat () a) 5))))
+    (accept "a moved variable is given a new value and used again"
+     ,(prog '((defn eat () ((b (box int))) int (* b)))
+            '(let ([a (box 1)]) (seq (call eat () a) (seq (set! a (box 2)) (* a))))))
+    (accept "a variable is given what a call that took it returns"
+     ,(prog '((defn same () ((b (box int))) (box int) b))
+            '(let ([a (box 1)]) (seq (set! a (call same () a)) (* a)))))
+    (accept "an outer owner moved inside a loop is given a new value in the same turn"
+     ,(prog '((defn eat () ((b (box int))) int (* b)))
+            '(let ([a (box 1)])
+               (let ([i 2])
+                 (seq (while i (seq (call eat () a) (seq (set! a (box i)) (set! i (+ i -1)))))
+                      (* a))))))
+    (reject "a variable moved in one branch only is used after being given no value"
+     ,(prog '((defn eat () ((b (box int))) int (* b)))
+            '(let ([a (box 1)]) (seq (if0 0 (call eat () a) (seq (set! a (box 2)) 5)) (* a)))))
     (accept "take an owner out of a box, leaving another in its place"
      ,(prog '() '(let ([a (box (box 1))]) (let ([old (take (* a) (box 2))]) (+ (* old) (* (* a)))))))
     (accept "unbox gives the contents and frees the box"

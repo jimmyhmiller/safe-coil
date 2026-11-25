@@ -24,9 +24,6 @@
 (import "coil.str" :use [substr])
 (import "safe.core" :use [unsafe lend lend-mut move])
 
-;;; The most arguments the first call of a `par` can take.
-(const SLOTS 8)
-
 ;;; A call running on its own thread, and the addresses of its arguments.
 (defstruct Running [(thread Thread) (slots (slice (ptr i8)))])
 
@@ -36,8 +33,18 @@
 (defn address-ref [T] [(place (ref T))] (-> (ptr i8))
   (primitive/cast (ptr i8) place))
 
-(defn no-address [] (-> (ptr i8))
-  (primitive/cast (ptr i8) 0))
+;;; Room for the addresses of COUNT arguments.
+(defn slots-for [(count i64)] (-> (slice (ptr i8)))
+  (unsafe
+    (match (alloc/alloc [(ptr i8)] (alloc/malloc-allocator) (if (> count 0) count 1))
+      (Some [memory] memory)
+      (None [] (panic "safe: out of memory")))))
+
+;;; ADDRESS is where argument I lies.
+(defn put! [(slots (slice (ptr i8))) (i i64) (address (ptr i8))] (-> void)
+  (unsafe
+    (store! (primitive/index (data slots) i) address)
+    0))
 
 ;;; Argument I of the call whose arguments RAW holds.
 (defn slot [(raw (ptr i8)) (i i64)] (-> (ptr i8))
@@ -53,23 +60,10 @@
 (defn as-value [T] [(address (ptr i8))] (-> T)
   (unsafe (take! [T] (primitive/cast (ptr T) address))))
 
-;;; Start BODY on a new thread, handing it the eight addresses.
-(defn start [(body (fnptr (cc/C) [(ptr i8)] (ptr i8)))
-             (a0 (ptr i8)) (a1 (ptr i8)) (a2 (ptr i8)) (a3 (ptr i8))
-             (a4 (ptr i8)) (a5 (ptr i8)) (a6 (ptr i8)) (a7 (ptr i8))] (-> Running)
+;;; Start BODY on a new thread, handing it the addresses in SLOTS.
+(defn start [(body (fnptr (cc/C) [(ptr i8)] (ptr i8))) (slots (slice (ptr i8)))] (-> Running)
   (unsafe
-    (let [slots (match (alloc/alloc [(ptr i8)] (alloc/malloc-allocator) SLOTS)
-                  (Some [memory] memory)
-                  (None [] (panic "safe: out of memory")))
-          (mut running) (Running :thread (primitive/zeroed Thread) :slots slots)]
-      (store! (primitive/index (data slots) 0) a0)
-      (store! (primitive/index (data slots) 1) a1)
-      (store! (primitive/index (data slots) 2) a2)
-      (store! (primitive/index (data slots) 3) a3)
-      (store! (primitive/index (data slots) 4) a4)
-      (store! (primitive/index (data slots) 5) a5)
-      (store! (primitive/index (data slots) 6) a6)
-      (store! (primitive/index (data slots) 7) a7)
+    (let [(mut running) (Running :thread (primitive/zeroed Thread) :slots slots)]
       (when (!= (Thread::spawn (mut (.thread running)) body (primitive/cast (ptr i8) (data slots)))
                 (: 0 i32))
         (panic "safe: a thread could not be started"))
@@ -118,8 +112,6 @@
   (unless (and (primitive/code-list? first) (> (len first) 0)
                (primitive/code-list? second) (> (len second) 0))
     (primitive/error "par: expected two calls, (par (f …) (g …))"))
-  (when (> (- (len first) (first-argument first)) SLOTS)
-    (primitive/error "par: the first call takes at most eight arguments"))
   (let [(mut binders) (primitive/code-list-new)
         ; the first call: how the thread reads each argument, where each lies,
         ; and what the type witness takes and is given
@@ -135,6 +127,7 @@
         result-type (primitive/fresh-identifier "R")
         ; the thread entry point's parameter: one name, shared by every template
         raw (primitive/fresh-identifier "raw")
+        slots (primitive/fresh-identifier "slots")
         (mut count) 0]
     (for i (range (first-argument first) (len first))
       (let [arg (get first i)
@@ -147,7 +140,7 @@
                         (do (push! (mut binders) `(mut ~name)) (push! (mut binders) arg))
                         (do (push! (mut binders) name) (push! (mut binders) (get arg 1))))
                     (push! (mut read) `(mut (as-mut (slot ~raw ~count))))
-                    (push! (mut addresses) `(address-mut (mut ~name)))
+                    (push! (mut addresses) `(put! ~slots ~count (address-mut (mut ~name))))
                     (push! (mut callee-types) `(mut ~type))
                     (push! (mut witness-params) `(~parameter (mut ~type)))
                     (push! (mut witness-args) `(mut ~name)))
@@ -155,7 +148,7 @@
                 (do (push! (mut binders) name)
                     (push! (mut binders) arg)
                     (push! (mut read) `(as-ref (slot ~raw ~count)))
-                    (push! (mut addresses) `(address-ref ~name))
+                    (push! (mut addresses) `(put! ~slots ~count (address-ref ~name)))
                     (push! (mut callee-types) `(ref ~type))
                     (push! (mut witness-params) `(~parameter (ref ~type)))
                     (push! (mut witness-args) name))
@@ -164,14 +157,12 @@
                 (do (push! (mut binders) `(mut ~name))
                     (push! (mut binders) `(move ~arg))
                     (push! (mut read) `(as-value (slot ~raw ~count)))
-                    (push! (mut addresses) `(address-mut (mut ~name)))
+                    (push! (mut addresses) `(put! ~slots ~count (address-mut (mut ~name))))
                     (push! (mut forgotten) `(forget ~name))
                     (push! (mut callee-types) type)
                     (push! (mut witness-params) `(~parameter (ref ~type)))
                     (push! (mut witness-args) name)))
         (set! count (+ count 1))))
-    (for i (range count SLOTS)
-      (push! (mut addresses) `(no-address)))
     (for i (range (first-argument second) (len second))
       (let [arg (get second i)
             name (primitive/fresh-identifier "argument")]
@@ -203,7 +194,10 @@
       `(let [~@binders]
          ; lends each name once to check its type; a name may hold a raw pointer
          (unsafe (~witness (primitive/fnptr-of ~@callee) ~@witness-args))
-         (let [running (start (primitive/fnptr-of ~worker) ~@addresses)]
+         (let [running (unsafe
+                          (let [~slots (slots-for ~count)]
+                            ~@addresses
+                            (start (primitive/fnptr-of ~worker) ~slots)))]
            (~@second-callee ~@direct)
            (finish running)
            ; the thread took these values; this one must not drop them again

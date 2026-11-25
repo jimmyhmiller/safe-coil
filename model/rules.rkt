@@ -18,7 +18,7 @@
 ;; Λ is an input only: a loan lives exactly as long as the scope of its holder.
 (require redex/reduction-semantics)
 (provide Safe chk check-program check-fn mutant mutants
-         make-Σ fields-of variants-of subst copy? second-class?)
+         make-Σ fields-of variants-of subst copy? second-class? exclusive?)
 
 ;; Testing the tests: with one part of one rule left out, the random search must
 ;; find a program that goes wrong. Never set in a real check. The value is also
@@ -299,6 +299,13 @@
   (if (mutant? 'no-moves)
       Γ
       (for/list ([b Γ]) (if (eq? (car b) x) (list x (cadr b) 'moved) b))))
+;; the type of x when it is a variable that was moved out of, else #f
+(define (moved-type Γ x)
+  (match (assq x Γ)
+    [(list _ τ 'moved) (and (not (second-class? τ)) τ)]
+    [_ #f]))
+(define (mark-live Γ x)
+  (for/list ([b Γ]) (if (eq? (car b) x) (list x (cadr b) 'live) b)))
 (define (remove-var Γ x) (filter (λ (b) (not (eq? (car b) x))) Γ))
 (define (join Γ1 Γ2)
   (for/list ([a Γ1] [b Γ2])
@@ -408,6 +415,14 @@
    (side-condition ,(write-ok? (term Λ) (term p)))
    -------------------------------------------- "set"
    (chk Σ Γ Λ (set! p e) unit () Γ_1)]
+
+  ;; a variable that was moved out of holds nothing to drop, so nothing can be
+  ;; lent from it: giving it a value makes it whole again
+  [(chk Σ Γ Λ e σ () Γ_1)
+   (where σ ,(moved-type (term Γ_1) (term x)))
+   (where Γ_2 ,(mark-live (term Γ_1) (term x)))
+   -------------------------------------------- "set-moved"
+   (chk Σ Γ Λ (set! x e) unit () Γ_2)]
 
   ;; the same, and the old value is the result instead of being dropped
   [(chk Σ Γ Λ e σ () Γ_1)
