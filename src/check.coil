@@ -75,7 +75,12 @@
    ;;; the function's type parameters, a list of symbols
    (tparams Code)
    ;;; the names of the modules being checked
-   (user Code)])
+   (user Code)
+   ;;; the form being checked and the forms it is inside, outermost first
+   (path (ArrayList Code))
+   ;;; the locals that hold their loans until their scope ends: views that are
+   ;;; dropped, whose drop may use what they borrowed
+   (pinned (ArrayList i64))])
 
 ;;; ---- small things ------------------------------------------------------------
 
@@ -380,11 +385,90 @@
 (defn loan-excl? [(l Code)] (-> bool) (primitive/code-eq (get l 1) `mut))
 
 ;;; Is some loan alive on any part of Q? Only exclusive ones count unless ANY.
+;;; ---- how long a loan counts ---------------------------------------------------
+;;;
+;;; A loan counts while its holder is still named by code that runs later. The
+;;; forms that run later are read off `path`: in each form the one being checked
+;;; is inside, whatever is written after it. A loop runs again and an assignment
+;;; may use its place after its value, so everything in one of those counts.
+
+(defn names? [(code Code) (binder Code)] (-> bool)
+  (cond (primitive/code-sym? code) (primitive/bound-identifier=? binder code)
+        (or (primitive/code-list? code) (primitive/code-vector? code))
+          (block :found
+            (for part (iter code)
+              (when (names? part binder) (return-from :found true)))
+            false)
+        :else false))
+
+;;; Is BINDER named in NODE after CHILD, the first part of NODE written as CHILD
+;;; is? SEEN says whether CHILD has been passed.
+(defn names-after? [(node Code) (child Code) (binder Code) (seen (mut bool))] (-> bool)
+  (cond (and (not seen) (primitive/code-eq node child)) (do (set! seen true) false)
+        (primitive/code-sym? node) (and seen (primitive/bound-identifier=? binder node))
+        (or (primitive/code-list? node) (primitive/code-vector? node))
+          (block :found
+            (for part (iter node)
+              (when (names-after? part child binder (mut seen)) (return-from :found true)))
+            false)
+        :else false))
+
+;;; Does every part of FORM count as running later than any part of it?
+(defn runs-again? [(form Code)] (-> bool)
+  (and (primitive/code-list? form)
+       (> (len form) 0)
+       (primitive/code-sym? (get form 0))
+       (let [text (meta/source (base-name (get form 0)))]
+         (or (= text "loop")
+             (and (> (len text) 0) (= (get text (- (len text) 1)) #\!))))))
+
+(defn named-later? [(cx (ref Cx)) (binder Code)] (-> bool)
+  (block :found
+    (for [k 0 (- (len (.path cx)) 1)]
+      (let [parent (get (.path cx) k)
+            child (get (.path cx) (+ k 1))
+            (mut seen) false]
+        (when (if (runs-again? parent)
+                  (names? parent binder)
+                  (or (names-after? parent child binder (mut seen))
+                      ; CHILD is not written in PARENT as it stands: all of it counts
+                      (and (not seen) (names? parent binder))))
+          (return-from :found true))))
+    false))
+
+;;; Does the loan a holder has still count? A call's argument being passed
+;;; (holder -1) does. A local does while it is named later, when it is pinned,
+;;; and when a holder that counts borrowed through it: that one reaches what
+;;; this one borrowed.
+(defn holder-counts? [(cx (ref Cx)) (holder i64) (depth i64)] (-> bool)
+  (if (< holder 0)
+      true
+      (block :found
+        (for [i 0 (len (.pinned cx))]
+          (when (= (get (.pinned cx) i) holder) (return-from :found true)))
+        (for [i 0 (len (.locals cx))]
+          (let [l (get (.locals cx) i)]
+            (when (and (= (.serial l) holder) (named-later? cx (.binder l)))
+              (return-from :found true))))
+        ; a chain of borrows is no longer than the locals in scope
+        (when (< depth (len (.locals cx)))
+          (for [i 0 (len (.loans cx))]
+            (let [l (get (.loans cx) i)
+                  root (place-root (.place l))]
+              (when (and (!= (.holder l) holder)
+                         (head-is? root `loc)
+                         (= (primitive/code-int (get root 1)) holder)
+                         (holder-counts? cx (.holder l) (+ depth 1)))
+                (return-from :found true)))))
+        false)))
+
 (defn lent? [(cx (ref Cx)) (q Code) (any bool)] (-> bool)
   (block :found
     (for [i 0 (len (.loans cx))]
       (let [l (get (.loans cx) i)]
-        (when (and (or any (.excl l)) (overlap? (.place l) q))
+        (when (and (or any (.excl l))
+                   (overlap? (.place l) q)
+                   (holder-counts? cx (.holder l) 0))
           (return-from :found true))))
     false))
 
@@ -613,6 +697,12 @@
             (do (guard-raw-flow! cx e init)
                 (let [r (eval (mut cx) init (WBind mutable))
                       serial (push-local! (mut cx) name (not (.fresh r)))]
+                  ; a value of its own that is dropped: a view, when it holds loans
+                  (when (and (.fresh r)
+                             (owner-type? cx (pointee (if (primitive/code-eq (type-of init) `unknown-type)
+                                                          (type-of name)
+                                                          (type-of init)))))
+                    (push! (mut (.pinned cx)) serial))
                   ; a `let` bound to a reference keeps the temporaries of its
                   ; initializer; one bound to a view does not
                   (unless (ref-type? (type-of init))
@@ -1133,6 +1223,12 @@
 
 ;;; Check E, whose consumer wants WANT.
 (defn eval [(cx (mut Cx)) (e Code) (want Want)] (-> Res)
+  (push! (mut (.path cx)) e)
+  (let [r (eval-form (mut cx) e want)]
+    (pop! (mut (.path cx)))
+    r))
+
+(defn eval-form [(cx (mut Cx)) (e Code) (want Want)] (-> Res)
   (cond (primitive/code-sym? e)
           (if (> (primitive/binding-of e) 0)
               (let [q (place-of (mut cx) e)]
@@ -1197,7 +1293,9 @@
                      :unsafe false
                      :serial 0
                      :tparams (union outer own)
-                     :user user)]
+                     :user user
+                     :path (ArrayList::new [Code] a)
+                     :pinned (ArrayList::new [i64] a))]
     (if (or (mentions-code? params) (mentions-code? result))
         ; compile-time code: it runs in the compiler, not in the program
         0
@@ -1214,6 +1312,7 @@
                            (head-is? result `ref) (WShared)
                            (primitive/code-eq result `void) (WDiscard)
                            :else (WValue))
+                _whole (push! (mut (.path cx)) form)
                 r (eval-seq (mut cx) form (+ arrow 1) want)
                 left (exit-scopes! (mut cx) form 0 0 (.loans r))]
             (for l (iter left)

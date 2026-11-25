@@ -1,0 +1,27 @@
+(module case.ok-borrow-ends-at-last-use)
+(import "coil.primitive" :as primitive)
+(import "safe.vec" :use [Vec])
+(import "safe.box" :use [Box])
+(defstruct Pt [(x i64) (y i64)])
+(defn bump [(p (mut Pt))] (-> i64) (set! (.x p) (+ (.x p) 1)) (.x p))
+(defn main [] (-> i64)
+  (let [(mut v) (Vec::new [i64])
+        (mut p) (Pt :x 1 :y 2)
+        (mut b) (Box::new 5)]
+    (Vec::push! (mut v) 1)
+    (let [first (Vec::at v 0)
+          seen (primitive/load first)]
+      ; `first` is not named again: the list is free to grow
+      (Vec::push! (mut v) (+ seen 1))
+      (let [m (Vec::at-mut (mut v) 1)]
+        (set! m 9))
+      (println "{} {}" (Vec::len v) (primitive/load (Vec::at v 1))))
+    (let [inside (Box::get-mut (mut b))]
+      (set! inside 6)
+      (set! b (Box::new 7))
+      (println "{}" (primitive/load (Box::get b))))
+    (let [r (bump (mut p))
+          q p]
+      (set! (.y p) (+ r (.x q)))
+      (println "{}" (.y p)))
+    0))

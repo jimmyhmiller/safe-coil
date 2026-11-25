@@ -1,0 +1,12 @@
+(module case.bad-borrow-through-dead-reference)
+(import "coil.primitive" :as primitive)
+(import "safe.vec" :use [Vec])
+(import "safe.box" :use [Box])
+(defn main [] (-> i64)
+  (let [(mut v) (Vec::new [(Box i64)])]
+    (Vec::push! (mut v) (Box::new 1))
+    (let [slot (Vec::at-mut (mut v) 0)
+          inside (Box::get slot)]
+      ; `slot` is not named again, but `inside` was borrowed through it
+      (Vec::push! (mut v) (Box::new 2))
+      (primitive/load inside))))

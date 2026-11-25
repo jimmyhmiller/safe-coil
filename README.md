@@ -34,9 +34,14 @@ reference, and a reference stored in a struct, a sum or a container. The checker
 adds the rest of the model:
 
 - **Loans.** A reference holds a loan on the place it came from for as long as
-  the name bound to it is in scope. A place is not read while lent exclusively,
-  and not written, moved, or lent exclusively while lent at all. Two fields of
-  one struct are separate places.
+  the name bound to it is still used: until its last use, not the end of its
+  scope. A name used in a loop counts as used for the whole loop. A place is
+  not read while lent exclusively, and not written, moved, or lent exclusively
+  while lent at all. Two fields of one struct are separate places. Two things
+  keep a loan past its holder's last use: a reference borrowed through the
+  holder that is itself still used, and a view that is dropped (a held lock, an
+  exclusive slice), which keeps its loans until its scope ends because its
+  drop may use what it borrowed.
 - **Arguments.** Each argument's loans are alive while the later ones are
   evaluated, so `(f (mut p) p)` is refused. Plain data passed by value is read
   where it lies for the length of the call, so it counts as lent shared.
@@ -204,15 +209,15 @@ run fails if the checker accepts anything the model refuses.
 checker at a time and requires `diff.py` to find a program the weakened checker
 wrongly accepts.
 
-On the model's 112 cases and 4000 random programs (seed 7), 4010 can be written
-as Coil. The compiler refuses 1676 of them itself. On the other 2334 the checker
-accepts nothing the model refuses: 1597 accepted by both, 702 refused by both,
-33 refused only by the checker, each for one of the differences below, and two
-that are the exclusive-reference case below, which the checker refuses too. All
-sixteen weakenings are caught, by a hand-written case or by the differential
-run.
+On the model's 118 cases and 4000 random programs (seed 7), 4020 can be written
+as Coil. The compiler refuses 1663 of them itself. On the other 2357 the checker
+accepts nothing the model refuses: 1611 accepted by both, 710 refused by both,
+32 refused only by the checker, each for one of the differences below, and
+four that are the exclusive-reference case below, of which the checker accepts
+one. All nineteen weakenings are
+caught, by a hand-written case or by the differential run.
 
-`tests/run.py` has 95 hand-written cases. Every `ok_` case and both examples
+`tests/run.py` has 100 hand-written cases. Every `ok_` case and both examples
 also run clean under `--sanitize=address` and `--sanitize=thread`.
 
 ### Where Coil and the model differ
@@ -299,7 +304,7 @@ racket model/search.rkt teeth       # each rule weakened in turn: the search mus
 racket model/search.rkt teeth 20000 no-union par-split   # only those weakenings
 ```
 
-`teeth` is the check on the search itself. `rules.rkt` lists 23 ways to weaken
+`teeth` is the check on the search itself. `rules.rkt` lists 24 ways to weaken
 one rule (`mutants`), and the machine can drop its run-time check on globals.
 `teeth` fails unless the search finds a program that goes wrong under each one.
 The programs a seed gives depend on the rules, because a function body the
@@ -310,7 +315,6 @@ says a weakening was not found.
 
 These are sound and simple. The model should be relaxed first, then the checker.
 
-- Loans are lexical: one lives until its holder's scope ends, not until its last use.
 - A returned reference borrows from every argument the call took by reference.
 - Every element of a pool is one place: two elements cannot be lent exclusively at once.
 - Only a whole variable can be moved. `replace!` swaps an owner out of a field, a

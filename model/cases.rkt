@@ -72,6 +72,27 @@
     (reject "a variable moved in one branch only is used after being given no value"
      ,(prog '((defn eat () ((b (box int))) int (* b)))
             '(let ([a (box 1)]) (seq (if0 0 (call eat () a) (seq (set! a (box 2)) 5)) (* a)))))
+    ;; ================================================== a loan lasts while its holder is named
+    (accept "a reference that is not named again no longer keeps its place lent"
+     ,(prog '() '(let ([a 1]) (let ([r (ref a)]) (seq (* r) (seq (set! a 2) a))))))
+    (accept "an exclusive reference that is not named again frees its place"
+     ,(prog '() '(let ([a (box 1)])
+                   (let ([m (mut a)]) (seq (set! (* m) (box 2)) (* a))))))
+    (reject "a reference named later keeps its place lent"
+     ,(prog '() '(let ([a (box 1)]) (let ([r (ref (* a))]) (seq (set! a (box 2)) (* r))))))
+    (reject "a reference lent again keeps what its source borrowed"
+     ,(prog '() '(let ([a (box 1)])
+                   (let ([m (mut a)])
+                     (let ([r (ref (* (* m)))]) (seq (set! a (box 2)) (* r)))))))
+    (reject "a reference named in a loop is named by its next turn"
+     ,(prog '() '(let ([a (box 1)])
+                   (let ([r (ref (* a))])
+                     (let ([i 2])
+                       (seq (while i (seq (* r) (seq (set! a (box i)) (set! i (+ i -1)))))
+                            0))))))
+    (accept "an argument's reference ends with the call"
+     ,(prog '((defn get () ((r (ref int))) int (* r)))
+            '(let ([a 1]) (let ([r (ref a)]) (seq (call get () r) (seq (set! a 2) a))))))
     (accept "take an owner out of a box, leaving another in its place"
      ,(prog '() '(let ([a (box (box 1))]) (let ([old (take (* a) (box 2))]) (+ (* old) (* (* a)))))))
     (accept "unbox gives the contents and frees the box"

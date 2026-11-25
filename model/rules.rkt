@@ -48,6 +48,7 @@
     (global-escape "a reference to a global may leave its `with`")
     (par-split "the two calls of a par are checked apart")
     (spawn-ref "a thread is given a reference")
+    (dead-source "a reference lent again is forgotten once its own name is no longer used")
     (raw-anywhere "a raw pointer is read outside unsafe")))
 (define (mutant? m) (eq? (mutant) m))
 
@@ -96,13 +97,45 @@
 ;; by identity: it looks Σ up in a table on every step, and hashing the whole
 ;; program each time was most of the cost of a check.
 (struct program-decls (list))
-(define (make-Σ decls [Ts '()]) (list (mutant) 'safe 'noloop Ts (program-decls decls)))
+(define (make-Σ decls [Ts '()]) (list (mutant) 'safe 'noloop Ts (program-decls decls) '()))
 (define (in-unsafe? Σ) (eq? (second Σ) 'unsafe))
 (define (in-loop? Σ) (eq? (third Σ) 'loop))
 (define (tparams Σ) (fourth Σ))
 (define (decls-of Σ) (program-decls-list (fifth Σ)))
-(define (Σ-unsafe Σ) (list (first Σ) 'unsafe (third Σ) (fourth Σ) (fifth Σ)))
-(define (Σ-loop Σ) (list (first Σ) (second Σ) 'loop (fourth Σ) (fifth Σ)))
+(define (Σ-unsafe Σ) (list (first Σ) 'unsafe (third Σ) (fourth Σ) (fifth Σ) (sixth Σ)))
+(define (Σ-loop Σ) (list (first Σ) (second Σ) 'loop (fourth Σ) (fifth Σ) (sixth Σ)))
+;; The variables that what runs after the expression being checked still names.
+(define (Σ-live Σ) (sixth Σ))
+;; Σ for an expression that the expressions `later` run after.
+(define (Σ+ Σ . later)
+  (list (first Σ) (second Σ) (third Σ) (fourth Σ) (fifth Σ)
+        (remove-duplicates (append (append-map uses later) (sixth Σ)))))
+
+;; Σ for an expression that each of the expressions `laters` runs after. A list
+;; of expressions is not an expression: `(x y)` is two variables, where a form
+;; headed by a name is that form.
+(define (Σ+* Σ laters) (apply Σ+ Σ laters))
+
+;; The variables an expression or a place names. A binder is
+;; named too, which is harmless: no two variables of a function share a name.
+(define (uses t)
+  (match t
+    [(? symbol? x) (if (memq x '(unit)) '() (list x))]
+    [(? number?) '()]
+    [`(: ,p ,_) (uses p)]
+    [`(at ,p ,x) (cons x (uses p))]
+    [`(let ([,x ,e1]) ,e2) (cons x (append (uses e1) (uses e2)))]
+    [`(new ,_ ,es ...) (append-map uses es)]
+    [`(inj ,_ ,_ ,e) (uses e)]
+    [`(,(or 'match 'match-ref 'match-mut) ,e ((,_ ,xs) ,es) ...)
+     (append (uses e) xs (append-map uses es))]
+    [`(pool-new ,_) '()]
+    [`(remove ,p ,x) (cons x (uses p))]
+    [`(call ,_ ,_ ,es ...) (append-map uses es)]
+    [`(with ,_ ,_ ,x ,e) (cons x (uses e))]
+    [`(break) '()]
+    [(cons (? symbol?) rest) (append-map uses rest)]
+    [_ (error 'uses "not an expression: ~a" t)]))
 (define (find-decl Σ kind name)
   (for/first ([d (decls-of Σ)] #:when (and (eq? (car d) kind) (eq? (cadr d) name))) d))
 
@@ -246,6 +279,33 @@
 (define (overlap? lent used)
   (or (prefix? lent used) (and (not (mutant? 'no-subplace)) (prefix? used lent))))
 
+;; A loan counts for as long as its holder is still named by what runs later.
+;; A view that is moved holds its loans until its scope ends: dropping it may
+;; use what it borrowed. A reference lent again keeps its source's loans alive,
+;; since the new reference reaches what the source did.
+(define (active Σ Γ Λ)
+  (define later (Σ-live Σ))
+  (define (kept? h)
+    (or (memq h later)
+        (match (assq h Γ)
+          [(list _ τ _) (or (not (second-class? τ))
+                            (match τ [`(view ,_) (exclusive? Σ τ)] [_ #f]))]
+          [_ #t])))
+  (define holders (remove-duplicates (map car Λ)))
+  (define live
+    (let grow ([live (filter kept? holders)])
+      (define more
+        (if (mutant? 'dead-source)
+            '()
+            (for/list ([l Λ]
+                       #:when (and (memq (car l) live)
+                                   (symbol? (place-root (cadr l)))
+                                   (memq (place-root (cadr l)) holders)
+                                   (not (memq (place-root (cadr l)) live))))
+              (place-root (cadr l)))))
+      (if (null? more) live (grow (remove-duplicates (append more live))))))
+  (filter (λ (l) (memq (car l) live)) Λ))
+
 (define (free-of? Λ q kinds)
   (or (mutant? 'no-exclusive)
       (for/and ([l Λ]) (match l [(list _ q2 k) (not (and (memq k kinds) (overlap? q2 q)))]))))
@@ -335,28 +395,28 @@
   [-------------------------------------------- "unit"
    (chk Σ Γ Λ unit unit () Γ)]
 
-  [(chk Σ Γ Λ e_1 int L_1 Γ_1)
+  [(chk ,(Σ+ (term Σ) (term e_2)) Γ Λ e_1 int L_1 Γ_1)
    (chk Σ Γ_1 Λ e_2 int L_2 Γ_2)
    -------------------------------------------- "add"
    (chk Σ Γ Λ (+ e_1 e_2) int () Γ_2)]
 
   [(side-condition ,(eq? 'copy (read-kind (term Σ) (term Γ) (term p))))
    (where σ ,(place-type (term Σ) (term Γ) (term p)))
-   (side-condition ,(read-ok? (term Λ) (term p)))
+   (side-condition ,(read-ok? (active (term Σ) (term Γ) (term Λ)) (term p)))
    -------------------------------------------- "copy"
    (chk Σ Γ Λ p σ () Γ)]
 
   ;; only a whole variable can be moved; `take` gets an owner out of anywhere else
   [(side-condition ,(eq? 'move (read-kind (term Σ) (term Γ) (term x))))
    (where σ ,(place-type (term Σ) (term Γ) (term x)))
-   (side-condition ,(write-ok? (term Λ) (term x)))
+   (side-condition ,(write-ok? (active (term Σ) (term Γ) (term Λ)) (term x)))
    (where Γ_1 ,(mark-moved (term Γ) (term x)))
    -------------------------------------------- "move"
    (chk Σ Γ Λ x σ () Γ_1)]
 
   [(side-condition ,(eq? 'copy2 (read-kind (term Σ) (term Γ) (term p))))
    (where τ ,(place-type (term Σ) (term Γ) (term p)))
-   (side-condition ,(read-ok? (term Λ) (term p)))
+   (side-condition ,(read-ok? (active (term Σ) (term Γ) (term Λ)) (term p)))
    (where L ,(loans-of (term Λ) (place-root (term p))))
    -------------------------------------------- "copy-ref"
    (chk Σ Γ Λ p τ L Γ)]
@@ -364,21 +424,21 @@
   ;; an exclusive reference is moved, and must not be reborrowed at the time
   [(side-condition ,(eq? 'move2 (read-kind (term Σ) (term Γ) (term x))))
    (where τ ,(place-type (term Σ) (term Γ) (term x)))
-   (side-condition ,(write-ok? (term Λ) (term x)))
+   (side-condition ,(write-ok? (active (term Σ) (term Γ) (term Λ)) (term x)))
    (where L ,(loans-of (term Λ) (term x)))
    (where Γ_1 ,(if (mutant? 'copy-mut) (term Γ) (mark-moved (term Γ) (term x))))
    -------------------------------------------- "move-mut"
    (chk Σ Γ Λ x τ L Γ_1)]
 
   [(where σ ,(place-type (term Σ) (term Γ) (term p)))
-   (side-condition ,(read-ok? (term Λ) (term p)))
+   (side-condition ,(read-ok? (active (term Σ) (term Γ) (term Λ)) (term p)))
    (where L ,(shared-loans (term Σ) (term Γ) (term Λ) (term p)))
    -------------------------------------------- "borrow"
    (chk Σ Γ Λ (ref p) (ref σ) L Γ)]
 
   [(where σ ,(place-type (term Σ) (term Γ) (term p)))
    (side-condition ,(writable? (term Σ) (term Γ) (term p)))
-   (side-condition ,(write-ok? (term Λ) (term p)))
+   (side-condition ,(write-ok? (active (term Σ) (term Γ) (term Λ)) (term p)))
    (where L ,(exclusive-loans (term p)))
    -------------------------------------------- "borrow-mut"
    (chk Σ Γ Λ (mut p) (mut σ) L Γ)]
@@ -391,8 +451,8 @@
    -------------------------------------------- "unbox"
    (chk Σ Γ Λ (unbox e) σ () Γ_1)]
 
-  ;; the loans of e_1's value belong to x until x's scope ends
-  [(chk Σ Γ Λ e_1 τ_1 L_1 Γ_1)
+  ;; the loans of e_1's value belong to x, and count while x is still named
+  [(chk ,(Σ+ (term Σ) (term e_2)) Γ Λ e_1 τ_1 L_1 Γ_1)
    (side-condition ,(not (assq (term x) (term Γ_1))))
    (where Λ_2 ,(add-loans (term Λ) (term x) (if (mutant? 'no-let-loans) '() (term L_1))))
    (where Γ_b ,(cons (term (x τ_1 live)) (term Γ_1)))
@@ -402,37 +462,37 @@
    -------------------------------------------- "let"
    (chk Σ Γ Λ (let ([x e_1]) e_2) τ_2 L_3 Γ_3)]
 
-  [(chk Σ Γ Λ e_1 τ_1 L_1 Γ_1)
+  [(chk ,(Σ+ (term Σ) (term e_2)) Γ Λ e_1 τ_1 L_1 Γ_1)
    (chk Σ Γ_1 Λ e_2 τ_2 L_2 Γ_2)
    -------------------------------------------- "seq"
    (chk Σ Γ Λ (seq e_1 e_2) τ_2 L_2 Γ_2)]
 
   ;; the new value is computed first; then the place must be whole, reachable
   ;; for writing, and free of loans, because its old value is dropped
-  [(chk Σ Γ Λ e σ () Γ_1)
+  [(chk ,(Σ+ (term Σ) (term p)) Γ Λ e σ () Γ_1)
    (where σ ,(place-type (term Σ) (term Γ_1) (term p)))
    (side-condition ,(writable? (term Σ) (term Γ_1) (term p)))
-   (side-condition ,(write-ok? (term Λ) (term p)))
+   (side-condition ,(write-ok? (active (term Σ) (term Γ_1) (term Λ)) (term p)))
    -------------------------------------------- "set"
    (chk Σ Γ Λ (set! p e) unit () Γ_1)]
 
   ;; a variable that was moved out of holds nothing to drop, so nothing can be
   ;; lent from it: giving it a value makes it whole again
-  [(chk Σ Γ Λ e σ () Γ_1)
+  [(chk ,(Σ+ (term Σ) (term x)) Γ Λ e σ () Γ_1)
    (where σ ,(moved-type (term Γ_1) (term x)))
    (where Γ_2 ,(mark-live (term Γ_1) (term x)))
    -------------------------------------------- "set-moved"
    (chk Σ Γ Λ (set! x e) unit () Γ_2)]
 
   ;; the same, and the old value is the result instead of being dropped
-  [(chk Σ Γ Λ e σ () Γ_1)
+  [(chk ,(Σ+ (term Σ) (term p)) Γ Λ e σ () Γ_1)
    (where σ ,(place-type (term Σ) (term Γ_1) (term p)))
    (side-condition ,(writable? (term Σ) (term Γ_1) (term p)))
-   (side-condition ,(write-ok? (term Λ) (term p)))
+   (side-condition ,(write-ok? (active (term Σ) (term Γ_1) (term Λ)) (term p)))
    -------------------------------------------- "take"
    (chk Σ Γ Λ (take p e) σ () Γ_1)]
 
-  [(chk Σ Γ Λ e_1 int L_1 Γ_1)
+  [(chk ,(Σ+ (term Σ) (term e_2) (term e_3)) Γ Λ e_1 int L_1 Γ_1)
    (chk Σ Γ_1 Λ e_2 τ L_2 Γ_2)
    (chk Σ Γ_1 Λ e_3 τ L_3 Γ_3)
    (where L ,(if (mutant? 'no-union) (term L_2) (union (term L_2) (term L_3))))
@@ -442,8 +502,9 @@
 
   ;; A loop's body may run again, so it leaves every outer variable as it found
   ;; it. A break then needs no state of its own.
-  [(chk Σ Γ Λ e_c int L_c Γ_1)
-   (chk ,(Σ-loop (term Σ)) Γ_1 Λ e_b τ_b L_b Γ_2)
+  ;; What the loop names is named again by its next turn.
+  [(chk ,(Σ+ (term Σ) (term e_c) (term e_b)) Γ Λ e_c int L_c Γ_1)
+   (chk ,(Σ-loop (Σ+ (term Σ) (term e_c) (term e_b))) Γ_1 Λ e_b τ_b L_b Γ_2)
    (side-condition ,(or (mutant? 'loop-moves) (equal? (term Γ_2) (term Γ))))
    -------------------------------------------- "while"
    (chk Σ Γ Λ (while e_c e_b) unit () Γ_2)]
@@ -474,17 +535,18 @@
    (chk Σ Γ Λ (inj σ K e) σ () Γ_1)]
 
   ;; by value: the sum is consumed and each arm owns its payload
-  [(chk Σ Γ Λ e_s σ_s () Γ_1)
+  [(chk ,(Σ+* (term Σ) (term (e_a ...))) Γ Λ e_s σ_s () Γ_1)
    (where ((K σ_K) ...) ,(variants-of (term Σ) (term σ_s)))
    (chk-arms Σ Γ_1 Λ (((K x) e_a) ...) (σ_K ...) () τ L Γ_2)
    -------------------------------------------- "match"
    (chk Σ Γ Λ (match e_s ((K x) e_a) ...) τ L Γ_2)]
 
   ;; by reference: the arm's reference keeps the matched place lent, so the
-  ;; variant cannot be replaced under it
+  ;; variant cannot be replaced under it. The arms run after the place is
+  ;; looked at, so what they name is still named then.
   [(where σ_s ,(place-type (term Σ) (term Γ) (term p)))
    (where ((K σ_K) ...) ,(variants-of (term Σ) (term σ_s)))
-   (side-condition ,(read-ok? (term Λ) (term p)))
+   (side-condition ,(read-ok? (active (Σ+* (term Σ) (term (e_a ...))) (term Γ) (term Λ)) (term p)))
    (where L_x ,(shared-loans (term Σ) (term Γ) (term Λ) (term p)))
    (chk-arms Σ Γ Λ (((K x) e_a) ...) ((ref σ_K) ...) L_x τ L Γ_1)
    -------------------------------------------- "match-ref"
@@ -493,7 +555,7 @@
   [(where σ_s ,(place-type (term Σ) (term Γ) (term p)))
    (where ((K σ_K) ...) ,(variants-of (term Σ) (term σ_s)))
    (side-condition ,(writable? (term Σ) (term Γ) (term p)))
-   (side-condition ,(write-ok? (term Λ) (term p)))
+   (side-condition ,(write-ok? (active (Σ+* (term Σ) (term (e_a ...))) (term Γ) (term Λ)) (term p)))
    (where L_x ,(exclusive-loans (term p)))
    (chk-arms Σ Γ Λ (((K x) e_a) ...) ((mut σ_K) ...) L_x τ L Γ_1)
    -------------------------------------------- "match-mut"
@@ -505,18 +567,18 @@
    -------------------------------------------- "pool-new"
    (chk Σ Γ Λ (pool-new σ) (pool σ) () Γ)]
 
-  [(chk Σ Γ Λ e σ () Γ_1)
+  [(chk ,(Σ+ (term Σ) (term p)) Γ Λ e σ () Γ_1)
    (where (pool σ) ,(place-type (term Σ) (term Γ_1) (term p)))
    (side-condition ,(writable? (term Σ) (term Γ_1) (term p)))
-   (side-condition ,(write-ok? (term Λ) (term p)))
+   (side-condition ,(write-ok? (active (term Σ) (term Γ_1) (term Λ)) (term p)))
    -------------------------------------------- "insert"
    (chk Σ Γ Λ (insert p e) (handle σ) () Γ_1)]
 
   [(where (pool σ) ,(place-type (term Σ) (term Γ) (term p)))
    (where (handle σ) ,(lookup (term Γ) (term x)))
-   (side-condition ,(read-ok? (term Λ) (term x)))
+   (side-condition ,(read-ok? (active (term Σ) (term Γ) (term Λ)) (term x)))
    (side-condition ,(writable? (term Σ) (term Γ) (term p)))
-   (side-condition ,(write-ok? (term Λ) (term p)))
+   (side-condition ,(write-ok? (active (term Σ) (term Γ) (term Λ)) (term p)))
    -------------------------------------------- "remove"
    (chk Σ Γ Λ (remove p x) σ () Γ)]
 
@@ -542,7 +604,7 @@
                          (andmap (λ (t) (wf? (term Σ) t)) (term (σ_1 ... σ_2 ...)))))
    (where (τ_a1 ...) ,(for/list ([t (term (τ_1 ...))]) (subst t (term (T_1 ...)) (term (σ_1 ...)))))
    (where (τ_a2 ...) ,(for/list ([t (term (τ_2 ...))]) (subst t (term (T_2 ...)) (term (σ_2 ...)))))
-   (chk-args Σ Γ Λ (e_1 ...) (τ_a1 ...) L_1 Γ_1)
+   (chk-args ,(Σ+* (term Σ) (term (e_2 ...))) Γ Λ (e_1 ...) (τ_a1 ...) L_1 Γ_1)
    (where Λ_2 ,(if (mutant? 'par-split) (term Λ) (add-loans (term Λ) (term tmp) (term L_1))))
    (chk-args Σ Γ_1 Λ_2 (e_2 ...) (τ_a2 ...) L_2 Γ_2)
    -------------------------------------------- "par"
@@ -594,7 +656,7 @@
    (chk Σ Γ Λ (load e) σ () Γ_1)]
 
   [(side-condition ,(in-unsafe? (term Σ)))
-   (chk Σ Γ Λ e_1 (ptr σ) () Γ_1)
+   (chk ,(Σ+ (term Σ) (term e_2)) Γ Λ e_1 (ptr σ) () Γ_1)
    (chk Σ Γ_1 Λ e_2 σ () Γ_2)
    -------------------------------------------- "store"
    (chk Σ Γ Λ (store e_1 e_2) unit () Γ_2)]
@@ -617,7 +679,7 @@
   [-------------------------------------------- "no-args"
    (chk-args Σ Γ Λ () () () Γ)]
 
-  [(chk Σ Γ Λ e_1 τ_1 L_1 Γ_1)
+  [(chk ,(Σ+* (term Σ) (term (e_r ...))) Γ Λ e_1 τ_1 L_1 Γ_1)
    (where Λ_1 ,(add-loans (term Λ) (term tmp) (if (mutant? 'no-arg-loans) '() (term L_1))))
    (chk-args Σ Γ_1 Λ_1 (e_r ...) (τ_r ...) L_2 Γ_2)
    (where L ,(union (term L_1) (term L_2)))
