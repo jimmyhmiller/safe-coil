@@ -1,0 +1,7 @@
+(module case.bad-slice-outlives-vec)
+(import "safe.vec" :use [Vec Slice])
+(defn part [] (-> (Slice i64))
+  (let [(mut v) (Vec::new [i64])]
+    (Vec::push! (mut v) 1)
+    (Vec::slice v 0 1)))
+(defn main [] (-> i64) 0)

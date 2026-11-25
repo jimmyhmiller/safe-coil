@@ -1,6 +1,7 @@
 ;;; Globals safe code can change: lent for a scope, with exclusivity checked when
 ;;; the scope is entered.
 (module safe.global)
+(export defglobal with-ref with-mut Global)
 (import "coil.primitive" :as primitive)
 (import "coil.atomic" :as atomic)
 (import "safe.core" :use [unsafe lend lend-mut])

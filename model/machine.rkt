@@ -36,6 +36,10 @@
   ;; inside a `par` side: every access made, to compare with the other side's
   (define log #f)
   (define held '())               ; globals this side has entered: (g . w)
+  ;; threads not yet joined: id -> (cons accesses-by-cell result). A thread's
+  ;; call is run to its end where it is spawned; what it touched is then
+  ;; compared with everything done until it is joined.
+  (define tasks (make-hasheqv))
 
   (define (find kind name)
     (for/first ([d decls] #:when (and (eq? (car d) kind) (eq? (cadr d) name))) d))
@@ -49,7 +53,9 @@
     (hash-set! store next (cell v #t heap?))
     next)
   (define (log! a path write?)
-    (when log (hash-set! log (list a path write? held) #t)))
+    (when log (hash-set! log (list a path write? held) #t))
+    (for ([t (in-hash-values tasks)])
+      (when (races? (list a path write? held) (car t)) (raise (stuck "data race")))))
   (define (live-cell a what)
     (define c (hash-ref store a))
     (unless (cell-live? c) (raise (stuck (format "~a a dead cell" what))))
@@ -107,6 +113,7 @@
   (define (owning? v)
     (match v
       [`(own ,_) #t]
+      [`(task ,_) #t]
       [`(tbl . ,_) #t]
       [`(rec (,_ . ,vs) ...) (ormap owning? vs)]
       [`(var ,_ ,pv) (owning? pv)]
@@ -121,7 +128,14 @@
       [`(rec (,_ . ,vs) ...) (for-each drop-val! vs)]
       [`(var ,_ ,pv) (drop-val! pv)]
       [`(tbl (,_ . ,vs) ...) (for-each drop-val! vs)]
+      ;; a task that is dropped waits for its thread and drops what it returned
+      [`(task ,id) (drop-val! (finish! id))]
       [_ (void)]))
+  ;; the thread is over: what its call returned
+  (define (finish! id)
+    (define t (hash-ref tasks id (λ () (raise (stuck "a task joined twice")))))
+    (hash-remove! tasks id)
+    (cdr t))
   (define (end-scope! a)
     (drop-val! (cell-v (hash-ref store a)))
     (kill! a))
@@ -171,18 +185,23 @@
 
   ;; do the two sides touch one place, one of them writing, with no global
   ;; whose `with` keeps them apart?
-  (define (race? l1 l2)
-    (define by-cell (make-hasheqv))
-    (for ([k (in-hash-keys l2)]) (hash-update! by-cell (car k) (λ (ks) (cons k ks)) '()))
+  (define (by-cell l)
+    (define cells (make-hasheqv))
+    (for ([k (in-hash-keys l)]) (hash-update! cells (car k) (λ (ks) (cons k ks)) '()))
+    cells)
+  ;; does the access k1 race with one of the accesses in cells?
+  (define (races? k1 cells)
     (define (inside? a b) (and (<= (length a) (length b)) (equal? a (take b (length a)))))
     (define (apart? h1 h2)
       (for/or ([g1 h1])
         (for/or ([g2 h2]) (and (eq? (car g1) (car g2)) (or (eq? (cdr g1) 'mut) (eq? (cdr g2) 'mut))))))
-    (for/or ([k1 (in-hash-keys l1)])
-      (match-define (list a p1 w1 h1) k1)
-      (for/or ([k2 (hash-ref by-cell a '())])
-        (match-define (list _ p2 w2 h2) k2)
-        (and (or w1 w2) (or (inside? p1 p2) (inside? p2 p1)) (not (apart? h1 h2))))))
+    (match-define (list a p1 w1 h1) k1)
+    (for/or ([k2 (hash-ref cells a '())])
+      (match-define (list _ p2 w2 h2) k2)
+      (and (or w1 w2) (or (inside? p1 p2) (inside? p2 p1)) (not (apart? h1 h2)))))
+  (define (race? l1 l2)
+    (define cells (by-cell l2))
+    (for/or ([k1 (in-hash-keys l1)]) (races? k1 cells)))
 
   (define (ev e env)
     (set! steps (add1 steps))
@@ -282,6 +301,23 @@
            (match-define (list a path w h) k)
            (hash-set! log (list a path w (append h held)) #t)))
        'unit]
+      [`(spawn (call ,f ,_ ,args ...))
+       (define vs (ev-list args env))
+       (define outer-log log)
+       (define outer-held held)
+       (set! log (make-hash))
+       (set! held '())
+       (define v (with-handlers ([brk? (λ (_) (raise (stuck "a break with no loop around it")))])
+                   (invoke (find 'defn f) vs)))
+       (define mine log)
+       (set! log outer-log)
+       (set! held outer-held)
+       ;; what the thread did is also done by whatever this is part of
+       (when log (for ([k (in-hash-keys mine)]) (hash-set! log k #t)))
+       (set! next (add1 next))
+       (hash-set! tasks next (cons (by-cell mine) v))
+       `(task ,next)]
+      [`(join ,e1) (match (ev e1 env) [`(task ,id) (finish! id)])]
       [`(with ,w ,g ,x ,body)
        (define st (hash-ref lent g))
        (when (check-globals?)

@@ -31,6 +31,7 @@
     [`(ptr ,σ) (format "(ptr ~a)" (coil-type σ))]
     [`(pool ,σ) (format "(Pool ~a)" (coil-type σ))]
     [`(handle ,σ) (format "(Handle ~a)" (coil-type σ))]
+    [`(task ,σ) (format "(Task ~a)" (coil-type σ))]
     [`(ref ,σ) (format "(ref ~a)" (coil-type σ))]
     [`(mut ,σ) (format "(mut ~a)" (coil-type σ))]
     [`(view ,_) (bail "a view")]
@@ -107,6 +108,12 @@
         (unless (= (length Ts) (length σs)) (bail "an ill-typed program"))
         (subst τr Ts σs)])]
     [`(par ,_ ,_) 'unit]
+    [`(spawn (call ,f ,σs ,_ ...))
+     (match (decl Σ 'defn f)
+       [`(defn ,_ ,Ts ,_ ,τr ,_)
+        (unless (= (length Ts) (length σs)) (bail "an ill-typed program"))
+        `(task ,(subst τr Ts σs))])]
+    [`(join ,e1) (match (type-of Σ Γ e1) [`(task ,σ) σ] [_ (bail "an ill-typed program")])]
     [`(with ,w ,g ,x ,e1)
      (match (decl Σ 'global g)
        [`(global ,_ ,σ ,_) (type-of Σ (cons (cons x `(,w ,σ)) Γ) e1)])]
@@ -174,8 +181,15 @@
 
 ;; e, evaluated for what it does. Naming a place there reads it, and moves an
 ;; owner out of it, which a bare name as a Coil statement does not.
+;; does e's value come from naming a place, at the end of a seq or a let?
+(define (ends-in-place? e)
+  (match e
+    [(? place?) #t]
+    [`(seq ,_ ,e2) (ends-in-place? e2)]
+    [`(let ,_ ,e2) (ends-in-place? e2)]
+    [_ #f]))
 (define (discarded Σ Γ e)
-  (if (and (place? e) (not (ref? (type-of Σ Γ e))))
+  (if (and (ends-in-place? e) (not (ref? (type-of Σ Γ e))))
       (format "(move ~a)" (value Σ Γ e))
       (value Σ Γ e)))
 
@@ -292,6 +306,9 @@
                                  [else (plain Σ Γ e1)])))))])]
     ;; `par` reads how each argument is passed from how it is written
     [`(par ,c1 ,c2) (format "(par ~a ~a)" (par-call Σ Γ c1) (par-call Σ Γ c2))]
+    ;; a thread's call is written as any call is; Coil refuses a reference argument
+    [`(spawn ,c) (format "(spawn ~a)" (par-call Σ Γ c))]
+    [`(join ,e1) (format "(Task::join ~a)" (plain Σ Γ e1))]
     [`(with ,w ,g ,x ,e1)
      (match (decl Σ 'global g)
        [`(global ,_ ,σ ,_)
@@ -388,8 +405,9 @@
              "(import \"safe.core\" :use [unsafe replace! borrow borrow-mut move])\n"
              "(import \"safe.box\" :use [Box])\n"
              "(import \"safe.pool\" :use [Pool Handle])\n"
-             "(import \"safe.global\" :use [defglobal with-ref with-mut Global Cell])\n"
+             "(import \"safe.global\" :use [defglobal with-ref with-mut Global])\n"
              "(import \"safe.par\" :use [par])\n"
+             "(import \"safe.thread\" :use [spawn Task])\n"
              (string-append*
               (for/list ([d ds] #:unless (and (eq? (car d) 'defn) (memq (cadr d) (unwritten))))
                 (define text (declaration ds d))

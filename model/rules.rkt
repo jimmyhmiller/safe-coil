@@ -47,6 +47,7 @@
     (view-field-escape "a reference to a view's own field may outlive the view")
     (global-escape "a reference to a global may leave its `with`")
     (par-split "the two calls of a par are checked apart")
+    (spawn-ref "a thread is given a reference")
     (raw-anywhere "a raw pointer is read outside unsafe")))
 (define (mutant? m) (eq? (mutant) m))
 
@@ -58,7 +59,7 @@
             (global g σ e)
             (defn f (T ...) ((x τ) ...) τ e))
   ;; storable types; what a view's field can be; all types
-  (σ ::= int unit (box σ) (ptr σ) (pool σ) (handle σ) (S σ ...) T)
+  (σ ::= int unit (box σ) (ptr σ) (pool σ) (handle σ) (task σ) (S σ ...) T)
   (ρ ::= σ (ref σ) (mut σ))
   (τ ::= ρ (view V))
   (e ::= n unit p
@@ -70,6 +71,7 @@
          (pool-new σ) (insert p e) (remove p x)
          (call f (σ ...) e ...)
          (par (call f (σ ...) e ...) (call f (σ ...) e ...))
+         (spawn (call f (σ ...) e ...)) (join e)
          (with w g x e)
          (unsafe e) (addr p) (load e) (store e e) (alloc e) (free e))
   ;; a variable, what a box or reference points at, a field, a pool element
@@ -142,7 +144,7 @@
   (match τ
     [(or 'int 'unit) #t]
     [(? symbol? t) (and (memq t (tparams Σ)) #t)]
-    [`(,(or 'box 'ptr 'pool 'handle 'ref 'mut) ,σ) (wf? Σ σ)]
+    [`(,(or 'box 'ptr 'pool 'handle 'task 'ref 'mut) ,σ) (wf? Σ σ)]
     [`(view ,V) (and (find-decl Σ 'view V) #t)]
     [(cons (? symbol? S) args)
      (let ([d (or (find-decl Σ 'struct S) (find-decl Σ 'sum S))])
@@ -164,7 +166,7 @@
     [(or 'int 'unit) #t]
     [(? symbol?) (mutant? 'copy-typevar)]
     [`(,(or 'ptr 'handle) ,_) #t]
-    [`(,(or 'box 'pool) ,_) #f]
+    [`(,(or 'box 'pool 'task) ,_) #f]
     [_ (let ([parts (or (fields-of Σ σ) (variants-of Σ σ))])
          (and parts
               (not (member σ seen))
@@ -531,6 +533,23 @@
    -------------------------------------------- "par"
    (chk Σ Γ Λ (par (call f_1 (σ_1 ...) e_1 ...) (call f_2 (σ_2 ...) e_2 ...)) unit () Γ_2)]
 
+  ;; a call on a thread of its own, which runs on after this one goes on. It
+  ;; owns what it is given: no argument is a reference or a view. The task is
+  ;; an owner; joining it gives what the call returned.
+  [(where (defn f (T ...) ((x_p τ_p) ...) σ_r any_b) ,(find-decl (term Σ) 'defn (term f)))
+   (side-condition ,(and (= (length (term (T ...))) (length (term (σ ...))))
+                         (andmap (λ (t) (wf? (term Σ) t)) (term (σ ...)))))
+   (where (τ_a ...) ,(for/list ([t (term (τ_p ...))]) (subst t (term (T ...)) (term (σ ...)))))
+   (side-condition ,(or (mutant? 'spawn-ref) (not (ormap second-class? (term (τ_a ...))))))
+   (where σ_ra ,(subst (term σ_r) (term (T ...)) (term (σ ...))))
+   (chk-args Σ Γ Λ (e ...) (τ_a ...) L Γ_1)
+   -------------------------------------------- "spawn"
+   (chk Σ Γ Λ (spawn (call f (σ ...) e ...)) (task σ_ra) () Γ_1)]
+
+  [(chk Σ Γ Λ e (task σ) () Γ_1)
+   -------------------------------------------- "join"
+   (chk Σ Γ Λ (join e) σ () Γ_1)]
+
   ;; ---- globals: lent for a scope, with exclusivity checked when it is entered
 
   [(where (global g σ any_i) ,(find-decl (term Σ) 'global (term g)))
@@ -655,7 +674,7 @@
 (define (constant? e)
   (not (let loop ([t e])
          (and (pair? t)
-              (or (memq (car t) '(call par with unsafe while load store alloc free))
+              (or (memq (car t) '(call par spawn join with unsafe while load store alloc free))
                   (ormap loop t))))))
 
 (define (check-decl decls d)

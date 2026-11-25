@@ -1,0 +1,8 @@
+(module case.bad-guard-stored)
+(import "safe.sync" :use [Mutex Guard])
+(import "safe.vec" :use [Vec])
+(defn main [] (-> i64)
+  (let [m (Mutex::new 1)
+        (mut held) (Vec::new [(Guard i64)])]
+    (Vec::push! (mut held) (Mutex::lock m))
+    0))

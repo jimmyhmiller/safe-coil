@@ -1,5 +1,6 @@
 ;;; An owner of one value on the heap.
 (module safe.box)
+(export Box)
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc)
 (import "safe.core" :use [unsafe lend lend-mut])

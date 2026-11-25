@@ -1,0 +1,8 @@
+(module case.bad-guard-sent-to-thread)
+(import "safe.sync" :use [Mutex Guard])
+(import "safe.thread" :use [spawn Task])
+(defn work [(g (Guard i64))] (-> i64) 0)
+(defn main [] (-> i64)
+  (let [m (Mutex::new 1)
+        t (spawn (work (Mutex::lock m)))]
+    (Task::join t)))

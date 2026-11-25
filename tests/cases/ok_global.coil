@@ -1,5 +1,5 @@
 (module case.ok-global)
-(import "safe.global" :use [defglobal with-ref with-mut Global Cell])
+(import "safe.global" :use [defglobal with-ref with-mut Global])
 (import "safe.box" :use [Box])
 (import "coil.primitive" :as primitive)
 (defstruct Pt [(x i64) (y i64)])

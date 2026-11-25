@@ -1,0 +1,7 @@
+(module case.no-arc-write)
+(import "safe.sync" :use [Arc])
+(import "safe.vec" :use [Vec])
+(defn main [] (-> i64)
+  (let [shared (Arc::new (Vec::new [i64]))]
+    (Vec::push! (mut (Arc::get shared)) 1)
+    0))

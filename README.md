@@ -45,9 +45,20 @@ adds the rest of the model:
   reference to a temporary.
 - **Results.** A reference a call returns borrows from every argument the call
   took by reference.
+- **Temporaries.** Coil drops a temporary that owns something as soon as the
+  call it was passed to returns. So a call's result may not borrow from one:
+  `(Box::get (Box::new 1))` is refused, and so is reading through a lock taken
+  and given up in one expression. Bind the temporary to a name first. A
+  temporary of plain data lives as long as the function's frame.
 - **Match.** A `match` on a name lends the parts of the payload that own something
   to the arm, where they lie. The matched place stays lent to those names, so the
   variant cannot be replaced under them. `(match (move x) …)` consumes x instead.
+- **Views.** A struct marked `(impl View TYPE)` stands for the references it was
+  made from, as a held lock or a slice of a list does. A call that returns one
+  keeps what it took by reference lent for as long as the view lives. A view is
+  a local, an argument or a result: it is not stored in a struct, a variant or
+  a place, and not passed for a type parameter, so it reaches no container and
+  no other thread.
 - **Raw fields.** A struct or variant with a field that is itself raw memory is
   built only inside `unsafe`, and such a field is changed only there. So a type
   like `Box` holds the pointer its own code put in it, never one safe code made up.
@@ -74,12 +85,19 @@ operations are allowed.
 | `safe.box` | `(Box T)`, an owner of one heap value: `Box::new`, `get`, `get-mut`, `into` |
 | `safe.pool` | `(Pool T)`, a collection that owns its elements, and `(Handle T)`, plain data checked when it is used: `insert!`, `remove!`, `at`, `at-mut` |
 | `safe.global` | `defglobal`, `with-ref`, `with-mut`: a global lent for a scope, with exclusivity checked when the scope is entered |
-| `safe.vec` | `(Vec T)`, a growable list that owns its elements: `push!`, `pop!`, `len`, `at`, `at-mut`. An index out of range stops the program |
+| `safe.vec` | `(Vec T)`, a growable list that owns its elements: `push!`, `pop!`, `len`, `at`, `at-mut`. `(Vec::slice v from to)` is a `(Slice T)`, part of the list lent shared: `len`, `at`, `part`. An index out of range stops the program |
 | `safe.str` | `Str`, text that owns its bytes: `Str::from "…"`, `len`, `byte`, `push!`, `push-text!`, `push-int!`, `append!`, `eq?`, `copy`. It prints with `{}` |
+| `safe.map` | `(Map K V)`, a hash table that owns its keys and values; K needs `Hash` and `Eq`: `insert!`, `remove!`, `has?`, `at`, `at-mut`, `len`, and `first`/`next`/`key-at`/`value-at` to walk it |
 | `safe.par` | `(par (f a…) (g b…))`: two calls at once, on two threads |
+| `safe.thread` | `(spawn (f a…))` starts a thread and gives a `(Task R)`: `Task::join`, `Task::detach` |
+| `safe.sync` | `(Arc T)`, an owner with many holders; `(Mutex T)` and `with-lock`; `(Channel T)`, a queue between threads: `send!`, `recv`, `close!`, `clone` |
 
-A stale handle, an index out of range and a global entered while it is already
-lent stop the program with a message. They are the checks made at run time.
+A stale handle, an index out of range, a key a `Map` does not hold, a lock asked
+for by the thread that holds it and a global entered while it is already lent
+stop the program with a message. They are the checks made at run time.
+
+Each module exports only what safe code may call. The functions it uses inside
+(the ones that trust their arguments) cannot be named from outside it.
 
 `examples/calc.coil` is Coil's calculator example (a lexer, a recursive-descent
 parser into a boxed tree, an evaluator) in safe Coil, with no `unsafe` in it.
@@ -95,10 +113,51 @@ sees their loans together, as the arguments of one call: nothing lent
 exclusively to one call can reach the other. A global's borrow count is atomic.
 The first call takes at most eight arguments.
 
+### Threads
+
+```coil
+(defn add-many [(total (Arc (Mutex i64))) (times i64)] (-> i64)
+  (for i (range 0 times)
+    (with-lock (Arc::get total) n
+      (set! n (+ n 1))))
+  0)
+
+(let [total (Arc::new (Mutex::new 0))
+      a (spawn (add-many (Arc::clone total) 20000))
+      b (spawn (add-many (Arc::clone total) 20000))]
+  (Task::join a)
+  (Task::join b)
+  (with-lock (Arc::get total) n (println "{}" n)))      ; 40000
+```
+
+`(spawn (f a b))` runs `(f a b)` on a new thread. The thread owns what it is
+given: `f` takes every argument by value, so each is moved or copied to the
+thread and no reference crosses. Coil itself refuses a reference where a value
+is asked for, and the checker refuses a view. `f` returns a value (0 if it has
+nothing to say), which `Task::join` waits for and hands back. A task that is
+dropped waits for its thread; `Task::detach` lets the thread run on.
+
+What threads share is one of three things, and each keeps the rule that a
+place is changed only by whoever has it exclusively:
+
+- an `(Arc T)` lends its value shared only, to every holder;
+- a `(Mutex T)` gives one thread at a time an exclusive reference, for the body
+  of `with-lock`. The held lock is a view: the mutex stays lent to it, and the
+  reference cannot leave the body;
+- a `(Channel T)` moves a value from the sender to the receiver;
+- a global, as before, is lent for a scope and checked when entered.
+
+So every type is safe to send and safe to share, with no marker traits. This
+holds because safe code has no way to change memory through a shared
+reference. Code inside `unsafe` that does so must do it atomically or under a
+lock, as `safe.sync` and `safe.global` do.
+
+`examples/wordcount.coil` counts words on four threads into one shared `Map`.
+
 ## Testing
 
 ```sh
-python3 tests/run.py            # hand-written Coil cases: ok_* must pass, bad_* must be refused
+python3 tests/run.py            # hand-written Coil cases: ok_* must pass, bad_* must be refused by the checker, no_* by the compiler
 python3 tests/diff.py 4000 7    # the checker against the model, on N random programs from a seed
 python3 tests/teeth.py          # each checker rule weakened in turn: diff.py must notice
 ```
@@ -113,11 +172,12 @@ run fails if the checker accepts anything the model refuses.
 checker at a time and requires `diff.py` to find a program the weakened checker
 wrongly accepts.
 
-On the model's 99 cases and 4000 random programs (seed 7), 3357 can be written
-as Coil. The compiler refuses 1025 of them itself. On the other 2332 the checker
-and the model agree on every one: 1748 accepted, 581 refused, and 3 that are the
-exclusive-reference case below. All nine weakenings are caught, eight of them by
-a hand-written case.
+On the model's 108 cases and 4000 random programs (seed 7), 3359 can be written
+as Coil. The compiler refuses 1155 of them itself. On the other 2204 the checker
+accepts nothing the model refuses: 1618 accepted by both, 584 refused by both,
+one refused only by the checker (below), and one that is the exclusive-reference
+case below. All fifteen weakenings are caught, by a hand-written case or by the
+differential run.
 
 ### Where Coil and the model differ
 
@@ -131,6 +191,11 @@ Found by the differential run:
 - **The compiler's move rule is stricter.** An `if` or `match` whose branches do
   not move the same owners is refused by the compiler; the model treats the owner
   as moved afterwards.
+- **Taking an address reads.** The model's `addr` of a place inside a box does
+  not read the box. Its Coil form goes through `Box::get`, which does, so the
+  checker refuses it while the box is lent exclusively.
+- **A discarded name is not a move.** The model moves an owner that is named and
+  thrown away; Coil leaves it alone. The translation writes `(move x)`.
 - **Plain data passed by value counts as lent for the call.** The model copies
   it. Coil passes a pointer to the caller's storage.
 
@@ -153,6 +218,7 @@ A small language with everything the rules are about:
 | `while`, `break` | loops |
 | `(with ref g x …)`, `(with mut g x …)` | a global, lent for a scope, with exclusivity checked on entry |
 | `(par (call …) (call …))` | two calls running at once |
+| `(spawn (call …))`, `(join e)`, `(task σ)` | a call on a thread that runs on; the task is an owner, and no argument is a reference |
 | `(unsafe …)`, `(ptr σ)`, `addr`, `load`, `store`, `alloc`, `free` | raw memory: a raw pointer is plain data anywhere and is followed only inside `unsafe` |
 
 | File | What it is |
@@ -199,11 +265,17 @@ These are sound and simple. The model should be relaxed first, then the checker.
 
 ## What is left out
 
-- Slices and arrays as safe types. They are raw memory to the checker, so the
-  library's `ArrayList` and `HashMap` need `unsafe`; `Vec` and `Str` are the
-  safe ones. There is no borrowed view of part of a `Vec` or `Str`: the model's
-  view has no Coil form, because Coil refuses a reference in a struct.
-- Detached threads. `par` is two calls that both finish before anything else runs.
+- Coil's own slices and arrays as safe types. They are raw memory to the
+  checker, so the library's `ArrayList` and `HashMap` need `unsafe`; `Vec`,
+  `Slice`, `Map` and `Str` are the safe ones. There is no exclusive slice and
+  no slice of a `Str` yet.
+- Views in the differential test. The model's view is a struct of references,
+  which Coil refuses; the checker's view is a marked struct of raw pointers.
+  `diff.py` still skips the model's view programs, so the checker's view rule
+  is tested by hand-written cases and by `teeth.py` only.
+- A `for` over a `Vec` or a `Map`. Walk one by index or by cursor.
+- Read-write locks, condition variables, thread-local values, a `spawn` of a
+  function that returns nothing, and more than eight arguments to a thread.
 - `return` from the middle of a function, trait objects and
   function pointers: outside the model, and refused or `unsafe`-only in the checker.
 - What is inside `unsafe`: the rules say which operations need it and that the

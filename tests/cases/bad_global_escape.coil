@@ -1,5 +1,5 @@
 (module case.bad-global-escape)
-(import "safe.global" :use [defglobal with-ref with-mut Global Cell])
+(import "safe.global" :use [defglobal with-ref with-mut Global])
 (defstruct Pt [(x i64) (y i64)])
 (defglobal origin Pt (Pt :x 1 :y 2))
 (defn idr [(a (ref Pt))] (-> (ref Pt)) a)

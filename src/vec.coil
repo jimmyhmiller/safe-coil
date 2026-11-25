@@ -1,8 +1,9 @@
 ;;; A growable list that owns its elements.
 (module safe.vec)
+(export Vec Slice)
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc)
-(import "safe.core" :use [unsafe lend lend-mut])
+(import "safe.core" :use [unsafe lend lend-mut View])
 
 ;;; A list of T. It owns its elements: they are freed with it. An index out of
 ;;; range stops the program.
@@ -13,6 +14,13 @@
     (match (alloc/alloc [T] (alloc/malloc-allocator) count)
       (Some [memory] memory)
       (None [] (panic "safe: out of memory")))))
+
+;;; Part of a list, lent shared: `count` elements from `items`. It is a view: the
+;;; list stays lent for as long as the slice lives, so it cannot grow or be
+;;; freed under it.
+(defstruct Slice [T] [(items (ptr T)) (count i64)])
+
+(impl [T] View (Slice T))
 
 ;;; Where element I of V is. An index out of range stops the program.
 (defn slot [T] [(v (ref (Vec T))) (i i64)] (-> (ptr T))
@@ -58,7 +66,34 @@
 
   ;;; Element I, lent to be changed for as long as the list is.
   (at-mut [(v (mut (Vec T))) (i i64)] (-> (mut T))
-    (unsafe (lend-mut (slot v i)))))
+    (unsafe (lend-mut (slot v i))))
+
+  ;;; The elements from FROM up to TO, lent shared. A range that is not inside
+  ;;; the list stops the program.
+  (slice [(v (ref (Vec T))) (from i64) (to i64)] (-> (Slice T))
+    (unsafe
+      (when (or (< from 0) (> to (.count v)) (> from to))
+        (panic "safe: the range {} to {} is not inside a Vec of {}" from to (.count v)))
+      (Slice :items (primitive/index (data (.items v)) from) :count (- to from)))))
+
+(impl [T] (Slice T)
+  ;;; How many elements it covers.
+  (len [(s (ref (Slice T)))] (-> i64)
+    (.count s))
+
+  ;;; Element I of the slice. An index out of range stops the program.
+  (at [(s (ref (Slice T))) (i i64)] (-> (ref T))
+    (unsafe
+      (when (or (< i 0) (>= i (.count s)))
+        (panic "safe: index {} is out of range for a Slice of {}" i (.count s)))
+      (lend [T] (primitive/index (.items s) i))))
+
+  ;;; The elements of the slice from FROM up to TO.
+  (part [(s (ref (Slice T))) (from i64) (to i64)] (-> (Slice T))
+    (unsafe
+      (when (or (< from 0) (> to (.count s)) (> from to))
+        (panic "safe: the range {} to {} is not inside a Slice of {}" from to (.count s)))
+      (Slice :items (primitive/index (.items s) from) :count (- to from)))))
 
 (impl [T] Drop (Vec T)
   (drop [(self (mut (Vec T)))] (-> void)

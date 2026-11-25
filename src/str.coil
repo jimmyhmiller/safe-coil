@@ -1,5 +1,6 @@
 ;;; Text that owns its bytes.
 (module safe.str)
+(export Str)
 (import "coil.primitive" :as primitive)
 (import "coil.fmt" :use [Display Formatter display-fmt])
 (import "safe.core" :use [unsafe])
@@ -66,6 +67,19 @@
     (let [(mut out) (Str::new)]
       (Str::append! (mut out) s)
       out)))
+
+;;; Strings are equal when their bytes are.
+(impl Eq Str
+  (= [(a (ref Str)) (b (ref Str))] (-> bool)
+    (Str::eq? a b)))
+
+;;; FNV-1a over the bytes.
+(impl Hash Str
+  (hash [(s (ref Str))] (-> i64)
+    (let [(mut h) -3750763034362895579]
+      (for i (range 0 (Str::len s))
+        (set! h (primitive/imul (primitive/ixor h (primitive/cast i64 (Str::byte s i))) 1099511628211)))
+      h)))
 
 (impl Display Str
   (display-fmt [(s (ref Str)) (f (ptr Formatter))] (-> i64)

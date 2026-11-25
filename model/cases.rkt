@@ -362,6 +362,37 @@
               (defn get () ((r (ref int))) int (* r)))
             '(let ([a (box 1)]) (seq (par (call get () (ref (* a))) (call eat () a)) 0))))
 
+    ;; ================================================== threads
+    (accept "a thread is given an owner, and joined for its result"
+     ,(prog '((defn eat () ((b (box int))) int (+ (* b) 1)))
+            '(let ([t (spawn (call eat () (box 1)))]) (+ (join t) 1))))
+    (accept "a task that is dropped waits for its thread"
+     ,(prog '((defn eat () ((b (box int))) int (* b)))
+            '(seq (spawn (call eat () (box 1))) 0)))
+    (accept "a thread returns an owner it made"
+     ,(prog '((defn make () ((n int)) (box int) (box (+ n 1))))
+            '(let ([t (spawn (call make () 1))]) (let ([b (join t)]) (* b)))))
+    (accept "a thread and its parent each enter a global"
+     ,(prog '((defn bump () () unit (with mut g1 x (set! (* (* x)) (+ (* (* x)) 1)))))
+            '(let ([t (spawn (call bump ()))])
+               (seq (with mut g1 x (set! (* (* x)) 5)) (seq (join t) 0)))))
+    (accept "a task is an owner: it can be handed on and joined elsewhere"
+     ,(prog '((defn eat () ((b (box int))) int (* b))
+              (defn wait () ((t (task int))) int (join t)))
+            '(call wait () (spawn (call eat () (box 3))))))
+    (reject "a thread is given a reference"
+     ,(prog '((defn get () ((r (ref int))) int (* r)))
+            '(let ([a 0]) (let ([t (spawn (call get () (ref a)))]) (seq (set! a 1) (join t))))))
+    (reject "a thread is given an exclusive reference"
+     ,(prog '((defn bump () ((r (mut int))) unit (set! (* r) (+ (* r) 1))))
+            '(let ([a 0]) (seq (spawn (call bump () (mut a))) a))))
+    (reject "a thread is given a view"
+     ,(prog '((defn peek () ((v (view Peek))) int (* (: v s))))
+            '(let ([a 0]) (seq (spawn (call peek () (new (view Peek) (ref a) 1))) a))))
+    (reject "a task is joined twice"
+     ,(prog '((defn eat () ((b (box int))) int (* b)))
+            '(let ([t (spawn (call eat () (box 1)))]) (+ (join t) (join t)))))
+
     ;; ================================================== raw memory
     (accept "a raw pointer is plain data in safe code"
      ,(prog '() '(let ([a 1]) (let ([q (addr a)]) (let ([b (box q)]) a)))))

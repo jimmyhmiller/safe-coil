@@ -1,0 +1,23 @@
+(module case.ok-view)
+(import "coil.primitive" :as primitive)
+(import "safe.core" :use [unsafe lend lend-mut View])
+(defstruct Pt [(x i64) (y i64)])
+(defstruct Window [(at (ptr Pt))])
+(impl View Window)
+(defn window [(p (mut Pt))] (-> Window)
+  (unsafe (Window :at (primitive/cast (ptr Pt) (mut p)))))
+(defn x-of [(w (mut Window))] (-> (mut i64))
+  (unsafe (lend-mut (field (.at w) x))))
+(defn through [(w Window)] (-> (ref i64))
+  (unsafe (lend (field (.at w) y))))
+(defn pass [(w Window)] (-> Window) w)
+(defn main [] (-> i64)
+  (let [(mut p) (Pt :x 1 :y 2)]
+    (let [(mut w) (window (mut p))
+          x (x-of (mut w))]
+      (set! x 5))
+    (let [w (pass (window (mut p)))
+          y (through w)]
+      (println "{}" y))
+    (println "{}" (.x p))
+    0))

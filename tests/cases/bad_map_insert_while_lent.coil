@@ -1,0 +1,9 @@
+(module case.bad-map-insert-while-lent)
+(import "coil.primitive" :as primitive)
+(import "safe.map" :use [Map])
+(defn main [] (-> i64)
+  (let [(mut m) (Map::new [i64 i64])]
+    (Map::insert! (mut m) 1 10)
+    (let [one (Map::at m 1)]
+      (Map::insert! (mut m) 2 20)
+      (primitive/load one))))

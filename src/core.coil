@@ -32,3 +32,11 @@
 ;;; VALUE, as a temporary. `(match (move x) …)` consumes x, so each arm owns what
 ;;; it binds; a match on a name lends an owned payload to its arm instead.
 (defn move [T] [(value T)] (-> T) value)
+
+;;; A view: a struct that stands for the references it was made from, as a slice
+;;; of a list or a held lock does. `(impl View TYPE)` marks one. The checker then
+;;; treats a TYPE as it treats a reference: a call that returns one keeps what it
+;;; took by reference lent for as long as the view lives, and a view is a local,
+;;; an argument or a result, never stored. What a view holds inside is raw
+;;; memory its own module follows.
+(deftrait View [Self])

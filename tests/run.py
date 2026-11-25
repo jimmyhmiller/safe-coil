@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Run the checker over tests/cases. A file `ok_*.coil` must pass. A file `bad_*.coil`
-must compile without the checker and be refused by it, with a `safe:` error."""
+must compile without the checker and be refused by it, with a `safe:` error. A file
+`no_*.coil` is one the compiler itself must refuse: a rule safe Coil leaves to it."""
 import subprocess, sys, os, glob
 here = os.path.dirname(os.path.abspath(__file__))
 root = os.path.dirname(here)
@@ -14,7 +15,9 @@ for path in names:
     name = os.path.basename(path)
     plain, plain_out = check(path, False)
     code, out = check(path, True)
-    if plain != 0:
+    if name.startswith("no_"):
+        verdict = "ok" if plain != 0 else "COMPILES"
+    elif plain != 0:
         verdict = "DOES NOT COMPILE"
     elif name.startswith("ok_"):
         verdict = "ok" if code == 0 else "REFUSED"

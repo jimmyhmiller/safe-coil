@@ -135,6 +135,23 @@
 
 (defn temporary-loan [] (-> Code) `(((tmp) shr)))
 
+;;; A loan on a temporary that owns something. Coil drops such a temporary as
+;;; soon as the call it was passed to returns, so nothing may keep a reference
+;;; into it.
+(defn dropped-loan [] (-> Code) `(((dropped) shr)))
+
+(defn into-dropped? [(loans Code)] (-> bool)
+  (block :found
+    (for l (iter loans)
+      (when (head-is? (place-root (get l 0)) `dropped) (return-from :found true)))
+    false))
+
+;;; LOANS are about to be kept: by a name, by a call's result, by a match arm.
+(defn refuse-dropped! [(node Code) (loans Code)] (-> i64)
+  (if (into-dropped? loans)
+      (fail! node "safe: this keeps a reference into a temporary that is dropped first; bind the temporary to a name")
+      0))
+
 ;;; The value of an expression that is one of two. When only one is a fresh
 ;;; value, the whole may refer to it: a temporary of this frame.
 (defn join [(a Res) (b Res)] (-> Res)
@@ -176,6 +193,19 @@
   (match (primitive/code-type-traits t)
     (primitive/TraitsAre [names] (name-in? `coil.core.Drop names))
     (primitive/TraitsUnknown [] true)))
+
+;;; Is T a view: a struct its module marked with the trait `safe.core.View`? A
+;;; view stands for the references it was made from. It is a local, an argument
+;;; or a result, and is never stored.
+(defn view-type? [(t Code)] (-> bool)
+  (and (or (primitive/code-list? t) (and (primitive/code-sym? t) (not (scalar-name? t))))
+       (not (ref-type? t))
+       (not (raw-type? t))
+       (not (head-is? t `array))
+       (not (primitive/code-eq t `unknown-type))
+       (match (primitive/code-type-traits t)
+         (primitive/TraitsAre [names] (name-in? `safe.core.View names))
+         (primitive/TraitsUnknown [] false))))
 
 ;;; Does every part of T satisfy PART? T is a struct or a sum; anything else is
 ;;; not known to.
@@ -517,7 +547,12 @@
         (do (if (owner-type? cx content)
                 (check-write! cx node q "moved")
                 (check-read! cx node q))
-            (fresh)))
+            (if (view-type? content)
+                ; a view taken out of a local takes that local's loans with it;
+                ; one copied from anywhere else is tied to where it was
+                (Res :loans (if (head-is? q `loc) (loans-of cx (primitive/code-int (get q 1))) (shared-loan q))
+                     :fresh true)
+                (fresh))))
       (WShared []
         (do (check-read! cx node q)
             (carrying (shared-loan q))))
@@ -533,13 +568,15 @@
 
 ;;; A value that is no place is used by a consumer that wants WANT: a fresh
 ;;; aggregate taken by reference is a temporary of this frame.
-(defn use-value [(node Code) (r Res) (want Want)] (-> Res)
+(defn use-value [(cx (ref Cx)) (node Code) (r Res) (want Want)] (-> Res)
   (match want
     (WDiscard [] r)
-    (WValue [] (fresh))
+    ; a view keeps the loans of what it was made from
+    (WValue [] (if (view-type? (pointee (type-of node))) (Res :loans (.loans r) :fresh true) (fresh)))
     (WBind [_] r)
     (_ (if (and (.fresh r) (not (word-type? (pointee (type-of node)))))
-           (carrying (temporary-loan))
+           (carrying (union (if (owner-type? cx (pointee (type-of node))) (dropped-loan) (temporary-loan))
+                            (.loans r)))
            r))))
 
 (defn eval-seq [(cx (mut Cx)) (forms Code) (from i64) (want Want)] (-> Res)
@@ -571,6 +608,7 @@
             (do (guard-raw-flow! cx e init)
                 (let [r (eval (mut cx) init (WBind mutable))
                       serial (push-local! (mut cx) name (not (.fresh r)))]
+                  (refuse-dropped! init (.loans r))
                   (hold! (mut cx) serial (.loans r))))
             (fail! binder "safe: this binding form is not covered by the rules"))))
     (let [r (eval-seq (mut cx) e 2 want)]
@@ -625,6 +663,7 @@
                    :else (do (eval (mut cx) scrutinee (WValue)) (no-loans)))
         (mut out) (fresh)
         (mut first) true]
+    (refuse-dropped! scrutinee lent)
     (for [i 2 (len e)]
       (let [arm (get e i)
             locals (len (.locals cx))
@@ -747,6 +786,7 @@
 (defn eval-store [(cx (mut Cx)) (e Code)] (-> Res)
   (let [target (get e 1)]
     (guard-raw-flow! cx e (get e 2))
+    (refuse-stored-view! (get e 2))
     (eval (mut cx) (get e 2) (WValue))
     (if (through-raw? target (type-of (get e 2)))
         (do (need-unsafe! cx e "a store through a raw pointer")
@@ -847,6 +887,33 @@
          (let [b (bound-to result (type-of call) t)]
            (and (= (len b) 1) (primitive/code-eq (get b 0) pointer))))))
 
+;;; The last part of a type's name: `safe.sync.Guard` and `(Guard T)` are both `Guard`.
+(defn type-base [(t Code)] (-> Code)
+  (let [head (if (primitive/code-list? t) (get t 0) t)]
+    (if (primitive/code-sym? head)
+        (let [text (meta/source head)
+              (mut start) 0]
+          (for [i 0 (len text)]
+            (when (and (= (get text i) #\.) (< (+ i 1) (len text))) (set! start (+ i 1))))
+          (primitive/code-symbol (substr text start (len text))))
+        `unknown-type)))
+
+;;; A view is passed only where the callee asked for that view by name. A
+;;; parameter that is a type parameter could store it.
+(defn check-view-argument! [(arg Code) (param Code)] (-> i64)
+  (if (and (view-type? (pointee (type-of arg)))
+           (not (primitive/code-eq (type-base (pointee param)) (type-base (pointee (type-of arg))))))
+      (fail! arg "safe: a view is passed where it could be stored; it can only be a local, an argument that names its type, or a result")
+      0))
+
+;;; What a view passed as ARG, evaluated to R, lets the call's result borrow: the
+;;; loans the view itself holds when it is a local, taken by value.
+(defn view-argument-loans [(cx (mut Cx)) (arg Code) (param Code) (r Res)] (-> Code)
+  (let [q (place-of (mut cx) arg)]
+    (if (and (= (len q) 1) (head-is? (get q 0) `loc) (not (ref-type? param)))
+        (loans-of cx (primitive/code-int (get (get q 0) 1)))
+        (.loans r))))
+
 (defn eval-arg [(cx (mut Cx)) (arg Code) (param Code) (result Code) (call Code)] (-> Res)
   (let [t (type-of arg)
         content (pointee t)
@@ -903,9 +970,12 @@
           (when (type-arguments? arg) (set! before (+ before 1)))
           (unless (or (primitive/code-keyword? arg) (type-arguments? arg))
             (guard-raw-flow! cx e arg)
-            (let [r (eval-arg (mut cx) arg (if known (get params (- i 1 before)) `unknown)
-                              (callee-result kind name signature) e)
-                  carried (.loans (use-value arg r (WShared)))]
+            (let [param (if known (get params (- i 1 before)) `unknown)
+                  r (eval-arg (mut cx) arg param (callee-result kind name signature) e)
+                  carried (.loans (use-value cx arg r (WShared)))]
+              (check-view-argument! arg param)
+              (when (view-type? (pointee (type-of arg)))
+                (set! all (union all (view-argument-loans (mut cx) arg param r))))
               (hold! (mut cx) -1 carried)
               ; The result borrows from what was passed by reference. Plain data
               ; taken by value is the callee's own for the call: a checked callee
@@ -913,12 +983,16 @@
               (when (or (not known) (head-is? arg `mut) (ref-type? (get params (- i 1 before))))
                 (set! all (union all carried))))))))
     (drop-loans-to! (mut cx) loans)
+    (when (or (ref-type? (type-of e)) (view-type? (type-of e)))
+      (refuse-dropped! e all))
     ; a reference that is thrown away still may not outlive what it refers to
-    (if (ref-type? (type-of e))
-        (match want
-          (WValue [] (fresh))
-          (_ (carrying all)))
-        (fresh))))
+    (cond (ref-type? (type-of e))
+            (match want
+              (WValue [] (fresh))
+              (_ (carrying all)))
+          ; a view is a value of its own that keeps what it was made from lent
+          (view-type? (type-of e)) (Res :loans all :fresh true)
+          :else (fresh))))
 
 ;;; Is HEAD, the head of a form the compiler resolved to no declaration, one of
 ;;; the primitives NAMES? A function of the program with such a name has a
@@ -942,6 +1016,12 @@
       (when (head-is? (pointee (type-of (get e i))) `dyn) (return-from :any true)))
     false))
 
+;;; VALUE is about to be stored: in a struct, a variant, or a place assigned to.
+(defn refuse-stored-view! [(value Code)] (-> i64)
+  (if (view-type? (pointee (type-of value)))
+      (fail! value "safe: a view is stored; it can only be a local, an argument or a result")
+      0))
+
 ;;; A form headed by a name the compiler resolves to something.
 (defn eval-resolved [(cx (mut Cx)) (e Code) (want Want)] (-> Res)
   (match (primitive/code-decl e)
@@ -953,6 +1033,7 @@
               (for [i 1 (len e)]
                 (unless (primitive/code-keyword? (get e i))
                   (guard-raw-flow! cx e (get e i))
+                  (refuse-stored-view! (get e i))
                   (eval (mut cx) (get e i) (WValue))))
               (fresh)))
         (primitive/VariantDecl []
@@ -961,6 +1042,7 @@
               (for [i 1 (len e)]
                 (unless (primitive/code-keyword? (get e i))
                   (guard-raw-flow! cx e (get e i))
+                  (refuse-stored-view! (get e i))
                   (eval (mut cx) (get e i) (WValue))))
               (fresh)))
         (primitive/FunctionDecl [] (eval-call (mut cx) e want module kind name signature))
@@ -1044,7 +1126,7 @@
             (let [r (eval-list (mut cx) e want)]
               (set! (.unsafe cx) before)
               r))
-        :else (use-value e (eval-list (mut cx) e want) want)))
+        :else (use-value cx e (eval-list (mut cx) e want) want)))
 
 ;;; ---- functions -------------------------------------------------------------------
 
@@ -1096,7 +1178,7 @@
             (if (and (primitive/code-list? p) (= (len p) 2) (primitive/code-sym? (get p 0)))
                 (let [t (get p 1)
                       serial (push-local! (mut cx) (get p 0) (ref-type? t))]
-                  (when (ref-type? t)
+                  (when (or (ref-type? t) (view-type? t))
                     (hold! (mut cx) serial
                            (if (head-is? t `mut) `(((ext ~serial) mut)) `(((ext ~serial) shr))))))
                 (fail! p "safe: this parameter form is not covered by the rules")))
@@ -1107,7 +1189,8 @@
                 r (eval-seq (mut cx) form (+ arrow 1) want)
                 left (exit-scopes! (mut cx) form 0 0 (.loans r))]
             (for l (iter left)
-              (when (head-is? (place-root (loan-place l)) `tmp)
+              (when (or (head-is? (place-root (loan-place l)) `tmp)
+                        (head-is? (place-root (loan-place l)) `dropped))
                 (fail! form "safe: this returns a reference to a temporary")))
             0)))))
 

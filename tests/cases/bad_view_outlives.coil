@@ -1,0 +1,12 @@
+(module case.bad-view-outlives)
+(import "coil.primitive" :as primitive)
+(import "safe.core" :use [unsafe View])
+(defstruct Pt [(x i64) (y i64)])
+(defstruct Window [(at (ptr Pt))])
+(impl View Window)
+(defn window [(p (mut Pt))] (-> Window)
+  (unsafe (Window :at (primitive/cast (ptr Pt) (mut p)))))
+(defn escape [] (-> Window)
+  (let [(mut p) (Pt :x 1 :y 2)]
+    (window (mut p))))
+(defn main [] (-> i64) 0)

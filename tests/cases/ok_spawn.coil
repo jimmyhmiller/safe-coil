@@ -1,0 +1,23 @@
+(module case.ok-spawn)
+(import "coil.primitive" :as primitive)
+(import "safe.thread" :use [spawn Task])
+(import "safe.box" :use [Box])
+(import "safe.vec" :use [Vec])
+(defn sum-to [(n i64) (extra (Box i64))] (-> i64)
+  (let [(mut total) (Box::into extra)]
+    (for i (range 0 n) (set! total (+ total i)))
+    total))
+(defn squares [(n i64)] (-> (Vec i64))
+  (let [(mut v) (Vec::new [i64])]
+    (for i (range 0 n) (Vec::push! (mut v) (* i i)))
+    v))
+(defn idle [] (-> i64) 0)
+(defn main [] (-> i64)
+  (let [a (spawn (sum-to 1000 (Box::new 7)))
+        b (spawn (squares 10))
+        c (spawn (idle))
+        d (spawn (sum-to 10 (Box::new 0)))]
+    (Task::detach c)
+    (let [v (Task::join b)]
+      (println "{} {}" (Task::join a) (primitive/load (Vec::at v 9))))
+    0))

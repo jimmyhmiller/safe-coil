@@ -1,0 +1,9 @@
+(module case.bad-slice-push-while-lent)
+(import "coil.primitive" :as primitive)
+(import "safe.vec" :use [Vec Slice])
+(defn main [] (-> i64)
+  (let [(mut v) (Vec::new [i64])]
+    (Vec::push! (mut v) 1)
+    (let [all (Vec::slice v 0 1)]
+      (Vec::push! (mut v) 2)
+      (primitive/load (Slice::at all 0)))))

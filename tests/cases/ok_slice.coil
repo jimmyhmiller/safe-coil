@@ -1,0 +1,15 @@
+(module case.ok-slice)
+(import "coil.primitive" :as primitive)
+(import "safe.vec" :use [Vec Slice])
+(defn total [(s (ref (Slice i64)))] (-> i64)
+  (let [(mut sum) 0]
+    (for i (range 0 (Slice::len s)) (set! sum (+ sum (primitive/load (Slice::at s i)))))
+    sum))
+(defn main [] (-> i64)
+  (let [(mut v) (Vec::new [i64])]
+    (for i (range 0 10) (Vec::push! (mut v) i))
+    (let [middle (Vec::slice v 2 8)
+          inner (Slice::part middle 1 3)]
+      (println "{} {} {}" (Slice::len middle) (total middle) (total inner)))
+    (Vec::push! (mut v) 10)
+    (Vec::len v)))

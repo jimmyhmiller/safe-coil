@@ -224,6 +224,32 @@
     (cond [(null? ok) 'unit]
           [(zero? (random 2)) (aimed)]
           [else `(par ,(one) ,(one))]))
+  ;; a call on its own thread, something done while it runs, and sometimes a join
+  (define (gen-spawn)
+    (define ok (filter (λ (s) (storable? (cadddr s))) sigs))
+    (define y (fresh 'v))
+    (define (after) (if (zero? (random 2)) `(seq (join ,y) ,(sub τ)) (sub τ)))
+    ;; the thread given a borrow of a place this one then writes
+    (define (aimed)
+      (define (first-ref sig)
+        (match (caddr sig) [(cons `(,(or 'ref 'mut) ,σ) _) (and (null? (cadr sig)) σ)] [_ #f]))
+      (define takers (filter first-ref ok))
+      (define sig (and (pair? takers) (pick takers)))
+      (define σ (and sig (first-ref sig)))
+      (define targets (if σ (of-type σ) '()))
+      (cond [(pair? targets)
+             (define p (pick targets))
+             (match-define (list f _ (cons `(,k ,_) τs) _) sig)
+             `(let ([,y (spawn (call ,f () (,k ,p) ,@(for/list ([t τs]) (sub t 0))))])
+                (seq (set! ,p ,(sub σ 0)) ,(after)))]
+            [else #f]))
+    (define (plain)
+      (define sig (pick ok))
+      `(let ([,y (spawn ,(call-with sig (instantiate-any sig)))])
+         (seq ,(sub (gen-type)) ,(after))))
+    (cond [(null? ok) (sub τ)]
+          [(zero? (random 3)) (or (aimed) (plain))]
+          [else (plain)]))
   ;; a call made for what it does
   (define (call-for-effect)
     (if (null? sigs)
@@ -493,6 +519,7 @@
        [(19) (gen-pool)]
        [(20) (gen-take)]
        [(21) (if (in-loop) `(seq (break) ,(sub τ 0)) (leaf))]
+       [(22) (gen-spawn)]
        [else (leaf)])]))
 
 (define (gen-program)
@@ -545,7 +572,7 @@
 (define features
   '(("references" ref mut) ("calls" call) ("fields" :) ("match" match match-ref match-mut)
     ("views" view) ("pools" insert remove at) ("take/unbox" take unbox) ("loops" while)
-    ("break" break) ("globals" with) ("par" par) ("raw pointers" addr)))
+    ("break" break) ("globals" with) ("par" par) ("threads" spawn) ("raw pointers" addr)))
 
 ;; -> the first counterexample, or #f
 (define (search n seed #:quiet [quiet #f])

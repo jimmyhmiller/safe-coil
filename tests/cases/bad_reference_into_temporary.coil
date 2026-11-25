@@ -1,0 +1,5 @@
+(module case.bad-reference-into-temporary)
+(import "coil.primitive" :as primitive)
+(import "safe.box" :use [Box])
+(defn main [] (-> i64)
+  (primitive/load (Box::get (Box::new 5))))

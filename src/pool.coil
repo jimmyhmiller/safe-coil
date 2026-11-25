@@ -1,5 +1,6 @@
 ;;; A collection that owns its elements and hands out handles to them.
 (module safe.pool)
+(export Pool Handle)
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc)
 (import "safe.core" :use [unsafe lend lend-mut])

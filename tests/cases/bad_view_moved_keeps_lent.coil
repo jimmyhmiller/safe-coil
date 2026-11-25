@@ -1,0 +1,13 @@
+(module case.bad-view-moved-keeps-lent)
+(import "coil.primitive" :as primitive)
+(import "safe.core" :use [unsafe View])
+(defstruct Pt [(x i64) (y i64)])
+(defstruct Window [(at (ptr Pt))])
+(impl View Window)
+(defn window [(p (mut Pt))] (-> Window)
+  (unsafe (Window :at (primitive/cast (ptr Pt) (mut p)))))
+(defn main [] (-> i64)
+  (let [(mut p) (Pt :x 1 :y 2)
+        (mut outer) (let [(mut inner) (window (mut p))] inner)]
+    (set! (.x p) 9)
+    0))

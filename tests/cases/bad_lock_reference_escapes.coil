@@ -1,0 +1,8 @@
+(module case.bad-lock-reference-escapes)
+(import "safe.core" :use [borrow])
+(import "safe.sync" :use [Mutex with-lock])
+(defstruct Pt [(x i64) (y i64)])
+(defn main [] (-> i64)
+  (let [m (Mutex::new (Pt :x 1 :y 2))
+        kept (with-lock m p (borrow p))]
+    (.x kept)))
