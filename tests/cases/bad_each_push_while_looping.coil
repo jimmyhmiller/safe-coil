@@ -1,0 +1,10 @@
+(module case.bad-each-push-while-looping)
+(import "coil.primitive" :as primitive)
+(import "safe.core" :use [each])
+(import "safe.vec" :use [Vec])
+(defn main [] (-> i64)
+  (let [(mut v) (Vec::new [i64])]
+    (Vec::push! (mut v) 1)
+    (each [x v]
+      (Vec::push! (mut v) (primitive/load x)))
+    (Vec::len v)))

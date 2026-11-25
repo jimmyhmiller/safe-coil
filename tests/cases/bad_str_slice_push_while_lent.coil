@@ -1,0 +1,9 @@
+(module case.bad-str-slice-push-while-lent)
+(import "coil.primitive" :as primitive)
+(import "safe.str" :use [Str])
+(import "safe.vec" :use [Slice])
+(defn main [] (-> i64)
+  (let [(mut s) (Str::from "abc")
+        part (Str::slice s 0 2)]
+    (Str::push! (mut s) #\d)
+    (Slice::len part)))

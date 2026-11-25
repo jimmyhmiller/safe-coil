@@ -1,0 +1,17 @@
+(module case.bad-view-copied-exclusive)
+(import "coil.primitive" :as primitive)
+(import "safe.core" :use [unsafe lend-mut View])
+(defstruct Cursor [(at (ptr i64))])
+(impl View Cursor)
+(defn cursor [(n (mut i64))] (-> Cursor)
+  (unsafe (Cursor :at (primitive/cast (ptr i64) (mut n)))))
+(defn slot [(c (mut Cursor))] (-> (mut i64))
+  (unsafe (lend-mut [i64] (.at c))))
+(defn main [] (-> i64)
+  (let [(mut n) 1
+        (mut a) (cursor (mut n))
+        (mut b) a
+        x (slot (mut a))
+        y (slot (mut b))]
+    (set! x 2)
+    (primitive/load y)))

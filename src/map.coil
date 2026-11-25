@@ -1,6 +1,6 @@
 ;;; A table from keys to values that owns both.
 (module safe.map)
-(export Map)
+(export Map each-entry)
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc)
 (import "safe.core" :use [unsafe lend lend-mut])
@@ -179,3 +179,18 @@
               0))))
       (alloc/free (alloc/malloc-allocator) (.entries self))
       0)))
+
+;;; `(each-entry [KEY VALUE TABLE] BODY…)`: BODY once for every pair of TABLE, in
+;;; no particular order, with KEY and VALUE references to the pair's key and
+;;; value. TABLE names a place; it is lent for the whole of each turn, so BODY
+;;; cannot add to it or take from it.
+(defn each-entry [(binding Code) & (body Code)] (-> Code)
+  (unless (and (primitive/code-vector? binding) (= (len binding) 3))
+    (primitive/error "each-entry: expected (each-entry [key value table] body…)"))
+  (let [table (get binding 2)]
+    `(let [(mut cursor) (Map::first ~table)]
+       (while (>= cursor 0)
+         (let [~(get binding 0) (Map::key-at ~table cursor)
+               ~(get binding 1) (Map::value-at ~table cursor)]
+           ~@body)
+         (set! cursor (Map::next ~table cursor))))))

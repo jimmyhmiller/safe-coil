@@ -40,3 +40,34 @@
 ;;; an argument or a result, never stored. What a view holds inside is raw
 ;;; memory its own module follows.
 (deftrait View [Self])
+
+;;; A collection whose elements are reached by position: `count` of them, and
+;;; `item` lends the one at I. An index out of range stops the program.
+(deftrait Each [Self Item]
+  (count [(xs (ref Self))] (-> i64))
+  (item [(xs (ref Self)) (i i64)] (-> (ref Item))))
+
+;;; A collection whose elements can be changed where they are.
+(deftrait EachMut [Self Item]
+  (item-mut [(xs (mut Self)) (i i64)] (-> (mut Item))))
+
+;;; `(each [NAME XS] BODY…)`: BODY once for every element of XS, in order, with
+;;; NAME a reference to the element. XS names a place; it is lent for the whole
+;;; of each turn, and BODY cannot add to it or take from it.
+(defn each [(binding Code) & (body Code)] (-> Code)
+  (unless (and (primitive/code-vector? binding) (= (len binding) 2))
+    (primitive/error "each: expected (each [name collection] body…)"))
+  `(let [total (count ~(get binding 1))]
+     (for i (range 0 total)
+       (let [~(get binding 0) (item ~(get binding 1) i)]
+         ~@body))))
+
+;;; `(each-mut [NAME XS] BODY…)`: as `each`, with NAME an exclusive reference to
+;;; the element, to change it. XS names a place that can be changed.
+(defn each-mut [(binding Code) & (body Code)] (-> Code)
+  (unless (and (primitive/code-vector? binding) (= (len binding) 2))
+    (primitive/error "each-mut: expected (each-mut [name collection] body…)"))
+  `(let [total (count ~(get binding 1))]
+     (for i (range 0 total)
+       (let [~(get binding 0) (item-mut (mut ~(get binding 1)) i)]
+         ~@body))))

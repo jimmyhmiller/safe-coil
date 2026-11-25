@@ -1,0 +1,9 @@
+(module case.bad-each-entry-insert-while-looping)
+(import "coil.primitive" :as primitive)
+(import "safe.map" :use [Map each-entry])
+(defn main [] (-> i64)
+  (let [(mut m) (Map::new [i64 i64])]
+    (Map::insert! (mut m) 1 2)
+    (each-entry [k v m]
+      (Map::insert! (mut m) (primitive/load v) 3))
+    (Map::len m)))

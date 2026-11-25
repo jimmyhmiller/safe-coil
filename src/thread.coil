@@ -9,22 +9,19 @@
 ;;; an argument is moved or copied to the thread, and no reference crosses: Coil
 ;;; refuses a reference where a value is asked for, and the checker refuses a
 ;;; view. What two threads share, they share through an `Arc` (see `safe.sync`),
-;;; a channel, or a global. `f` must return a value; a function with nothing to
-;;; say returns 0.
+;;; a channel, or a global. A function that returns nothing is started with
+;;; `(spawn-do (f a b))`, which gives a `(Task Done)`.
 ;;;
 ;;; The thread's entry point is a function `spawn` adds to the caller's module,
 ;;; with a second one that takes the arguments at the callee's own types.
 (module safe.thread)
-(export spawn Task)
+(export spawn spawn-do Task Done)
 (import "coil.primitive" :as primitive)
 (import "coil.cc" :as cc)
 (import "coil.alloc" :as alloc)
 (import "coil.atomic" :as atomic)
 (import "coil.thread" :use [Thread])
 (import "safe.core" :use [unsafe])
-
-;;; The most arguments a spawned call can take.
-(const SLOTS 8)
 
 (extern pthread_detach :cc (cc/C) [(ptr i8)] (-> i32))
 
@@ -34,6 +31,9 @@
 ;;; result is there, 2 if the task was detached first.
 (defstruct Packet
   [(slots (slice (ptr i8))) (result (ptr i8)) (state i64) (thread Thread)])
+
+;;; What a task returns when the call it runs returns nothing.
+(defsum Done (Finished []))
 
 ;;; A call running on its own thread, which will return an R.
 (defstruct Task [R] [(packet (ptr Packet))])
@@ -50,8 +50,15 @@
       (store! (data cell) value)
       (primitive/cast (ptr i8) (data cell)))))
 
-(defn nothing [] (-> (ptr i8))
-  (primitive/cast (ptr i8) 0))
+;;; Room for the addresses of COUNT arguments.
+(defn slots-for [(count i64)] (-> (slice (ptr i8)))
+  (unsafe (must (alloc/alloc [(ptr i8)] (alloc/malloc-allocator) (if (> count 0) count 1)))))
+
+;;; Move VALUE to the heap as argument I.
+(defn slot! [T] [(slots (slice (ptr i8))) (i i64) (value T)] (-> void)
+  (unsafe
+    (store! (primitive/index (data slots) i) (keep value))
+    0))
 
 ;;; Argument I of the call whose packet RAW is, taken out of the heap.
 (defn kept [T] [(raw (ptr i8)) (i i64)] (-> T)
@@ -68,22 +75,11 @@
     (alloc/free (alloc/malloc-allocator) (slice::new [Packet] packet 1))
     0))
 
-;;; Start BODY on a new thread with the eight argument addresses.
-(defn begin [R] [(body (fnptr (cc/C) [(ptr i8)] (ptr i8)))
-                 (a0 (ptr i8)) (a1 (ptr i8)) (a2 (ptr i8)) (a3 (ptr i8))
-                 (a4 (ptr i8)) (a5 (ptr i8)) (a6 (ptr i8)) (a7 (ptr i8))] (-> (Task R))
+;;; Start BODY on a new thread with the argument addresses in SLOTS.
+(defn begin [R] [(body (fnptr (cc/C) [(ptr i8)] (ptr i8))) (slots (slice (ptr i8)))] (-> (Task R))
   (unsafe
-    (let [slots (must (alloc/alloc [(ptr i8)] (alloc/malloc-allocator) SLOTS))
-          result (must (alloc/alloc [R] (alloc/malloc-allocator) 1))
+    (let [result (must (alloc/alloc [R] (alloc/malloc-allocator) 1))
           packet (data (must (alloc/alloc [Packet] (alloc/malloc-allocator) 1)))]
-      (store! (primitive/index (data slots) 0) a0)
-      (store! (primitive/index (data slots) 1) a1)
-      (store! (primitive/index (data slots) 2) a2)
-      (store! (primitive/index (data slots) 3) a3)
-      (store! (primitive/index (data slots) 4) a4)
-      (store! (primitive/index (data slots) 5) a5)
-      (store! (primitive/index (data slots) 6) a6)
-      (store! (primitive/index (data slots) 7) a7)
       (store! (field packet slots) slots)
       (store! (field packet result) (primitive/cast (ptr i8) (data result)))
       (store! (field packet state) 0)
@@ -140,39 +136,57 @@
 
 ;;; ---- the macro ---------------------------------------------------------------
 
-(defn spawn [(call Code)] (-> Code)
+;;; `(spawn-as :value (f a b))` or `(spawn-as :done (f a b))`: what `spawn` and
+;;; `spawn-do` expand to.
+(defn spawn-as [(mode Code) (call Code)] (-> Code)
   (unless (and (primitive/code-list? call) (> (len call) 0))
     (primitive/error "spawn: expected a call, (spawn (f …))"))
-  (let [from (if (and (> (len call) 1) (primitive/code-vector? (get call 1))) 2 1)
+  (let [quiet (primitive/code-eq mode `:done)
+        from (if (and (> (len call) 1) (primitive/code-vector? (get call 1))) 2 1)
         count (- (len call) from)
         callee `(~@(primitive/code-slice call 0 from))
         raw (primitive/fresh-identifier "raw")
+        slots (primitive/fresh-identifier "slots")
         result-type (primitive/fresh-identifier "R")
         (mut types) (primitive/code-list-new)
         (mut parameters) (primitive/code-list-new)
         (mut kept-values) (primitive/code-list-new)
         (mut taken) (primitive/code-list-new)
         (mut arguments) (primitive/code-list-new)]
-    (when (> count SLOTS)
-      (primitive/error "spawn: the call takes at most eight arguments"))
-    (for i (range 0 SLOTS)
-      (if (< i count)
-          (let [type (primitive/fresh-identifier "A")
-                parameter (primitive/fresh-identifier "argument")]
-            (push! (mut types) type)
-            (push! (mut parameters) `(~parameter ~type))
-            (push! (mut kept-values) `(keep ~parameter))
-            (push! (mut taken) `(kept ~raw ~i))
-            (push! (mut arguments) (get call (+ from i))))
-          (push! (mut kept-values) `(nothing))))
+    (for i (range 0 count)
+      (let [type (primitive/fresh-identifier "A")
+            parameter (primitive/fresh-identifier "argument")]
+        (push! (mut types) type)
+        (push! (mut parameters) `(~parameter ~type))
+        (push! (mut kept-values) `(slot! ~slots ~i ~parameter))
+        (push! (mut taken) `(kept ~raw ~i))
+        (push! (mut arguments) (get call (+ from i)))))
     (let [site (primitive/code-call-site)
+          task-type (if quiet `Done result-type)
           worker (primitive/code-hoist `(spawn-worker ~site)
-                                       `(defn _ :cc (cc/C) [(~raw (ptr i8))] (-> (ptr i8))
-                                          (deliver ~raw (~@callee ~@taken))))
+                                       (if quiet
+                                           `(defn _ :cc (cc/C) [(~raw (ptr i8))] (-> (ptr i8))
+                                              (~@callee ~@taken)
+                                              (deliver ~raw (Finished)))
+                                           `(defn _ :cc (cc/C) [(~raw (ptr i8))] (-> (ptr i8))
+                                              (deliver ~raw (~@callee ~@taken)))))
           launch (primitive/code-hoist `(spawn-launch ~site)
                                        `(defn _ [~@types ~result-type]
                                           [(callee (fnptr (cc/C) [~@types] ~result-type))
                                            (body (fnptr (cc/C) [(ptr i8)] (ptr i8)))
-                                           ~@parameters] (-> (Task ~result-type))
-                                          (begin [~result-type] body ~@kept-values)))]
+                                           ~@parameters] (-> (Task ~task-type))
+                                          (unsafe
+                                            (let [~slots (slots-for ~count)]
+                                              ~@kept-values
+                                              (begin [~task-type] body ~slots)))))]
       `(~launch (primitive/fnptr-of ~@callee) (primitive/fnptr-of ~worker) ~@arguments))))
+
+;;; `(spawn (f a b))`: start the call on a new thread. A `(Task R)`, where R is
+;;; what `f` returns.
+(defn spawn [(call Code)] (-> Code)
+  `(spawn-as :value ~call))
+
+;;; `(spawn-do (f a b))`: start a call that returns nothing on a new thread. A
+;;; `(Task Done)`.
+(defn spawn-do [(call Code)] (-> Code)
+  `(spawn-as :done ~call))

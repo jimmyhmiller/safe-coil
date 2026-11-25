@@ -3,8 +3,8 @@
 (export Str)
 (import "coil.primitive" :as primitive)
 (import "coil.fmt" :use [Display Formatter display-fmt])
-(import "safe.core" :use [unsafe])
-(import "safe.vec" :use [Vec])
+(import "safe.core" :use [unsafe Each])
+(import "safe.vec" :use [Vec Slice])
 
 ;;; A string of bytes, UTF-8 by convention. It owns them: they are freed with it.
 ;;; Text between quotes is a slice, which is raw memory; `(Str::from "…")` copies
@@ -44,6 +44,22 @@
     (for i (range 0 (Str::len more))
       (Str::push! (mut s) (Str::byte more i))))
 
+  ;;; The bytes from FROM up to TO, lent shared. A range that is not inside the
+  ;;; string stops the program.
+  (slice [(s (ref Str)) (from i64) (to i64)] (-> (Slice u8))
+    (Vec::slice (field s bytes) from to))
+
+  ;;; A copy of the bytes PART covers.
+  (from-slice [(part (ref (Slice u8)))] (-> Str)
+    (let [(mut s) (Str::new)]
+      (Str::push-slice! (mut s) part)
+      s))
+
+  ;;; Add a copy of the bytes PART covers at the end.
+  (push-slice! [(s (mut Str)) (part (ref (Slice u8)))] (-> void)
+    (for i (range 0 (Slice::len part))
+      (Str::push! (mut s) (primitive/load (Slice::at part i)))))
+
   ;;; Add N in decimal at the end.
   (push-int! [(s (mut Str)) (n i64)] (-> void)
     (if (< n 0)
@@ -67,6 +83,11 @@
     (let [(mut out) (Str::new)]
       (Str::append! (mut out) s)
       out)))
+
+;;; `each` over a string visits its bytes.
+(impl Each Str
+  (count [(xs (ref Str))] (-> i64) (Str::len xs))
+  (item [(xs (ref Str)) (i i64)] (-> (ref u8)) (Vec::at (field xs bytes) i)))
 
 ;;; Strings are equal when their bytes are.
 (impl Eq Str

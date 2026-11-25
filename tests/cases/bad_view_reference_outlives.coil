@@ -4,6 +4,7 @@
 (defstruct Pt [(x i64) (y i64)])
 (defstruct Window [(at (ptr Pt))])
 (impl View Window)
+(impl Drop Window (drop [(self (mut Window))] (-> void) 0))
 (defn window [(p (mut Pt))] (-> Window)
   (unsafe (Window :at (primitive/cast (ptr Pt) (mut p)))))
 (defn x-of [(w (mut Window))] (-> (mut i64))

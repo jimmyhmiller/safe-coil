@@ -957,7 +957,20 @@
     (for [i 1 (len e)]
       (when (primitive/code-keyword? (get e i)) (set! positional false))
       (when (type-arguments? (get e i)) (set! skipped (+ skipped 1))))
-    (let [known (and positional
+    (let [; `(+ a b c)` is the two-parameter method folded over its arguments:
+          ; every argument past the first is taken as the second parameter is
+          folded (and positional
+                      (not (head-is? params `unknown))
+                      (= (len params) 2)
+                      (> (- (len e) 1 skipped) 2)
+                      (match kind (primitive/MethodDecl [] true) (_ false)))
+          params (if folded
+                     (let [(mut spread) (primitive/code-list-new)]
+                       (push! (mut spread) (get params 0))
+                       (for [i 2 (- (len e) skipped)] (push! (mut spread) (get params 1)))
+                       `(~@spread))
+                     params)
+          known (and positional
                      (not (head-is? params `unknown))
                      (= (len params) (- (len e) 1 skipped)))]
       (when (and external (not (raw-ok? cx e)))
@@ -985,6 +998,11 @@
     (drop-loans-to! (mut cx) loans)
     (when (or (ref-type? (type-of e)) (view-type? (type-of e)))
       (refuse-dropped! e all))
+    ; a view over an exclusive reference gives exclusive access, so there is one of it
+    (when (and (view-type? (type-of e)) (not (owner-type? cx (type-of e))))
+      (for l (iter all)
+        (when (loan-excl? l)
+          (fail! e "safe: a view that can be copied is made from an exclusive reference; a view over one is moved, so its type needs a Drop"))))
     ; a reference that is thrown away still may not outlive what it refers to
     (cond (ref-type? (type-of e))
             (match want

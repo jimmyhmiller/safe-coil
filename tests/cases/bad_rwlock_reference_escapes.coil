@@ -1,0 +1,7 @@
+(module case.bad-rwlock-reference-escapes)
+(import "coil.primitive" :as primitive)
+(import "safe.sync" :use [RwLock Reading])
+(defn peek [(l (ref (RwLock i64)))] (-> (ref i64))
+  (let [reading (RwLock::read l)]
+    (Reading::get reading)))
+(defn main [] (-> i64) 0)

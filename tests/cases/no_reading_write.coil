@@ -1,0 +1,8 @@
+(module case.no-reading-write)
+(import "coil.primitive" :as primitive)
+(import "safe.sync" :use [RwLock Reading])
+(defn main [] (-> i64)
+  (let [l (RwLock::new 1)
+        (mut reading) (RwLock::read l)]
+    (set! (mut (Reading::get reading)) 2)
+    0))

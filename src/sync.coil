@@ -1,6 +1,7 @@
-;;; What threads share: an owner with many holders, a lock, and a channel.
+;;; What threads share: an owner with many holders, a lock, a lock for many
+;;; readers or one writer, something to wait on, and a channel.
 (module safe.sync)
-(export Arc Mutex Guard with-lock Channel)
+(export Arc Mutex Guard with-lock Condvar RwLock Reading Writing Channel)
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc)
 (import "coil.atomic" :as atomic)
@@ -130,6 +131,156 @@
   `(let [(mut guard) (Mutex::lock ~mutex)
          ~name (Guard::get-mut (mut guard))]
      ~@body))
+
+;;; ---- Condvar -----------------------------------------------------------------
+
+;;; Something threads wait on until another thread says a value has changed.
+(defstruct Condvar [(ready (ptr sync/Condition))])
+
+(impl Condvar
+  ;;; A new one, with nobody waiting.
+  (new [] (-> Condvar)
+    (unsafe
+      (let [ready (one [sync/Condition])]
+        (match (sync/Condition::init ready)
+          (Ok [_] 0)
+          (Err [_] (panic "safe: a lock could not be made")))
+        (Condvar :ready ready))))
+
+  ;;; Wake one thread that waits here, if any does.
+  (notify-one [(c (ref Condvar))] (-> void)
+    (unsafe (sure (sync/Condition::notify-one! (.ready c)))))
+
+  ;;; Wake every thread that waits here.
+  (notify-all [(c (ref Condvar))] (-> void)
+    (unsafe (sure (sync/Condition::notify-all! (.ready c))))))
+
+(impl Drop Condvar
+  (drop [(self (mut Condvar))] (-> void)
+    (unsafe
+      (sure (sync/Condition::destroy! (.ready self)))
+      (free-one (.ready self))
+      0)))
+
+(impl [T] (Guard T)
+  ;;; Give the lock up, sleep until CONDVAR is notified, and hold the lock again.
+  ;;; The guard is lent exclusively meanwhile, so no reference to the value is
+  ;;; kept across the wait. A wait can end with nothing notified: wait in a loop
+  ;;; that looks at the value.
+  (wait [(g (mut (Guard T))) (condvar (ref Condvar))] (-> void)
+    (unsafe
+      (let [at (load (field g mutex))]
+        (atomic/store (field at owner) 0)
+        (sure (sync/Condition::wait! (.ready condvar) (load (field at lock))))
+        (atomic/store (field at owner) (thread/current-id))
+        0))))
+
+;;; ---- RwLock ------------------------------------------------------------------
+
+;;; Who holds a read-write lock: `readers` threads reading, or the thread
+;;; `writer` writing (0 when none is).
+(defstruct Holders
+  [(lock sync/Mutex) (changed sync/Condition) (readers i64) (writer i64)])
+
+;;; A value many threads may read at once, or one may change.
+(defstruct RwLock [T] [(holders (ptr Holders)) (value T)])
+
+;;; A held read lock. While it lives nobody writes. It is a view.
+(defstruct Reading [T] [(of (ptr (RwLock T)))])
+
+;;; A held write lock. While it lives nobody else reads or writes. It is a view.
+(defstruct Writing [T] [(of (ptr (RwLock T)))])
+
+(impl [T] View (Reading T))
+(impl [T] View (Writing T))
+
+(impl [T] (RwLock T)
+  ;;; VALUE, behind a read-write lock.
+  (new [(value T)] (-> (RwLock T))
+    (unsafe
+      (let [holders (one [Holders])]
+        (match (sync/Mutex::init (field holders lock))
+          (Ok [_] 0)
+          (Err [_] (panic "safe: a lock could not be made")))
+        (match (sync/Condition::init (field holders changed))
+          (Ok [_] 0)
+          (Err [_] (panic "safe: a lock could not be made")))
+        (store! (field holders readers) 0)
+        (store! (field holders writer) 0)
+        (RwLock :holders holders :value value))))
+
+  ;;; Wait until nobody writes, and read for as long as the result lives. A
+  ;;; thread that holds the write lock and asks to read stops the program.
+  (read [(l (ref (RwLock T)))] (-> (Reading T))
+    (unsafe
+      (let [at (primitive/cast (ptr (RwLock T)) l)
+            holders (load (field at holders))]
+        (sure (sync/Mutex::lock! (field holders lock)))
+        (when (= (load (field holders writer)) (thread/current-id))
+          (panic "safe: a thread asked to read a lock it holds for writing"))
+        (while (!= (load (field holders writer)) 0)
+          (sure (sync/Condition::wait! (field holders changed) (field holders lock))))
+        (store! (field holders readers) (+ (load (field holders readers)) 1))
+        (sure (sync/Mutex::unlock! (field holders lock)))
+        (Reading :of at))))
+
+  ;;; Wait until nobody reads or writes, and hold the lock alone for as long as
+  ;;; the result lives. A thread that holds the write lock and asks again stops
+  ;;; the program; one that holds a read lock and asks to write waits for ever.
+  (write [(l (ref (RwLock T)))] (-> (Writing T))
+    (unsafe
+      (let [at (primitive/cast (ptr (RwLock T)) l)
+            holders (load (field at holders))]
+        (sure (sync/Mutex::lock! (field holders lock)))
+        (when (= (load (field holders writer)) (thread/current-id))
+          (panic "safe: a thread asked for a lock it already holds"))
+        (while (or (!= (load (field holders writer)) 0) (> (load (field holders readers)) 0))
+          (sure (sync/Condition::wait! (field holders changed) (field holders lock))))
+        (store! (field holders writer) (thread/current-id))
+        (sure (sync/Mutex::unlock! (field holders lock)))
+        (Writing :of at)))))
+
+(impl [T] Drop (RwLock T)
+  (drop [(self (mut (RwLock T)))] (-> void)
+    (unsafe
+      (sure (sync/Condition::destroy! (field (.holders self) changed)))
+      (sure (sync/Mutex::destroy! (field (.holders self) lock)))
+      (free-one (.holders self))
+      0)))
+
+(impl [T] (Reading T)
+  ;;; The value behind the lock.
+  (get [(r (ref (Reading T)))] (-> (ref T))
+    (unsafe (lend (field (load (field r of)) value)))))
+
+(impl [T] Drop (Reading T)
+  (drop [(self (mut (Reading T)))] (-> void)
+    (unsafe
+      (let [holders (load (field (load (field self of)) holders))]
+        (sure (sync/Mutex::lock! (field holders lock)))
+        (store! (field holders readers) (- (load (field holders readers)) 1))
+        (sure (sync/Condition::notify-all! (field holders changed)))
+        (sure (sync/Mutex::unlock! (field holders lock)))
+        0))))
+
+(impl [T] (Writing T)
+  ;;; The value behind the lock.
+  (get [(w (ref (Writing T)))] (-> (ref T))
+    (unsafe (lend (field (load (field w of)) value))))
+
+  ;;; The value behind the lock, to be changed.
+  (get-mut [(w (mut (Writing T)))] (-> (mut T))
+    (unsafe (lend-mut (field (load (field w of)) value)))))
+
+(impl [T] Drop (Writing T)
+  (drop [(self (mut (Writing T)))] (-> void)
+    (unsafe
+      (let [holders (load (field (load (field self of)) holders))]
+        (sure (sync/Mutex::lock! (field holders lock)))
+        (store! (field holders writer) 0)
+        (sure (sync/Condition::notify-all! (field holders changed)))
+        (sure (sync/Mutex::unlock! (field holders lock)))
+        0))))
 
 ;;; ---- Channel -----------------------------------------------------------------
 
