@@ -90,6 +90,10 @@
   (item [(xs (ref Str)) (i i64)] (-> (ref u8)) (Vec::at (field xs bytes) i)))
 
 ;;; Strings are equal when their bytes are.
+;;; `(clone s)`: the same text, owned anew.
+(impl Clone Str
+  (clone [(s (ref Str))] (-> Str) (Str::copy s)))
+
 (impl Eq Str
   (= [(a (ref Str)) (b (ref Str))] (-> bool)
     (Str::eq? a b)))

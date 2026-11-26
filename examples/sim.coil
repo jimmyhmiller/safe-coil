@@ -1,0 +1,151 @@
+;;; A small ecosystem: rabbits graze and breed, foxes hunt the nearest rabbit and
+;;; remember it by handle, and creatures that run out of energy die. Entities live
+;;; in a Pool; a handle to one that has died is noticed, not followed. Safe Coil
+;;; throughout.
+;;;
+;;;   coil run examples/sim.coil --use safe.check
+(module example.sim)
+(import "safe.vec" :use [Vec])
+(import "safe.str" :use [Str])
+(import "safe.pool" :use [Pool Handle])
+(import "safe.loop" :use [for])
+
+(defsum Kind (Rabbit) (Fox))
+
+(defstruct Creature
+  [(kind Kind) (name Str) (x i64) (y i64) (energy i64)
+   ;; what a fox is hunting, and whether it hunts at all
+   (target (Handle Creature)) (hunting bool)
+   ;; what it has eaten, by name
+   (eaten (Vec Str))])
+
+(defstruct World [(creatures (Pool Creature)) (seed i64) (born i64) (log (Vec Str))])
+
+;;; A number from 0 below N, from the world's own sequence.
+(defn roll! [(w (mut World)) (n i64)] (-> i64)
+  (set! (.seed w) (% (+ (* (.seed w) 1103515245) 12345) 2147483648))
+  (% (/ (.seed w) 65536) n))
+
+(defn note! [(w (mut World)) (text (ref Str))] (-> void)
+  (Vec::push! (mut (field w log)) (Str::copy text)))
+
+(defn spawn! [(w (mut World)) (kind Kind) (x i64) (y i64)] (-> (Handle Creature))
+  (set! (.born w) (+ (.born w) 1))
+  (let [(mut name) (Str::from (match kind (Rabbit [] "rabbit-") (Fox [] "fox-")))]
+    (Str::push-int! (mut name) (.born w))
+    (Pool::insert! (mut (field w creatures))
+                   (Creature :kind kind :name name :x x :y y :energy (match kind (Rabbit [] 6) (Fox [] 16))
+                             :target (Handle :slot -1 :generation 0) :hunting false
+                             :eaten (Vec::new [Str])))))
+
+(defn fox? [(c (ref Creature))] (-> bool)
+  (match (field c kind) (Fox [] true) (Rabbit [] false)))
+
+(defn distance [(a (ref Creature)) (b (ref Creature))] (-> i64)
+  (+ (abs (- (.x a) (.x b))) (abs (- (.y a) (.y b)))))
+
+(defn abs [(n i64)] (-> i64) (if (< n 0) (- 0 n) n))
+
+;;; The rabbit nearest to the creature H, if there is one.
+(defn nearest-rabbit [(w (ref World)) (h (Handle Creature))] (-> (Option (Handle Creature)))
+  (let [me (Pool::at (field w creatures) h)
+        (mut best) (None [(Handle Creature)])
+        (mut best-d) 1000000]
+    (for (ref other) (Pool::handles (field w creatures))
+      (let [c (Pool::at (field w creatures) other)]
+        (when (and (not (fox? c)) (< (distance me c) best-d))
+          (set! best-d (distance me c))
+          (set! best (Some other)))))
+    best))
+
+(defn step-toward! [(c (mut Creature)) (x i64) (y i64)] (-> void)
+  (cond (< (.x c) x) (set! (.x c) (+ (.x c) 1))
+        (> (.x c) x) (set! (.x c) (- (.x c) 1))
+        (< (.y c) y) (set! (.y c) (+ (.y c) 1))
+        (> (.y c) y) (set! (.y c) (- (.y c) 1))
+        :else 0))
+
+;;; One fox's turn: keep its target while it lives, else pick the nearest; move
+;;; toward it, and eat it when there.
+(defn fox-turn! [(w (mut World)) (h (Handle Creature))] (-> void)
+  (let [keeps (and (.hunting (Pool::at (field w creatures) h))
+                   (Pool::live? (field w creatures) (.target (Pool::at (field w creatures) h))))]
+    (unless keeps
+      (match (nearest-rabbit w h)
+        (Some [prey]
+              (let [fox (Pool::at-mut (mut (field w creatures)) h)]
+                (set! (.target fox) prey)
+                (set! (.hunting fox) true)))
+        (None [] (set! (.hunting (Pool::at-mut (mut (field w creatures)) h)) false)))))
+  (when (.hunting (Pool::at (field w creatures) h))
+    (let [prey (.target (Pool::at (field w creatures) h))
+          px (.x (Pool::at (field w creatures) prey))
+          py (.y (Pool::at (field w creatures) prey))]
+      (step-toward! (mut (Pool::at-mut (mut (field w creatures)) h)) px py)
+      (let [fox (Pool::at (field w creatures) h)]
+        (when (and (= (.x fox) px) (= (.y fox) py))
+          (let [eaten (Pool::remove! (mut (field w creatures)) prey)
+                (mut line) (Str::copy (field (Pool::at (field w creatures) h) name))]
+            (Str::push-text! (mut line) " eats ")
+            (Str::append! (mut line) (field eaten name))
+            (note! (mut w) line)
+            (let [fox (Pool::at-mut (mut (field w creatures)) h)]
+              (set! (.energy fox) (+ (.energy fox) 5))
+              (set! (.hunting fox) false)
+              (Vec::push! (mut (field fox eaten)) (.name eaten))))))))
+  (set! (.energy (Pool::at-mut (mut (field w creatures)) h))
+        (- (.energy (Pool::at (field w creatures) h)) 1)))
+
+;;; One rabbit's turn: wander, graze, and now and then have a young one.
+(defn rabbit-turn! [(w (mut World)) (h (Handle Creature))] (-> void)
+  (let [dx (- (roll! (mut w) 3) 1)
+        dy (- (roll! (mut w) 3) 1)
+        grass (roll! (mut w) 2)
+        young (= (roll! (mut w) 5) 0)
+        r (Pool::at-mut (mut (field w creatures)) h)]
+    (set! (.x r) (+ (.x r) dx))
+    (set! (.y r) (+ (.y r) dy))
+    (set! (.energy r) (+ (.energy r) grass -1))
+    (when (and young (> (.energy r) 4))
+      (let [x (.x r)
+            y (.y r)]
+        (set! (.energy r) (- (.energy r) 3))
+        (let [kid (spawn! (mut w) (Rabbit) x y)
+              (mut line) (Str::copy (field (Pool::at (field w creatures) kid) name))]
+          (Str::push-text! (mut line) " is born")
+          (note! (mut w) line))))))
+
+(defn tick! [(w (mut World))] (-> void)
+  (for (ref h) (Pool::handles (field w creatures))
+    (when (Pool::live? (field w creatures) h)
+      (if (fox? (Pool::at (field w creatures) h))
+          (fox-turn! (mut w) h)
+          (rabbit-turn! (mut w) h))))
+  ;; the starved die
+  (for (ref h) (Pool::handles (field w creatures))
+    (when (<= (.energy (Pool::at (field w creatures) h)) 0)
+      (let [dead (Pool::remove! (mut (field w creatures)) h)
+            (mut line) (Str::copy (field dead name))]
+        (Str::push-text! (mut line) " starves")
+        (note! (mut w) line)))))
+
+(defn count-kind [(w (ref World)) (foxes bool)] (-> i64)
+  (let [(mut n) 0]
+    (for (ref h) (Pool::handles (field w creatures))
+      (when (= (fox? (Pool::at (field w creatures) h)) foxes) (set! n (+ n 1))))
+    n))
+
+(defn main [] (-> i64)
+  (let [(mut w) (World :creatures (Pool::new [Creature]) :seed 7 :born 0 :log (Vec::new [Str]))]
+    (for i (range 0 6) (spawn! (mut w) (Rabbit) (* i 2) (- 5 i)))
+    (spawn! (mut w) (Fox) 0 0)
+    (spawn! (mut w) (Fox) 9 9)
+    (for turn (range 0 12)
+      (tick! (mut w))
+      (println "turn {}: {} rabbits, {} foxes" turn (count-kind w false) (count-kind w true)))
+    (for (ref line) (field w log) (println "  {}" line))
+    (for (ref h) (Pool::handles (field w creatures))
+      (let [c (Pool::at (field w creatures) h)]
+        (when (fox? c)
+          (println "{} ate {} rabbits" (.name c) (Vec::len (field c eaten)))))))
+  0)

@@ -168,6 +168,16 @@
   (value-at [(m (ref (Map K V))) (cursor i64)] (-> (ref V))
     (unsafe (lend (field (pair-at m cursor) value)))))
 
+;;; `(clone m)`: a new table of the keys' and values' clones.
+(impl [(K Hash Eq Clone) (V Clone)] Clone (Map K V)
+  (clone [(m (ref (Map K V)))] (-> (Map K V))
+    (let [(mut out) (Map::new [K V])
+          (mut cursor) (Map::first m)]
+      (while (>= cursor 0)
+        (Map::insert! (mut out) (clone (Map::key-at m cursor)) (clone (Map::value-at m cursor)))
+        (set! cursor (Map::next m cursor)))
+      out)))
+
 (impl [K V] Drop (Map K V)
   (drop [(self (mut (Map K V)))] (-> void)
     (unsafe

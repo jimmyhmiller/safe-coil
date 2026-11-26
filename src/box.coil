@@ -36,6 +36,11 @@
         (forget held)
         value))))
 
+;;; `(clone b)`: a new box holding a clone of what B holds.
+(impl [(T Clone)] Clone (Box T)
+  (clone [(b (ref (Box T)))] (-> (Box T))
+    (Box::new (clone (Box::get b)))))
+
 (impl [T] Drop (Box T)
   (drop [(self (mut (Box T)))] (-> void)
     (unsafe

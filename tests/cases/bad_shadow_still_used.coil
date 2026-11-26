@@ -1,0 +1,12 @@
+;;; A name bound again inside hides the outer one only there: after, it is the
+;;; outer one again, still lent.
+(module bad_shadow_still_used)
+(import "coil.primitive" :as primitive)
+(import "safe.vec" :use [Vec])
+(defn main [] (-> i64)
+  (let [(mut v) (Vec::new [i64])]
+    (Vec::push! (mut v) 1)
+    (let [x (Vec::at v 0)]
+      (let [x 5]
+        (Vec::push! (mut v) x))
+      (primitive/load x))))

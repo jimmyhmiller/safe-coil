@@ -414,12 +414,70 @@
 ;;; is inside, whatever is written after it. A loop runs again and an assignment
 ;;; may use its place after its value, so everything in one of those counts.
 
-(defn names? [(code Code) (binder Code)] (-> bool)
-  (cond (primitive/code-sym? code) (primitive/bound-identifier=? binder code)
+;;; Is the symbol CODE a use of the binding BINDER makes, whose uses the compiler
+;;; resolved to BID (0 when no use was seen yet)? Spelled and scoped alike, and
+;;; the same binding: a later `let` of the same name makes another.
+(defn same-binding? [(binder Code) (bid i64) (code Code)] (-> bool)
+  (and (primitive/bound-identifier=? binder code)
+       (let [b (primitive/binding-of code)]
+         (or (<= bid 0) (<= b 0) (= b bid)))))
+
+;;; Is B, a binding form's binder (`x` or `(mut x)`), another binding of the
+;;; identifier BINDER: spelled and scoped alike, and not BINDER itself?
+(defn binds? [(b Code) (binder Code)] (-> bool)
+  (let [name (cond (primitive/code-sym? b) b
+                   (and (primitive/code-list? b) (= (len b) 2) (head-is? b `mut) (primitive/code-sym? (get b 1)))
+                     (get b 1)
+                   :else `())]
+    (and (primitive/code-sym? name)
+         (primitive/bound-identifier=? name binder)
+         (not (same-occurrence? name binder)))))
+
+;;; The parts of the form CODE that can name BINDER's binding: all of them,
+;;; unless CODE binds the same identifier again. In a `let` (the checker sees
+;;; `let*`, what it expands to) that is the
+;;; initializers up to and including the one of the binder that shadows; in a
+;;; `match`, every arm but those that bind it.
+(defn visible-parts [(code Code) (binder Code)] (-> Code)
+  (cond (and (or (head-is? code `let) (head-is? code `let*)) (> (len code) 1) (primitive/code-vector? (get code 1)))
+          (let [v (get code 1)
+                shadow (block :found
+                         (let [(mut k) 0]
+                           (while (< k (len v))
+                             (when (binds? (get v k) binder) (return-from :found k))
+                             (set! k (+ k 2))))
+                         -1)]
+            (if (< shadow 0)
+                code
+                (let [(mut out) (primitive/code-list-new)]
+                  (push! (mut out) (get code 0))
+                  ; the binders of the vector are not uses; its initializers are
+                  (let [(mut k) 1]
+                    (while (and (< k (len v)) (<= k (+ shadow 1)))
+                      (push! (mut out) (get v k))
+                      (set! k (+ k 2))))
+                  `(~@out))))
+        (and (head-is? code `match) (> (len code) 1))
+          (let [(mut out) (primitive/code-list-new)]
+            (push! (mut out) (get code 0))
+            (push! (mut out) (get code 1))
+            (for [i 2 (len code)]
+              (let [arm (get code i)]
+                (unless (and (primitive/code-list? arm) (> (len arm) 1) (primitive/code-vector? (get arm 1))
+                             (block :binds
+                               (for b (iter (get arm 1))
+                                 (when (binds? b binder) (return-from :binds true)))
+                               false))
+                  (push! (mut out) arm))))
+            `(~@out))
+        :else code))
+
+(defn names? [(code Code) (binder Code) (bid i64)] (-> bool)
+  (cond (primitive/code-sym? code) (same-binding? binder bid code)
         (or (primitive/code-list? code) (primitive/code-vector? code))
           (block :found
-            (for part (iter code)
-              (when (names? part binder) (return-from :found true)))
+            (for part (iter (if (primitive/code-list? code) (visible-parts code binder) code))
+              (when (names? part binder bid) (return-from :found true)))
             false)
         :else false))
 
@@ -433,13 +491,13 @@
 
 ;;; Is BINDER named in NODE after CHILD, the first part of NODE that is the
 ;;; occurrence CHILD? SEEN says whether CHILD has been passed.
-(defn names-after? [(node Code) (child Code) (binder Code) (seen (mut bool))] (-> bool)
+(defn names-after? [(node Code) (child Code) (binder Code) (bid i64) (seen (mut bool))] (-> bool)
   (cond (and (not seen) (same-occurrence? node child)) (do (set! seen true) false)
-        (primitive/code-sym? node) (and seen (primitive/bound-identifier=? binder node))
+        (primitive/code-sym? node) (and seen (same-binding? binder bid node))
         (or (primitive/code-list? node) (primitive/code-vector? node))
           (block :found
-            (for part (iter node)
-              (when (names-after? part child binder (mut seen)) (return-from :found true)))
+            (for part (iter (if (primitive/code-list? node) (visible-parts node binder) node))
+              (when (names-after? part child binder bid (mut seen)) (return-from :found true)))
             false)
         :else false))
 
@@ -452,17 +510,17 @@
          (or (= text "loop")
              (and (> (len text) 0) (= (get text (- (len text) 1)) #\!))))))
 
-(defn named-later? [(cx (ref Cx)) (binder Code)] (-> bool)
+(defn named-later? [(cx (ref Cx)) (binder Code) (bid i64)] (-> bool)
   (block :found
     (for [k 0 (- (len (.path cx)) 1)]
       (let [parent (get (.path cx) k)
             child (get (.path cx) (+ k 1))
             (mut seen) false]
         (when (if (runs-again? parent)
-                  (names? parent binder)
-                  (or (names-after? parent child binder (mut seen))
+                  (names? parent binder bid)
+                  (or (names-after? parent child binder bid (mut seen))
                       ; CHILD is not written in PARENT as it stands: all of it counts
-                      (and (not seen) (names? parent binder))))
+                      (and (not seen) (names? parent binder bid))))
           (return-from :found true))))
     false))
 
@@ -478,7 +536,7 @@
           (when (= (get (.pinned cx) i) holder) (return-from :found true)))
         (for [i 0 (len (.locals cx))]
           (let [l (get (.locals cx) i)]
-            (when (and (= (.serial l) holder) (named-later? cx (.binder l)))
+            (when (and (= (.serial l) holder) (named-later? cx (.binder l) (.bid l)))
               (return-from :found true))))
         ; a chain of borrows is no longer than the locals in scope
         (when (< depth (len (.locals cx)))
@@ -941,7 +999,11 @@
                   (WDiscard [] (fresh))
                   (WValue [] (fresh))
                   (WBind [mutable]
-                    (if (or mutable (not (ref-type? (type-of e))) (word-type? (pointee (type-of e))))
+                    ; a `let` copies plain data: a number, or a struct of plain data
+                    (if (or mutable (not (ref-type? (type-of e))) (word-type? (pointee (type-of e)))
+                            (and (copy-type? cx (pointee (type-of e)) 0)
+                                 (not (view-type? (pointee (type-of e))))
+                                 (not (raw-in? cx (pointee (type-of e)) 0 true))))
                         (fresh)
                         r))
                   (_ r))))))))

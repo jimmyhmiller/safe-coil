@@ -23,17 +23,7 @@
 
 (defstruct Env [(vars (Mutex (Map Str Value))) (parent (Option (Arc Env)))])
 
-(defn copy-value [(v (ref Value))] (-> Value)
-  (match v
-    (Nil [] (Nil))
-    (Num [n] (Num n))
-    (Sym [name] (Sym (Str::copy name)))
-    (List [items]
-          (let [(mut out) (Vec::new [Value])]
-            (for (ref x) items (Vec::push! (mut out) (copy-value x)))
-            (List out)))
-    (Fn [f] (Fn (Arc::clone f)))
-    (Builtin [op] (Builtin op))))
+(derive Clone Value)
 
 (defn show [(v (ref Value)) (out (mut Str))] (-> void)
   (match v
@@ -120,7 +110,7 @@
 (defn env-lookup [(env (ref Env)) (name (ref Str))] (-> (Option Value))
   (let [found (with-lock (field env vars) vars
                 (if (Map::has? vars name)
-                    (Some (copy-value (Map::at vars name)))
+                    (Some (clone (Map::at vars name)))
                     (None)))]
     (match found
       (Some [_] found)
@@ -149,7 +139,7 @@
           (if (= (Vec::len items) 0)
               (Ok (Nil))
               (let [head (Vec::at items 0)]
-                (cond (sym? head "quote") (Ok (copy-value (Vec::at items 1)))
+                (cond (sym? head "quote") (Ok (clone (Vec::at items 1)))
                       (sym? head "if")
                         (match (try! (eval (Vec::at items 1) env))
                           (Nil [] (eval (Vec::at items 3) env))
@@ -171,7 +161,7 @@
                                       (_ 0))))
                             (_ 0))
                           (Ok (Fn (Arc::new (Lambda :params params
-                                                    :body (Arc::new (copy-value (Vec::at items 2)))
+                                                    :body (Arc::new (clone (Vec::at items 2)))
                                                     :env (Arc::clone env))))))
                       :else
                         (let [f (try! (eval head env))
@@ -179,7 +169,7 @@
                           (for i (range 1 (Vec::len items))
                             (Vec::push! (mut args) (try! (eval (Vec::at items i) env))))
                           (apply f args))))))
-    (_ (Ok (copy-value v))))))
+    (_ (Ok (clone v))))))
 
 (defn num-of [(v (ref Value))] (-> (Result i64 Str))
   (match v
@@ -196,7 +186,7 @@
                    (= op 3) (Ok (if (< (try! (num-of (Vec::at args 0))) (try! (num-of (Vec::at args 1))))
                                     (Num 1) (Nil)))
                    (= op 4) (let [(mut out) (Vec::new [Value])]
-                              (for (ref a) args (Vec::push! (mut out) (copy-value a)))
+                              (for (ref a) args (Vec::push! (mut out) (clone a)))
                               (Ok (List out)))
                    :else (Err (Str::from "unknown builtin"))))
     (Fn [lam]
@@ -205,7 +195,7 @@
           (for i (range 0 (Vec::len (field l params)))
             (env-define! (Arc::get env)
                          (Str::copy (Vec::at (field l params) i))
-                         (copy-value (Vec::at args i))))
+                         (clone (Vec::at args i))))
           (eval (Arc::get (field l body)) env)))
     (_ (Err (Str::from "not a function"))))))
 

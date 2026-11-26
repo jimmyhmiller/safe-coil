@@ -1,0 +1,14 @@
+;;; A name bound again inside is another binding: the outer one is no longer used.
+(module ok_shadowed_name)
+(import "coil.primitive" :as primitive)
+(import "safe.vec" :use [Vec])
+(defn main [] (-> i64)
+  (let [(mut v) (Vec::new [i64])]
+    (Vec::push! (mut v) 1)
+    (let [x (Vec::at v 0)]
+      (when (= (primitive/load x) 1)
+        (Vec::push! (mut v) 2)
+        (let [x (Vec::at-mut (mut v) 1)]
+          (set! x 3))))
+    (println "{}" (get v 1)))
+  0)

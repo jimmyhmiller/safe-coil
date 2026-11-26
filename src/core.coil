@@ -1,6 +1,7 @@
 ;;; What safe Coil code is written with besides the language itself.
 (module safe.core)
 (import "coil.primitive" :as primitive)
+(import "coil.meta" :as meta)
 
 ;;; `(defn f :safe/borrows "a b" [(a (ref T)) (b (ref U)) (c (ref V))] (-> (ref W)) …)`:
 ;;; the reference f returns borrows only from what the parameters named were lent,
@@ -91,23 +92,43 @@
           (panic "safe: index {} is out of range for a slice of {}" i (len s)))
         (lend (primitive/index (data s) i))))))
 
+;;; Is XS a name, or a field of one: a place `each` can name again and again?
+(defn place-form? [(xs Code)] (-> bool)
+  (cond (primitive/code-sym? xs) true
+        (and (primitive/code-list? xs) (> (len xs) 1) (primitive/code-sym? (get xs 0)))
+          (let [h (meta/source (get xs 0))]
+            (cond (= h "field") (place-form? (get xs 1))
+                  (= h "..") (place-form? (get xs 1))
+                  (and (> (len h) 1) (= (get h 0) #\.) (= (len xs) 2)) (place-form? (get xs 1))
+                  :else false))
+        :else false))
+
 ;;; `(each [NAME XS] BODY…)`: BODY once for every element of XS, in order, with
 ;;; NAME a reference to the element. XS names a place; it is lent for the whole
 ;;; of each turn, and BODY cannot add to it or take from it.
 (defn each [(binding Code) & (body Code)] (-> Code)
   (unless (and (primitive/code-vector? binding) (= (len binding) 2))
     (primitive/error "each: expected (each [name collection] body…)"))
-  `(let [total (Each::count ~(get binding 1))]
-     (for i (range 0 total)
-       (let [~(get binding 0) (Each::item ~(get binding 1) i)]
-         ~@body))))
+  (if (place-form? (get binding 1))
+      `(let [total (Each::count ~(get binding 1))]
+         (for i (range 0 total)
+           (let [~(get binding 0) (Each::item ~(get binding 1) i)]
+             ~@body)))
+      ; anything else is evaluated once, and the loop runs over what it gave
+      (let [xs (primitive/fresh-identifier "collection")]
+        `(let [~xs ~(get binding 1)]
+           (each [~(get binding 0) ~xs] ~@body)))))
 
 ;;; `(each-mut [NAME XS] BODY…)`: as `each`, with NAME an exclusive reference to
 ;;; the element, to change it. XS names a place that can be changed.
 (defn each-mut [(binding Code) & (body Code)] (-> Code)
   (unless (and (primitive/code-vector? binding) (= (len binding) 2))
     (primitive/error "each-mut: expected (each-mut [name collection] body…)"))
-  `(let [total (Each::count ~(get binding 1))]
-     (for i (range 0 total)
-       (let [~(get binding 0) (EachMut::item-mut (mut ~(get binding 1)) i)]
-         ~@body))))
+  (if (place-form? (get binding 1))
+      `(let [total (Each::count ~(get binding 1))]
+         (for i (range 0 total)
+           (let [~(get binding 0) (EachMut::item-mut (mut ~(get binding 1)) i)]
+             ~@body)))
+      (let [xs (primitive/fresh-identifier "collection")]
+        `(let [(mut ~xs) ~(get binding 1)]
+           (each-mut [~(get binding 0) ~xs] ~@body)))))

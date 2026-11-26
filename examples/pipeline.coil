@@ -1,0 +1,103 @@
+;;; Higher-order code: generic map, filter, fold and sort over lists, given
+;;; closures, and a list of stored rules (owning closures) applied to orders.
+;;;
+;;;   coil run examples/pipeline.coil --use safe.check
+(module example.pipeline)
+(import "safe.vec" :use [Vec])
+(import "safe.str" :use [Str])
+(import "safe.fn" :use [deffn lambda lambda-own])
+(import "safe.loop" :use [for])
+
+;; ---- closure types ---------------------------------------------------------------
+
+(deffn Test [T] [(ref T)] bool)
+(deffn Turn [T U] [(ref T)] U)
+(deffn Before [T] [(ref T) (ref T)] bool)
+(deffn Step [A T] [A (ref T)] A)
+
+;; ---- generic higher-order functions ------------------------------------------
+
+(defn keep [T] [(xs (ref (Vec T))) (test (mut (Test T)))] (-> (Vec i64))
+  (let [(mut out) (Vec::new [i64])]
+    (for i (range 0 (len xs))
+      (when (Test::run (mut test) (Vec::at xs i)) (Vec::push! (mut out) i)))
+    out))
+
+(defn turn [T U] [(xs (ref (Vec T))) (f (mut (Turn T U)))] (-> (Vec U))
+  (let [(mut out) (Vec::new [U])]
+    (for (ref x) xs (Vec::push! (mut out) (Turn::run (mut f) x)))
+    out))
+
+(defn fold [A T] [(xs (ref (Vec T))) (start A) (f (mut (Step A T)))] (-> A)
+  (let [(mut acc) start]
+    (for (ref x) xs (set! acc (Step::run (mut f) acc x)))
+    acc))
+
+;;; Sort XS in place: insertion sort, by BEFORE.
+(defn sort-by! [T] [(xs (mut (Vec T))) (before (mut (Before T)))] (-> void)
+  (for i (range 1 (len xs))
+    (let [(mut j) i]
+      (while (and (> j 0) (Before::run (mut before) (Vec::at xs j) (Vec::at xs (- j 1))))
+        (Vec::swap! (mut xs) j (- j 1))
+        (set! j (- j 1))))))
+
+;; ---- orders and rules ------------------------------------------------------------
+
+(defstruct Order [(id i64) (customer Str) (cents i64) (items i64)])
+
+(defn order [(id i64) (customer (slice u8)) (cents i64) (items i64)] (-> Order)
+  (Order :id id :customer (Str::from customer) :cents cents :items items))
+
+;;; A rule changes an order's price: an owning closure, so a list can keep it.
+(deffn Rule [] [(mut Order)] void)
+
+(defn rules [(threshold i64) (vip (slice u8))] (-> (Vec Rule-own))
+  (let [(mut out) (Vec::new [Rule-own])
+        vip-name (Str::from vip)
+        off 500]
+    ;; a discount over a threshold
+    (Vec::push! (mut out)
+                (lambda-own Rule [threshold] [o]
+                  (when (> (.cents o) threshold)
+                    (set! (.cents o) (- (.cents o) (/ (.cents o) 10))))))
+    ;; a fixed amount off for one customer; the rule owns the name
+    (Vec::push! (mut out)
+                (lambda-own Rule [vip-name off] [o]
+                  (when (Str::eq? (field o customer) vip-name)
+                    (set! (.cents o) (- (.cents o) off)))))
+    ;; a fee per item, counting how often it applied
+    (let [fee 25
+          applied 0]
+      (Vec::push! (mut out)
+                  (lambda-own Rule [fee applied] [o]
+                    (set! applied (+ applied 1))
+                    (set! (.cents o) (+ (.cents o) (* fee (.items o)))))))
+    out))
+
+(defn main [] (-> i64)
+  (let [(mut orders) (Vec::new [Order])]
+    (Vec::push! (mut orders) (order 1 "ada" 12000 3))
+    (Vec::push! (mut orders) (order 2 "bob" 800 1))
+    (Vec::push! (mut orders) (order 3 "cy" 45000 9))
+    (Vec::push! (mut orders) (order 4 "ada" 3000 2))
+
+    (let [(mut all) (rules 10000 "ada")]
+      (for (mut o) orders
+        (for (mut r) all (Rule-own::run (mut r) (mut o)))))
+
+    (let [min-cents 2000
+          (mut big) (lambda (Test Order) [(ref min-cents)] [o] (>= (.cents o) min-cents))]
+      (print "orders over {}: " min-cents)
+      (for (ref i) (keep orders (mut big)) (print "{} " (.id (Vec::at orders i))))
+      (println ""))
+
+    (let [(mut cents-of) (lambda (Turn Order i64) [] [o] (.cents o))
+          cents (turn orders (mut cents-of))
+          (mut sum) (lambda (Step i64 i64) [] [acc c] (+ acc c))]
+      (println "total cents: {}" (fold cents 0 (mut sum))))
+
+    (let [(mut by-cents) (lambda (Before Order) [] [a b] (< (.cents a) (.cents b)))]
+      (sort-by! (mut orders) (mut by-cents)))
+    (for (ref o) orders
+      (println "#{} {} {}" (.id o) (.customer o) (.cents o))))
+  0)

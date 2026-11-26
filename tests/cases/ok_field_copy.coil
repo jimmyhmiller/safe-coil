@@ -1,0 +1,12 @@
+;;; A let copies a field of plain data, so what it read from is free again.
+(module ok_field_copy)
+(import "safe.pool" :use [Pool Handle])
+(defstruct Node [(next (Handle Node)) (value i64)])
+(defn main [] (-> i64)
+  (let [(mut p) (Pool::new [Node])
+        a (Pool::insert! (mut p) (Node :next (Handle :slot -1 :generation 0) :value 1))
+        b (Pool::insert! (mut p) (Node :next a :value 2))
+        next (.next (Pool::at p b))]
+    (Pool::remove! (mut p) b)
+    (println "{}" (.value (Pool::at p next))))
+  0)

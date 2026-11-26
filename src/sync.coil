@@ -57,6 +57,10 @@
   (get [(a (ref (Arc T)))] (-> (ref T))
     (unsafe (lend (field (.held a) value)))))
 
+;;; `(clone a)`: another holder of the same value.
+(impl [T] Clone (Arc T)
+  (clone [(a (ref (Arc T)))] (-> (Arc T)) (Arc::clone a)))
+
 (impl [T] Drop (Arc T)
   (drop [(self (mut (Arc T)))] (-> void)
     (unsafe

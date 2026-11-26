@@ -1,0 +1,30 @@
+;;; The safe collections clone, element by element, and derive Clone works on a
+;;; type built from them.
+(module ok_clone)
+(import "safe.vec" :use [Vec])
+(import "safe.str" :use [Str])
+(import "safe.box" :use [Box])
+(import "safe.map" :use [Map])
+(defsum Tree (Leaf [(label Str)]) (Node [(kids (Vec Tree))]) (Boxed [(inner (Box Tree))]))
+(derive Clone Tree)
+(defn size [(t (ref Tree))] (-> i64)
+  (match t
+    (Leaf [_] 1)
+    (Node [kids] (let [(mut n) 1] (for (ref k) kids (set! n (+ n (size k)))) n))
+    (Boxed [inner] (+ 1 (size (Box::get inner))))))
+(defn main [] (-> i64)
+  (let [(mut kids) (Vec::new [Tree])]
+    (Vec::push! (mut kids) (Leaf (Str::from "a")))
+    (Vec::push! (mut kids) (Boxed (Box::new (Leaf (Str::from "b")))))
+    (let [t (Node kids)
+          (mut u) (clone t)]
+      (match u
+        (Node [ks] (Vec::push! (mut ks) (Leaf (Str::from "c"))))
+        (_ 0))
+      (println "{} {}" (size t) (size u))))
+  (let [(mut m) (Map::new [Str i64])]
+    (Map::insert! (mut m) (Str::from "k") 1)
+    (let [(mut n) (clone m)]
+      (Map::insert! (mut n) (Str::from "j") 2)
+      (println "{} {}" (Map::len m) (Map::len n))))
+  0)

@@ -43,13 +43,21 @@ adds the rest of the model:
   exclusive slice), which keeps its loans until its scope ends because its
   drop may use what it borrowed.
 - **Arguments.** Each argument's loans are alive while the later ones are
-  evaluated, so `(f (mut p) p)` is refused. Plain data passed by value is read
+  evaluated. One lent exclusively is only reserved meanwhile (two-phase
+  borrows): the later arguments may read what it lends, so `(set! (mut v) i (+
+  (get v i) 1))` and `(Vec::push! (mut v) (len v))` are fine, and may not change
+  or move it; when the call begins, no other argument may still hold a loan on
+  it, so `(f (mut p) (borrow p))` is refused. Plain data passed by value is read
   where it lies for the length of the call, so it counts as lent shared.
 - **No escape.** A reference cannot leave the scope of the local it refers to: not
   as the value of a `let`, a `block`, a `break` or a function, and not as a
   reference to a temporary.
 - **Results.** A reference a call returns borrows from every argument the call
-  took by reference.
+  took by reference, unless the function says which with `:safe/borrows`:
+  `(defn lookup :safe/borrows "doc" [(doc (ref Json)) (path (ref (Vec Str)))]
+  (-> (Maybe Json)) …)` borrows from `doc` alone, so the path can be a temporary.
+  The body is held to it: it may give back nothing the other parameters were
+  lent. `Map::at` borrows from the map, not the key.
 - **Temporaries.** Coil keeps a temporary that owns something until the
   statement it was made in ends, and a `let` bound to a reference keeps the
   temporaries of its initializer for as long as the `let` runs. So
@@ -61,8 +69,14 @@ adds the rest of the model:
   initializer's temporaries. A temporary of plain data lives as long as the
   function's frame.
 - **Match.** A `match` on a name lends the parts of the payload that own something
-  to the arm, where they lie. The matched place stays lent to those names, so the
-  variant cannot be replaced under them. `(match (move x) …)` consumes x instead.
+  to the arm, where they lie. The matched place stays lent to those names while
+  they are used, so the variant cannot be replaced under them; an arm whose
+  names are not used again may move what it matched, as `(match o (Some [_] o)
+  (None [] …))` does. `(match (move x) …)` consumes x instead.
+- **Names.** A later use is a use of the same binding: a `let` or an arm that
+  binds the name again starts another, and the one outside is no longer used
+  inside it. A `let` copies plain data, a number or a struct of plain data, so
+  `(let [next (.next (Pool::at p h))] …)` holds no loan on `p`.
 - **Views.** A struct marked `(impl View TYPE)` stands for the references it was
   made from, as a held lock or a slice of a list does. A call that returns one
   keeps what it took by reference lent for as long as the view lives. A view is
@@ -89,7 +103,9 @@ adds the rest of the model:
   lent exclusively wherever it is used, never stored or passed for a type
   parameter. A trait's method that takes what it works on as `(ptr Self)` is
   checked as though that were an exclusive reference, with no `unsafe`, so a raw
-  pointer is given to one only inside `unsafe`.
+  pointer is given to one only inside `unsafe`, and its fields are places behind
+  that reference. One a call gives back keeps what the call took lent: `(Own::get-mut
+  (mut s))` keeps `s`. An owned trait object is `safe.own`'s `(Own (dyn Trait))`.
 - **Loads.** `(primitive/load …)` of an owner makes a second owner of the same
   thing, so safe code does not load one: it names a variable to move it, or
   takes it out of a place with `replace!`.
@@ -101,9 +117,14 @@ adds the rest of the model:
   call of an `extern`, a call through a function pointer or a trait object.
 - **Library code.** A function of the standard library is called freely unless it
   takes raw memory, which includes slices, arrays and anything holding a pointer
-  (so `ArrayList` and `HashMap`). Those calls need `unsafe`. The code `print`,
-  `println`, `panic`, `unreachable` and `assert` expand to is trusted; raw memory
-  the program made must not be handed to it.
+  (so `ArrayList` and `HashMap`). Those calls need `unsafe`. Safe code meets a
+  slice only as a string literal, or a parameter given one, which lives as long
+  as the program and never changes: it reads one through `size`, `nth` and `(for
+  (ref x) s …)`, which check every index (Coil's own `get` does only under
+  `--debug-checks`). A method of a trait declared in checked code is checked
+  code wherever it is implemented, since Coil's own modules cannot name such a
+  trait. The code `print`, `println`, `panic`, `unreachable` and `assert` expand
+  to is trusted; raw memory the program made must not be handed to it.
 - **Anything else is refused.** A form the rules do not cover (`defer`, a
   destructuring `let`, an array literal, a primitive not listed as safe) is an
   error outside `unsafe`.
@@ -115,20 +136,25 @@ operations are allowed.
 
 | Module | What it gives |
 |---|---|
-| `safe.core` | `unsafe`; `borrow` and `borrow-mut`, a reference as a value; `replace!`, which swaps an owner out of a place; `move`; `each` and `each-mut`, a loop over a list, a slice or a string; the traits `View` and `QuietDrop` |
+| `safe.core` | `unsafe`; `borrow` and `borrow-mut`, a reference as a value; `replace!`, which swaps an owner out of a place; `move`; `each` and `each-mut`, a loop over a list, a slice or a string; `size` and `nth`, a `(slice T)` read with every index checked; the traits `View` and `QuietDrop`; the annotation `:safe/borrows` |
 | `safe.loop` | `(for (ref x) xs …)` and `(for (mut x) xs …)` over a safe collection, each element by reference; any other `for` is Coil's |
 | `safe.fn` | `(deffn NAME [T…] [PARAM-TYPE…] RESULT)` declares a closure type; `(lambda NAME [(ref x) (mut y) (z (ref PLACE))…] [params…] body…)` makes one that borrows what it captures, `(lambda-own NAME [x (y VALUE)…] [params…] body…)` one of `NAME-own` that owns them; `(NAME::run (mut f) args…)` calls either; `(NAME-own::call-once f args…)` calls one and frees it, so `(spawn (NAME-own::call-once f))` runs it on a thread |
 | `safe.view` | `(defview NAME [T…] [(field TYPE)…])`, a view whose fields may be references or views: `NAME::new`, `NAME::field`, `NAME::field-mut`. `(defsubscript NAME [T…] [params…] (-> (ref R) or (mut R)) before… (yield PLACE) after…)`: `NAME::open` runs `before` and gives a view of `PLACE`, read with `NAME::get` and `NAME::get-mut`; `after` runs when the view is dropped |
 | `safe.box` | `(Box T)`, an owner of one heap value: `Box::new`, `get`, `get-mut`, `into` |
-| `safe.pool` | `(Pool T)`, a collection that owns its elements, and `(Handle T)`, plain data checked when it is used: `insert!`, `remove!`, `at`, `at-mut` |
+| `safe.own` | `(own Trait value)` makes an `(Own (dyn Trait))`, an owned trait object: a value of any type that implements the trait, on the heap, dropped as its own type drops. `(Own::get-mut (mut o))` lends the `(dyn Trait)` |
+| `safe.maybe` | `(Maybe T)` and `(MaybeMut T)`: a reference or nothing, for a lookup's result (Coil keeps references out of `Option`). `Maybe::found`, `Maybe::nothing`, `found?`, `get`; `(if-found [x m] then else)`, `when-found`, `if-found-mut`. It is a view: it keeps what it was found in lent |
+| `safe.pool` | `(Pool T)`, a collection that owns its elements, and `(Handle T)`, plain data checked when it is used: `insert!`, `remove!`, `at`, `at-mut`, `live?`, `len`, `handles` |
 | `safe.global` | `defglobal`, `with-ref`, `with-mut`: a global lent for a scope, with exclusivity checked when the scope is entered |
-| `safe.vec` | `(Vec T)`, a growable list that owns its elements: `push!`, `pop!`, `len`, `at`, `at-mut`. `(Vec::slice v from to)` is a `(Slice T)`, part of the list lent shared: `len`, `at`, `part`. `(Vec::slice-mut (mut v) from to)` is a `(SliceMut T)`, part of it lent exclusively: `len`, `at`, `at-mut`, `part`, `part-mut`. An index out of range stops the program |
+| `safe.vec` | `(Vec T)`, a growable list that owns its elements: `push!`, `pop!`, `at`, `at-mut`, `swap!`, `insert!`, `remove!`, `clear!`; `(len v)`, `(get v i)` (a copy, for plain data) and `(set! (mut v) i x)` as for Coil's own collections. `(Vec::slice v from to)` is a `(Slice T)`, part of the list lent shared: `len`, `at`, `part`. `(Vec::slice-mut (mut v) from to)` is a `(SliceMut T)`, part of it lent exclusively: `len`, `at`, `at-mut`, `part`, `part-mut`. An index out of range stops the program |
 | `safe.str` | `Str`, text that owns its bytes: `Str::from "…"`, `len`, `byte`, `push!`, `push-text!`, `push-int!`, `append!`, `eq?`, `copy`; `Str::slice` is a `(Slice u8)` of its bytes, with `from-slice` and `push-slice!` to copy one. It prints with `{}` |
 | `safe.map` | `(Map K V)`, a hash table that owns its keys and values; K needs `Hash` and `Eq`: `insert!`, `remove!`, `has?`, `at`, `at-mut`, `len`; `(each-entry [key value table] …)` walks it, as `first`/`next`/`key-at`/`value-at` do by hand |
 | `safe.par` | `(par (f a…) (g b…))`: two calls at once, on two threads |
 | `safe.thread` | `(spawn (f a…))` starts a thread and gives a `(Task R)`: `Task::join`, `Task::detach`. `(spawn-do (f a…))` starts a function that returns nothing and gives a `(Task Done)` |
 | `safe.sync` | `(Arc T)`, an owner with many holders; `(Mutex T)` and `with-lock`; `(RwLock T)`, read by many or written by one: `read`, `write`; `Condvar`: `Guard::wait`, `notify-one`, `notify-all`; `(Channel T)`, a queue between threads: `send!`, `recv`, `close!`, `clone` |
 | `safe.local` | `(deflocal NAME TYPE INIT)`, a value each thread has its own of; `with-local` and `with-local-ref` lend this thread's |
+
+`Vec`, `Str`, `Box`, `Map` and `Arc` implement `Clone` (element by element, or for
+`Arc` another holder), so `(derive Clone T)` works on a type built from them.
 
 A stale handle, an index out of range, a key a `Map` does not hold, a lock asked
 for by the thread that holds it, and a global or a thread-local entered while it
@@ -202,8 +228,40 @@ fill a place that holds nothing, such as a variable made with `(uninit [T])`.
 The compiler tracks which parts are gone (see the Coil language guide); the
 checker's loans work on the same places.
 
-`examples/calc.coil` is Coil's calculator example (a lexer, a recursive-descent
-parser into a boxed tree, an evaluator) in safe Coil, with no `unsafe` in it.
+An owner, or a part of one, may be moved on some ways through an `if`, a
+`match` or a loop's exits and not on others: after they meet it counts as moved,
+and on the ways that kept it Coil still drops it, at the end of its scope or when
+`set!` replaces it, by a flag set at run time (Rust's drop flags).
+
+### Owned trait objects
+
+```coil
+(deftrait Shape [Self] (area [(self (ptr Self))] (-> i64)))
+(let [(mut shapes) (Vec::new [(Own (dyn Shape))])]
+  (Vec::push! (mut shapes) (own Shape (Square :side 3)))
+  (Vec::push! (mut shapes) (own Shape (Rect :w 2 :h 5)))
+  (for (mut s) shapes (println "{}" (area (Own::get-mut (mut s))))))
+```
+
+An `Own` keeps no `(dyn Trait)` in it: `get-mut` makes one each time, lent
+exclusively from the `Own`, so the `Own` is not moved, dropped or used again while
+it is in use.
+
+## Programs
+
+`examples/` holds programs written in safe Coil, none with `unsafe` in it. Each runs
+clean under `--sanitize=address`:
+
+| Program | What it uses |
+|---|---|
+| `calc.coil` | Coil's calculator example: a lexer, a recursive-descent parser into a boxed tree, an evaluator |
+| `lisp.coil` | a Lisp: a reader, closures over shared environments (`Arc`, `Mutex`, `Map`), errors as results |
+| `json.coil` | a JSON parser, printer and path query: a recursive sum of `Vec`s and `Map`s, `Maybe`, `:safe/borrows` |
+| `graph.coil` | a generic binary heap, Dijkstra, a topological order, union-find: generics with trait bounds, two-phase borrows |
+| `shapes.coil` | a scene of owned trait objects, one a group of others |
+| `pipeline.coil` | generic `map`, `filter`, `fold` and sort taking closures; a list of stored rules, each an owning closure |
+| `sim.coil` | rabbits and foxes in a `Pool`: entities naming each other by handle, removed while others hold handles |
+| `wordcount.coil` | words counted on four threads into a shared table, through a channel |
 
 ### par
 
@@ -413,9 +471,10 @@ These are sound and simple. The model should be relaxed first, then the checker.
 
 ## What is left out
 
-- Coil's own slices and arrays as safe types. They are raw memory to the
-  checker, so the library's `ArrayList` and `HashMap` need `unsafe`; `Vec`,
-  `Slice`, `SliceMut`, `Map` and `Str` are the safe ones.
+- Coil's own arrays, and slices other than read: an array literal needs
+  `unsafe`, and so do `ArrayList` and `HashMap`; `Vec`, `Slice`, `SliceMut`, `Map`
+  and `Str` are the safe collections. A `(slice T)` is read with `size`, `nth`
+  and `for`.
 - Coil's `for` over a `Vec` or a `Map`. Its iterator protocol hands each element
   out as a value of a type parameter, which a reference can never be; `each`,
   `each-mut` and `each-entry` are the loops.

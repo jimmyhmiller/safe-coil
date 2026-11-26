@@ -62,7 +62,11 @@
 
 ;;; `(deffn NAME [T…] [PARAM-TYPE…] RESULT)`, or `(deffn NAME [PARAM-TYPE…] RESULT)`.
 (defn deffn [(name Code) (a Code) (b Code) & (rest Code)] (-> Code)
-  (let [generic (> (len rest) 0)
+  (let [; `(deffn NAME [] [PARAM…] RESULT)` names no type parameter either
+        empty-tps (and (> (len rest) 0) (= (len a) 0))
+        a (if empty-tps b a)
+        b (if empty-tps (get rest 0) b)
+        generic (and (> (len rest) 0) (not empty-tps))
         tps (if generic a `[])
         params (if generic b a)
         result (if generic (get rest 0) b)

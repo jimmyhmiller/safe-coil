@@ -196,6 +196,14 @@
     (set! (Vec::at-mut (mut v) i) x)
     0))
 
+;;; `(clone v)`: a new list of the elements' clones.
+(impl [(T Clone)] Clone (Vec T)
+  (clone [(v (ref (Vec T)))] (-> (Vec T))
+    (let [(mut out) (Vec::new [T])]
+      (for i (range 0 (Vec::len v))
+        (Vec::push! (mut out) (clone (Vec::at v i))))
+      out)))
+
 (impl [T] Each (Vec T)
   (count [(xs (ref (Vec T)))] (-> i64) (Vec::len xs))
   (item [(xs (ref (Vec T))) (i i64)] (-> (ref T)) (Vec::at xs i)))

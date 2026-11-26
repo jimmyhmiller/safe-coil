@@ -3,6 +3,7 @@
 (export Pool Handle)
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc)
+(import "safe.vec" :use [Vec])
 (import "safe.core" :use [unsafe lend lend-mut])
 
 ;;; The name of one element of a `(Pool T)`. A handle is plain data: it can be
@@ -70,6 +71,31 @@
         (store! (field slot full) false)
         (store! (field slot generation) (+ (load (field slot generation)) 1))
         value)))
+
+  ;;; Does H still name an element of the pool: one not removed?
+  (live? [(pool (ref (Pool T))) (h (Handle T))] (-> bool)
+    (unsafe
+      (and (>= (.slot h) 0) (< (.slot h) (.used pool))
+           (let [slot (slot-at (.slots pool) (.slot h))]
+             (and (load (field slot full)) (= (load (field slot generation)) (.generation h)))))))
+
+  ;;; How many elements the pool holds.
+  (len [(pool (ref (Pool T)))] (-> i64)
+    (unsafe
+      (let [(mut n) 0]
+        (for i (range 0 (.used pool))
+          (when (load (field (slot-at (.slots pool) i) full)) (set! n (+ n 1))))
+        n)))
+
+  ;;; A handle to every element, in the order of their slots.
+  (handles [(pool (ref (Pool T)))] (-> (Vec (Handle T)))
+    (unsafe
+      (let [(mut out) (Vec::new [(Handle T)])]
+        (for i (range 0 (.used pool))
+          (let [slot (slot-at (.slots pool) i)]
+            (when (load (field slot full))
+              (Vec::push! (mut out) (Handle :slot i :generation (load (field slot generation)))))))
+        out)))
 
   ;;; The element H names, lent for as long as the pool is.
   (at [(pool (ref (Pool T))) (h (Handle T))] (-> (ref T))
