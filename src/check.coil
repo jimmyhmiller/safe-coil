@@ -707,11 +707,21 @@
 
 ;;; CHILD is handed to trusted code, PARENT. Raw memory the program made must
 ;;; not reach it outside `unsafe`: the trusted code will follow it.
+;;; Is T a slice of plain data: what safe code meets only as a string literal or
+;;; a parameter given one, memory that lives as long as the program and is never
+;;; changed, so trusted code may read it?
+(defn static-slice? [(cx (ref Cx)) (t Code)] (-> bool)
+  (let [s (pointee t)]
+    (and (head-is? s `slice)
+         (copy-type? cx (get s 1) 0)
+         (not (raw-in? cx (get s 1) 0 true)))))
+
 (defn guard-raw-flow! [(cx (ref Cx)) (parent Code) (child Code)] (-> i64)
   (if (and (trusted? parent)
            (not (.unsafe cx))
            (not (primitive/code-macro? child))
            (not (literal? child))
+           (not (static-slice? cx (type-of child)))
            (raw-carrying? cx (type-of child) 0))
       (fail! child "safe: raw memory is handed to library code; that is allowed only inside (unsafe …)")
       0))

@@ -121,7 +121,8 @@ adds the rest of the model:
   slice only as a string literal, or a parameter given one, which lives as long
   as the program and never changes: it reads one through `size`, `nth` and `(for
   (ref x) s …)`, which check every index (Coil's own `get` does only under
-  `--debug-checks`). A method of a trait declared in checked code is checked
+  `--debug-checks`), and prints it. Safe code cannot free one, so none it holds
+  goes stale. A method of a trait declared in checked code is checked
   code wherever it is implemented, since Coil's own modules cannot name such a
   trait. The code `print`, `println`, `panic`, `unreachable` and `assert` expand
   to is trusted; raw memory the program made must not be handed to it.
@@ -146,7 +147,7 @@ operations are allowed.
 | `safe.pool` | `(Pool T)`, a collection that owns its elements, and `(Handle T)`, plain data checked when it is used: `insert!`, `remove!`, `at`, `at-mut`, `live?`, `len`, `handles` |
 | `safe.global` | `defglobal`, `with-ref`, `with-mut`: a global lent for a scope, with exclusivity checked when the scope is entered |
 | `safe.vec` | `(Vec T)`, a growable list that owns its elements: `push!`, `pop!`, `at`, `at-mut`, `swap!`, `insert!`, `remove!`, `clear!`; `(len v)`, `(get v i)` (a copy, for plain data) and `(set! (mut v) i x)` as for Coil's own collections. `(Vec::slice v from to)` is a `(Slice T)`, part of the list lent shared: `len`, `at`, `part`. `(Vec::slice-mut (mut v) from to)` is a `(SliceMut T)`, part of it lent exclusively: `len`, `at`, `at-mut`, `part`, `part-mut`. An index out of range stops the program |
-| `safe.str` | `Str`, text that owns its bytes: `Str::from "…"`, `len`, `byte`, `push!`, `push-text!`, `push-int!`, `append!`, `eq?`, `copy`; `Str::slice` is a `(Slice u8)` of its bytes, with `from-slice` and `push-slice!` to copy one. It prints with `{}` |
+| `safe.str` | `Str`, text that owns its bytes: `Str::from "…"`, `len`, `byte`, `push!`, `push-text!`, `push-int!`, `append!`, `eq?`, `copy`; `Str::slice` is a `(Slice u8)` of its bytes, with `from-slice` and `push-slice!` to copy one. It prints with `{}`. `(str-of "x={} y={}" x y)` is a new `Str` formatted as `println` formats, and `(str-push! (mut s) "…" args…)` adds to one |
 | `safe.map` | `(Map K V)`, a hash table that owns its keys and values; K needs `Hash` and `Eq`: `insert!`, `remove!`, `has?`, `at`, `at-mut`, `len`; `(each-entry [key value table] …)` walks it, as `first`/`next`/`key-at`/`value-at` do by hand |
 | `safe.par` | `(par (f a…) (g b…))`: two calls at once, on two threads |
 | `safe.thread` | `(spawn (f a…))` starts a thread and gives a `(Task R)`: `Task::join`, `Task::detach`. `(spawn-do (f a…))` starts a function that returns nothing and gives a `(Task Done)` |

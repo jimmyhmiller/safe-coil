@@ -6,7 +6,7 @@
 ;;;   coil run examples/sim.coil --use safe.check
 (module example.sim)
 (import "safe.vec" :use [Vec])
-(import "safe.str" :use [Str])
+(import "safe.str" :use [Str str-of])
 (import "safe.pool" :use [Pool Handle])
 (import "safe.loop" :use [for])
 
@@ -31,8 +31,7 @@
 
 (defn spawn! [(w (mut World)) (kind Kind) (x i64) (y i64)] (-> (Handle Creature))
   (set! (.born w) (+ (.born w) 1))
-  (let [(mut name) (Str::from (match kind (Rabbit [] "rabbit-") (Fox [] "fox-")))]
-    (Str::push-int! (mut name) (.born w))
+  (let [name (str-of "{}-{}" (match kind (Rabbit [] "rabbit") (Fox [] "fox")) (.born w))]
     (Pool::insert! (mut (field w creatures))
                    (Creature :kind kind :name name :x x :y y :energy (match kind (Rabbit [] 6) (Fox [] 16))
                              :target (Handle :slot -1 :generation 0) :hunting false
@@ -85,9 +84,7 @@
       (let [fox (Pool::at (field w creatures) h)]
         (when (and (= (.x fox) px) (= (.y fox) py))
           (let [eaten (Pool::remove! (mut (field w creatures)) prey)
-                (mut line) (Str::copy (field (Pool::at (field w creatures) h) name))]
-            (Str::push-text! (mut line) " eats ")
-            (Str::append! (mut line) (field eaten name))
+                line (str-of "{} eats {}" (.name (Pool::at (field w creatures) h)) (.name eaten))]
             (note! (mut w) line)
             (let [fox (Pool::at-mut (mut (field w creatures)) h)]
               (set! (.energy fox) (+ (.energy fox) 5))
@@ -111,8 +108,7 @@
             y (.y r)]
         (set! (.energy r) (- (.energy r) 3))
         (let [kid (spawn! (mut w) (Rabbit) x y)
-              (mut line) (Str::copy (field (Pool::at (field w creatures) kid) name))]
-          (Str::push-text! (mut line) " is born")
+              line (str-of "{} is born" (.name (Pool::at (field w creatures) kid)))]
           (note! (mut w) line))))))
 
 (defn tick! [(w (mut World))] (-> void)
@@ -125,8 +121,7 @@
   (for (ref h) (Pool::handles (field w creatures))
     (when (<= (.energy (Pool::at (field w creatures) h)) 0)
       (let [dead (Pool::remove! (mut (field w creatures)) h)
-            (mut line) (Str::copy (field dead name))]
-        (Str::push-text! (mut line) " starves")
+            line (str-of "{} starves" (.name dead))]
         (note! (mut w) line)))))
 
 (defn count-kind [(w (ref World)) (foxes bool)] (-> i64)

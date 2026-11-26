@@ -6,6 +6,7 @@
   (let [(mut n) 0]
     (for (ref c) text
       (when (or (= c #\a) (= c #\e) (= c #\i) (= c #\o) (= c #\u)) (set! n (+ n 1))))
+    (println "{} has {}" text n)
     n))
 (defn main [] (-> i64)
   (println "{} {} {}" (size "hello") (nth "hello" 1) (vowels "a quiet afternoon"))

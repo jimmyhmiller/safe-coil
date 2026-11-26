@@ -4,7 +4,7 @@
 (module example.json)
 (import "safe.box" :use [Box])
 (import "safe.vec" :use [Vec])
-(import "safe.str" :use [Str])
+(import "safe.str" :use [Str str-of])
 (import "safe.map" :use [Map each-entry])
 (import "safe.core" :use [replace! size nth])
 (import "safe.loop" :use [for])
@@ -36,10 +36,7 @@
     (bump! (mut p))))
 
 (defn fail [(p (ref Parser)) (what (slice u8))] (-> Str)
-  (let [(mut msg) (Str::from what)]
-    (Str::push-text! (mut msg) " at ")
-    (Str::push-int! (mut msg) (.pos p))
-    msg))
+  (str-of "{} at {}" what (.pos p)))
 
 (defn expect! [(p (mut Parser)) (c i64)] (-> (Result i64 Str))
   (skip-ws! (mut p))

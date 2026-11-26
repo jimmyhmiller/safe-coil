@@ -1,9 +1,10 @@
 ;;; Text that owns its bytes.
 (module safe.str)
-(export Str)
+(export Str str-of str-push! writer-for)
 (import "coil.primitive" :as primitive)
 (import "coil.fmt" :use [Display Formatter display-fmt])
-(import "safe.core" :use [unsafe Each])
+(import "safe.core" :use [unsafe Each lend-mut])
+(import "coil.io" :as io)
 (import "safe.vec" :use [Vec Slice])
 
 ;;; A string of bytes, UTF-8 by convention. It owns them: they are freed with it.
@@ -110,3 +111,38 @@
   (display-fmt [(s (ref Str)) (f (ptr Formatter))] (-> i64)
     (unsafe
       (display-fmt (slice::new [u8] (data (.items (.bytes s))) (Str::len s)) f))))
+
+;;; ---- formatted text ----------------------------------------------------------------
+;;;
+;;; `(str-of "x={} y={}" x y)` is a new Str, formatted as `println` formats;
+;;; `(str-push! (mut s) "…" args…)` adds the text to S. The arguments are lent, as
+;;; `println` lends them.
+
+;;; Add the N bytes at BUF to the Str CTX: a Writer's write.
+(defn write-into [(ctx (ptr i8)) (buf (ptr i8)) (n i64)] (-> (Result i64 io/IoError))
+  (unsafe
+    (let [s (lend-mut [Str] (primitive/cast (ptr Str) ctx))
+          bytes (primitive/cast (ptr u8) buf)]
+      (for i (range 0 n)
+        (Str::push! (mut s) (load (primitive/index bytes i))))
+      (Ok n))))
+
+;;; A Writer that adds what is written to S. Only the formatting macros use it,
+;;; for as long as one statement.
+(defn writer-for [(s (mut Str))] (-> io/Writer)
+  (unsafe
+    (io/Writer :write-fn (primitive/fnptr-of write-into)
+               :ctx (primitive/cast (ptr i8) (primitive/cast (ptr Str) (mut s))))))
+
+(defn str-push! [(s Code) (format Code) & (args Code)] (-> Code)
+  (let [target (if (and (primitive/code-list? s) (= (len s) 2)) (get s 1) s)
+        w (primitive/fresh-identifier "writer")]
+    `(let [(mut ~w) (writer-for (mut ~target))]
+       (fmt (mut ~w) ~format ~@args)
+       0)))
+
+(defn str-of [(format Code) & (args Code)] (-> Code)
+  (let [out (primitive/fresh-identifier "text")]
+    `(let [(mut ~out) (Str::new)]
+       (str-push! (mut ~out) ~format ~@args)
+       ~out)))

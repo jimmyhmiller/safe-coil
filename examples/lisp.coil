@@ -5,7 +5,7 @@
 (import "coil.primitive" :as primitive)
 (import "safe.box" :use [Box])
 (import "safe.vec" :use [Vec])
-(import "safe.str" :use [Str])
+(import "safe.str" :use [Str str-of])
 (import "safe.map" :use [Map])
 (import "safe.sync" :use [Arc Mutex with-lock])
 
@@ -132,9 +132,7 @@
     (Sym [name]
          (match (env-lookup (Arc::get env) name)
            (Some [x] (Ok x))
-           (None [] (let [(mut msg) (Str::from "unbound: ")]
-                      (Str::append! (mut msg) name)
-                      (Err msg)))))
+           (None [] (Err (str-of "unbound: {}" name)))))
     (List [items]
           (if (= (Vec::len items) 0)
               (Ok (Nil))
