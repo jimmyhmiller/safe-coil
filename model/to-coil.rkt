@@ -365,6 +365,9 @@
      (format "(~a~a)" (constructor (type-name (car σ)) (cdr σ))
              (string-append* (for/list ([f fields] [e1 es]) (format " :~a ~a" (car f) (plain Σ Γ e1)))))]
     [`(inj ,σ ,K ,e1)
+     ;; a payload of another type than the variant's: the rules refuse the program
+     (unless (equal? (type-of Σ Γ e1) (variant-type Σ σ K))
+       (bail "an ill-typed program"))
      (format "(~a ~a)" (constructor (variant-name K) (cdr σ)) (plain Σ Γ e1))]
     [`(match ,e1 ,arms ...)
      (define τ1 (type-of Σ Γ e1))

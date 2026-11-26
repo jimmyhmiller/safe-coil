@@ -1,0 +1,116 @@
+;;; A least-recently-used cache: a doubly linked list of entries, most recent
+;;; first, kept in a Pool and linked by handle, and a Map from each key to its
+;;; entry. Safe Coil throughout.
+;;;
+;;;   coil run examples/lru.coil --use safe.check
+(module example.lru)
+(import "coil.primitive" :as primitive)
+(import "safe.str" :use [Str str-of])
+(import "safe.map" :use [Map])
+(import "safe.pool" :use [Pool Handle])
+(import "safe.maybe" :use [Maybe if-found])
+
+(defstruct Entry [(key Str) (value i64)
+                  (prev (Handle Entry)) (next (Handle Entry)) (has-prev bool) (has-next bool)])
+
+(defstruct Lru [(entries (Pool Entry)) (index (Map Str (Handle Entry)))
+                (head (Handle Entry)) (tail (Handle Entry)) (empty bool) (room i64)])
+
+(defn none [] (-> (Handle Entry)) (Handle :slot -1 :generation 0))
+
+(defn lru [(room i64)] (-> Lru)
+  (Lru :entries (Pool::new [Entry]) :index (Map::new [Str (Handle Entry)])
+       :head (none) :tail (none) :empty true :room room))
+
+;;; Take the entry H out of the list, leaving it in the pool.
+(defn unlink! [(c (mut Lru)) (h (Handle Entry))] (-> void)
+  (let [e (Pool::at (field c entries) h)
+        prev (.prev e) next (.next e) has-prev (.has-prev e) has-next (.has-next e)]
+    (if has-prev
+        (let [p (Pool::at-mut (mut (field c entries)) prev)]
+          (set! (.next p) next)
+          (set! (.has-next p) has-next))
+        (set! (.head c) next))
+    (if has-next
+        (let [n (Pool::at-mut (mut (field c entries)) next)]
+          (set! (.prev n) prev)
+          (set! (.has-prev n) has-prev))
+        (set! (.tail c) prev))
+    (when (and (not has-prev) (not has-next)) (set! (.empty c) true))))
+
+;;; Put the entry H at the front of the list.
+(defn push-front! [(c (mut Lru)) (h (Handle Entry))] (-> void)
+  (let [old (.head c)
+        was-empty (.empty c)]
+    (let [e (Pool::at-mut (mut (field c entries)) h)]
+      (set! (.has-prev e) false)
+      (set! (.next e) old)
+      (set! (.has-next e) (not was-empty)))
+    (if was-empty
+        (set! (.tail c) h)
+        (let [o (Pool::at-mut (mut (field c entries)) old)]
+          (set! (.prev o) h)
+          (set! (.has-prev o) true)))
+    (set! (.head c) h)
+    (set! (.empty c) false)))
+
+;;; The value KEY maps to, now the most recent, or nothing. What it finds is
+;;; lent from the cache, which stays lent while it is used.
+(defn get! :safe/borrows "c" [(c (mut Lru)) (key (ref Str))] (-> (Maybe i64))
+  (if (Map::has? (field c index) key)
+      (let [h (get-handle (field c index) key)]
+        (unlink! (mut c) h)
+        (push-front! (mut c) h)
+        (Maybe::found (field (Pool::at (field c entries) h) value)))
+      (Maybe::nothing)))
+
+(defn get-handle [(index (ref (Map Str (Handle Entry)))) (key (ref Str))] (-> (Handle Entry))
+  (primitive/load (Map::at index key)))
+
+;;; Map KEY to VALUE, as the most recent; the least recent goes when full.
+(defn put! [(c (mut Lru)) (key Str) (value i64)] (-> void)
+  (if (Map::has? (field c index) key)
+      (let [h (get-handle (field c index) key)]
+        (set! (.value (Pool::at-mut (mut (field c entries)) h)) value)
+        (unlink! (mut c) h)
+        (push-front! (mut c) h))
+      (do
+        (when (= (Pool::len (field c entries)) (.room c))
+          (let [last (.tail c)]
+            (unlink! (mut c) last)
+            (let [gone (Pool::remove! (mut (field c entries)) last)]
+              (println "  evict {}" (.key gone))
+              (Map::remove! (mut (field c index)) (field gone key)))))
+        (let [h (Pool::insert! (mut (field c entries))
+                               (Entry :key (Str::copy key) :value value :prev (none) :next (none)
+                                      :has-prev false :has-next false))]
+          (Map::insert! (mut (field c index)) key h)
+          (push-front! (mut c) h)))))
+
+(defn order [(c (ref Lru))] (-> Str)
+  (let [(mut out) (Str::new)
+        (mut at) (.head c)
+        (mut more) (not (.empty c))]
+    (while more
+      (let [e (Pool::at (field c entries) at)]
+        (Str::append! (mut out) (field e key))
+        (Str::push-text! (mut out) " ")
+        (set! more (.has-next e))
+        (set! at (.next e))))
+    out))
+
+(defn main [] (-> i64)
+  (let [(mut c) (lru 3)]
+    (put! (mut c) (Str::from "a") 1)
+    (put! (mut c) (Str::from "b") 2)
+    (put! (mut c) (Str::from "c") 3)
+    (println "{}" (order c))
+    (if-found [v (get! (mut c) (Str::from "a"))] (println "a = {}" (primitive/load v)) (println "a missing"))
+    (println "{}" (order c))
+    (put! (mut c) (Str::from "d") 4)
+    (println "{}" (order c))
+    (if-found [v (get! (mut c) (Str::from "b"))] (println "b = {}" (primitive/load v)) (println "b missing"))
+    (put! (mut c) (Str::from "c") 30)
+    (put! (mut c) (Str::from "e") 5)
+    (println "{}" (order c)))
+  0)

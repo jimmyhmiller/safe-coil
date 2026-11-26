@@ -13,9 +13,13 @@
 ;; `reborrow`: refused only because an exclusive reference is used after it was
 ;; moved. Coil never moves one: naming it lends what it refers to again, and the
 ;; checker holds that loan. The checker may accept such a program.
+;; `closure-kind`: refused only because a closure that captured exclusively is
+;; given where one that captured shared is asked for. Coil never copies a
+;; closure and runs one only exclusively, so it has the one kind.
 (define (verdict prog)
   (cond [(check-program prog) 'accept]
         [(parameterize ([mutant 'copy-mut]) (check-program prog)) 'reborrow]
+        [(parameterize ([mutant 'coil-closures]) (check-program prog)) 'closure-kind]
         [else 'reject]))
 
 (define (emit out-dir verdicts name prog)

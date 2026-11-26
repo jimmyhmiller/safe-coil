@@ -1,0 +1,18 @@
+;;; A function that takes its argument exclusively may give back a view that
+;;; gives only shared access; what it came from stays lent while it is used.
+(module ok_shared_view_from_mut)
+(import "coil.primitive" :as primitive)
+(import "safe.vec" :use [Vec])
+(import "safe.maybe" :use [Maybe if-found])
+(defn bump-first! :safe/borrows "v" [(v (mut (Vec i64)))] (-> (Maybe i64))
+  (if (> (len v) 0)
+      (do (set! (mut v) 0 (+ (get v 0) 1)) (Maybe::found (Vec::at v 0)))
+      (Maybe::nothing)))
+(defn main [] (-> i64)
+  (let [(mut v) (Vec::new [i64])]
+    (Vec::push! (mut v) 41)
+    (let [m (bump-first! (mut v))
+          again m]
+      (if-found [x again] (println "{}" (primitive/load x)) (println "none")))
+    (Vec::push! (mut v) 1)
+    0))

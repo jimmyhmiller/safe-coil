@@ -337,6 +337,33 @@
     (reject "what a lock holds is not freed while the lock lives, even after its last use"
      ,(prog '() '(let ([b (box (box 1))])
                    (let ([g (new (view Lock) (mut (* b)))]) (set! b (box (box 2)))))))
+    ;; ================================================== references to views
+    (accept "a view lent exclusively where it lies, and changed through"
+     ,(prog '((defn relock () ((k (mut (view Lock)))) unit (set! (* (: (* k) r)) (box 5))))
+            '(let ([a (box 1)])
+               (seq (let ([k (new (view Lock) (mut a))]) (call relock () (mut k))) (* a)))))
+    (accept "two views a view holds, lent exclusively at once to the two sides of a par"
+     ,(prog '((view Locks ((l (view Lock)) (r (view Lock))))
+              (defn relock () ((k (mut (view Lock)))) unit (set! (* (: (* k) r)) (box 5))))
+            '(let ([a (box 1)])
+               (let ([b (box 2)])
+                 (seq (let ([h (new (view Locks) (new (view Lock) (mut a)) (new (view Lock) (mut b)))])
+                        (par (call relock () (mut (: h l))) (call relock () (mut (: h r)))))
+                      (+ (* a) (* b)))))))
+    (reject "one view a view holds, lent exclusively to both sides of a par"
+     ,(prog '((view Locks ((l (view Lock)) (r (view Lock))))
+              (defn relock () ((k (mut (view Lock)))) unit (set! (* (: (* k) r)) (box 5))))
+            '(let ([a (box 1)])
+               (let ([b (box 2)])
+                 (let ([h (new (view Locks) (new (view Lock) (mut a)) (new (view Lock) (mut b)))])
+                   (par (call relock () (mut (: h l))) (call relock () (mut (: h l)))))))))
+    (reject "what a view borrowed is not used while a reference to the view is"
+     ,(prog '((defn relock () ((k (mut (view Lock)))) unit (set! (* (: (* k) r)) (box 5))))
+            '(let ([a (box 1)])
+               (let ([k (new (view Lock) (mut a))])
+                 (let ([r (mut k)])
+                   (seq (set! a (box 2)) (call relock () r)))))))
+
     ;; ================================================== two-phase borrows
     (accept "a later argument reads what an earlier one lends exclusively"
      ,(prog '((defn put () ((m (mut (box int))) (n int)) unit (set! (* m) (box n))))

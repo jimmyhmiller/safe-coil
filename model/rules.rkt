@@ -87,7 +87,8 @@
   (σ ::= int unit (box σ) (ptr σ) (pool σ) (handle σ) (task σ) (S σ ...) T
          (fno (τ ...) τ))
   (ρ ::= σ (ref σ) (mut σ) (view V))
-  (τ ::= ρ (fnb k (τ ...) τ) (out σ))
+  ;; a reference to a view: a view lent where it lies, as `(mut (SliceMut T))`
+  (τ ::= ρ (ref (view V)) (mut (view V)) (fnb k (τ ...) τ) (out σ))
   (e ::= n unit p
          (let ([x e]) e) (seq e e) (if0 e e e) (+ e e)
          (while e e) (break) (return e τ)
@@ -597,10 +598,16 @@
     [_ #f]))
 
 ;; can a value of type GOT be given where WANT is asked for?
+;; With `coil-closures` (not a weakening: what Coil's closures are), one that
+;; captured exclusively goes where one that captured only shared is asked for
+;; too: Coil never copies a closure, and runs one only through an exclusive
+;; reference to it, so the model's shared kind is no more than its exclusive one.
 (define (fits? got want)
   (or (equal? got want)
       (match* (got want)
         [(`(fnb shr ,τs ,τr) `(fnb mut ,τs2 ,τr2)) (and (equal? τs τs2) (equal? τr τr2))]
+        [(`(fnb mut ,τs ,τr) `(fnb shr ,τs2 ,τr2))
+         (and (mutant? 'coil-closures) (equal? τs τs2) (equal? τr τr2))]
         [(_ _) #f])))
 
 ;; what naming a place as a value does
@@ -669,20 +676,24 @@
    -------------------------------------------- "move-mut"
    (chk Σ Γ Λ x τ L Γ_1)]
 
-  [(where σ ,(place-type (term Σ) (term Γ) (term p)))
+  ;; what is lent may be a view: the reference keeps it, and through it what it
+  ;; borrowed, lent for as long as the reference is used
+  [(where any_t ,(place-type (term Σ) (term Γ) (term p)))
+   (side-condition ,(or (redex-match? Safe σ (term any_t)) (redex-match? Safe (view V) (term any_t))))
    (side-condition ,(available? (term Γ) (term p)))
    (side-condition ,(read-ok? (active (term Σ) (term Γ) (term Λ)) (term p)))
    (where L ,(shared-loans (term Σ) (term Γ) (term Λ) (term p)))
    -------------------------------------------- "borrow"
-   (chk Σ Γ Λ (ref p) (ref σ) L Γ)]
+   (chk Σ Γ Λ (ref p) (ref any_t) L Γ)]
 
-  [(where σ ,(place-type (term Σ) (term Γ) (term p)))
+  [(where any_t ,(place-type (term Σ) (term Γ) (term p)))
+   (side-condition ,(or (redex-match? Safe σ (term any_t)) (redex-match? Safe (view V) (term any_t))))
    (side-condition ,(available? (term Γ) (term p)))
    (side-condition ,(writable? (term Σ) (term Γ) (term p)))
    (side-condition ,(write-ok? (active (term Σ) (term Γ) (term Λ)) (term p)))
    (where L ,(exclusive-loans (term p)))
    -------------------------------------------- "borrow-mut"
-   (chk Σ Γ Λ (mut p) (mut σ) L Γ)]
+   (chk Σ Γ Λ (mut p) (mut any_t) L Γ)]
 
   ;; a place that holds nothing, lent to be filled: a call it is passed to fills it
   [(where σ ,(place-type (term Σ) (all-live (term Γ)) (term p)))

@@ -1,9 +1,9 @@
 ;;; A growable list that owns its elements.
 (module safe.vec)
-(export Vec Slice SliceMut)
+(export Vec Slice SliceMut Halves)
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc)
-(import "safe.core" :use [unsafe lend lend-mut View Each EachMut])
+(import "safe.core" :use [unsafe lend lend-mut View Each EachMut SharedView CrossThread])
 (import "safe.mem" :use [room release])
 
 ;;; A list of T. It owns its elements: they are freed with it. An index out of
@@ -17,12 +17,28 @@
 
 (impl [T] View (Slice T))
 
+(impl [T] SharedView (Slice T))
+
+(impl [T] CrossThread (Slice T))
+
 ;;; Part of a list, lent exclusively: its elements can be changed through it. While
 ;;; it lives nothing else reaches the list. It is a view, and it is moved, never
 ;;; copied: two of them would be two ways to change the same elements.
 (defstruct SliceMut [T] [(items (ptr T)) (count i64)])
 
 (impl [T] View (SliceMut T))
+
+(impl [T] CrossThread (SliceMut T))
+
+;;; Two parts of one slice, each lent exclusively, at once: `left` and `right`
+;;; are fields, so separate places, and `(mut (field h left))` and `(mut (field h
+;;; right))` can be held together, as `par` does. The slice they came from stays
+;;; lent while the Halves live. It is moved, never copied.
+(defstruct Halves [T] [(left (SliceMut T)) (right (SliceMut T))])
+
+(impl [T] View (Halves T))
+
+(impl [T] CrossThread (Halves T))
 
 (impl [T] Drop (SliceMut T)
   (drop [(self (mut (SliceMut T)))] (-> void) 0))
@@ -173,6 +189,19 @@
   (part [(s (ref (SliceMut T))) (from i64) (to i64)] (-> (Slice T))
     (unsafe
       (Slice :items (range-within (.items s) (.count s) from to) :count (- to from))))
+
+  ;;; A copy of element I, for an element of plain data.
+  (get :collection/copies-element "(SliceMut::at s i)" [(s (ref (SliceMut T))) (i i64)] (-> T)
+    (unsafe (load (within (.items s) (.count s) i))))
+
+  ;;; The elements before MID and from MID on, both to be changed, as Halves.
+  ;;; MID outside the slice stops the program.
+  (split [(s (mut (SliceMut T))) (mid i64)] (-> (Halves T))
+    (unsafe
+      (when (or (< mid 0) (> mid (.count s)))
+        (panic "safe: {} is not inside a slice of {}" mid (.count s)))
+      (Halves :left (SliceMut :items (.items s) :count mid)
+              :right (SliceMut :items (primitive/index (.items s) mid) :count (- (.count s) mid)))))
 
   ;;; The elements of the slice from FROM up to TO, to be changed. This slice is
   ;;; lent to the new one for as long as it lives.

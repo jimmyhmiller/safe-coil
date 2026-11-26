@@ -43,11 +43,15 @@ for line in open(os.path.join(out, "verdicts.txt")):
         model[name] = verdict
 
 table, reasons, unsound, strict, refused, details, reborrow = {}, {}, [], [], {}, [], {}
+closure_kind = {}
 with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
     for name, verdict, why in pool.map(coil, sorted(model)):
         details.append(f"{name} model={model[name]} checker={verdict} {why}")
         if model[name] == "reborrow":
             reborrow[verdict] = reborrow.get(verdict, 0) + 1
+            continue
+        if model[name] == "closure-kind":
+            closure_kind[verdict] = closure_kind.get(verdict, 0) + 1
             continue
         key = (model[name], verdict)
         table[key] = table.get(key, 0) + 1
@@ -69,6 +73,9 @@ for key in [("accept", "accept"), ("reject", "reject"), ("accept", "reject"), ("
 if reborrow:
     print("refused by the model only for using an exclusive reference after moving it, which Coil")
     print(f"never does (it lends again): {sum(reborrow.values())}, of which the checker accepts {reborrow.get('accept', 0)}")
+if closure_kind:
+    print("refused by the model only for giving a closure that captured exclusively where one that")
+    print(f"captured shared is asked for, which Coil allows (it has one kind): {sum(closure_kind.values())}, of which the checker accepts {closure_kind.get('accept', 0)}")
 open(os.path.join(out, "results.txt"), "w").write("\n".join(details) + "\n")
 if refused:
     print("the compiler refuses what the model accepts:")

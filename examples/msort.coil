@@ -1,0 +1,48 @@
+;;; A parallel merge sort: the list is split into two halves lent exclusively at
+;;; once, which are sorted on two threads with par, then merged. Safe Coil
+;;; throughout.
+;;;
+;;;   coil run examples/msort.coil --use safe.check
+(module example.msort)
+(import "safe.vec" :use [Vec SliceMut Halves])
+(import "safe.par" :use [par])
+
+;;; Merge the sorted halves of XS, split at MID, through SCRATCH.
+(defn merge! [(xs (mut (SliceMut i64))) (mid i64) (scratch (mut (Vec i64)))] (-> void)
+  (Vec::clear! (mut scratch))
+  (let [n (SliceMut::len xs)
+        (mut i) 0
+        (mut j) mid]
+    (while (or (< i mid) (< j n))
+      (if (and (< i mid) (or (>= j n) (<= (SliceMut::get xs i) (SliceMut::get xs j))))
+          (do (Vec::push! (mut scratch) (SliceMut::get xs i)) (set! i (+ i 1)))
+          (do (Vec::push! (mut scratch) (SliceMut::get xs j)) (set! j (+ j 1)))))
+    (for k (range 0 n)
+      (set! (SliceMut::at-mut (mut xs) k) (get scratch k)))))
+
+;;; Sort XS; below LIMIT elements, on this thread alone.
+(defn msort! [(xs (mut (SliceMut i64))) (limit i64)] (-> void)
+  (let [n (SliceMut::len xs)]
+    (when (> n 1)
+      (let [mid (/ n 2)]
+        (let [(mut h) (SliceMut::split (mut xs) mid)]
+          (if (> n limit)
+              (par (msort! (mut (field h left)) limit) (msort! (mut (field h right)) limit))
+              (do (msort! (mut (field h left)) limit)
+                  (msort! (mut (field h right)) limit))))
+        (let [(mut scratch) (Vec::new [i64])]
+          (merge! (mut xs) mid (mut scratch)))))))
+
+(defn main [] (-> i64)
+  (let [(mut v) (Vec::new [i64])
+        (mut seed) 42]
+    (for i (range 0 2000)
+      (set! seed (% (+ (* seed 1103515245) 12345) 2147483648))
+      (Vec::push! (mut v) (% (/ seed 65536) 1000)))
+    (let [(mut all) (Vec::slice-mut (mut v) 0 (len v))]
+      (msort! (mut all) 256))
+    (let [(mut sorted) true]
+      (for i (range 1 (len v))
+        (when (> (get v (- i 1)) (get v i)) (set! sorted false)))
+      (println "sorted: {}; first {} {} {}, last {}" sorted (get v 0) (get v 1) (get v 2) (get v (- (len v) 1)))))
+  0)

@@ -1,0 +1,14 @@
+;;; A shared view made from an exclusive loan keeps that loan: what it came from
+;;; is not read or changed while the view is used.
+(module bad_shared_view_kept)
+(import "coil.primitive" :as primitive)
+(import "safe.vec" :use [Vec])
+(import "safe.maybe" :use [Maybe if-found])
+(defn first! :safe/borrows "v" [(v (mut (Vec i64)))] (-> (Maybe i64))
+  (if (> (len v) 0) (Maybe::found (Vec::at v 0)) (Maybe::nothing)))
+(defn main [] (-> i64)
+  (let [(mut v) (Vec::new [i64])]
+    (Vec::push! (mut v) 41)
+    (let [m (first! (mut v))]
+      (println "{}" (len v))
+      (if-found [x m] (primitive/load x) 0))))

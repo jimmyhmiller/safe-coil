@@ -47,7 +47,10 @@
     (defn fill () ((r (out (box int)))) unit (set! (* r) (box 4)))
     (defn swap-in () ((m (mut (Pair)))) int
       (let ([old (: (* m) a)]) (seq (set! (: (* m) a) (box 7)) (* old))))
-    (defn lock () ((r (mut (box int)))) (view Lock) (new (view Lock) r))))
+    (defn lock () ((r (mut (box int)))) (view Lock) (new (view Lock) r))
+    ;; a view lent where it lies
+    (defn relock () ((k (mut (view Lock)))) unit (set! (* (: (* k) r)) (box 5)))
+    (defn peek-at () ((v (ref (view Peek)))) int (+ (* (: (* v) s)) (: (* v) i)))))
 (define stock-sigs
   (for/list ([fn stock])
     (match-define `(defn ,f ,Ts ((,_ ,τs) ...) ,τr ,_) fn)

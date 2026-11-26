@@ -1,0 +1,11 @@
+;;; The slice the halves came from stays lent while they are used.
+(module bad_halves_whole_used)
+(import "safe.vec" :use [Vec SliceMut Halves])
+(defn main [] (-> i64)
+  (let [(mut v) (Vec::new [i64])]
+    (for i (range 0 4) (Vec::push! (mut v) i))
+    (let [(mut all) (Vec::slice-mut (mut v) 0 4)
+          (mut h) (SliceMut::split (mut all) 2)]
+      (set! (SliceMut::at-mut (mut all) 0) 9)
+      (set! (SliceMut::at-mut (mut (field h left)) 0) 8)
+      0)))

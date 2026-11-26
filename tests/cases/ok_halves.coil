@@ -1,0 +1,16 @@
+;;; One slice split into two halves, both lent exclusively at once, changed on
+;;; two threads.
+(module ok_halves)
+(import "safe.vec" :use [Vec SliceMut Halves])
+(import "safe.par" :use [par])
+(defn fill! [(s (mut (SliceMut i64))) (value i64)] (-> i64)
+  (for i (range 0 (SliceMut::len s)) (set! (SliceMut::at-mut (mut s) i) value))
+  0)
+(defn main [] (-> i64)
+  (let [(mut v) (Vec::new [i64])]
+    (for i (range 0 6) (Vec::push! (mut v) 0))
+    (let [(mut all) (Vec::slice-mut (mut v) 0 6)
+          (mut h) (SliceMut::split (mut all) 2)]
+      (par (fill! (mut (field h left)) 1) (fill! (mut (field h right)) 2)))
+    (println "{} {} {}" (get v 0) (get v 2) (get v 5)))
+  0)

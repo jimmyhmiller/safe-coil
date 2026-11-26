@@ -1,0 +1,6 @@
+;;; Only the module that declares a view may say it gives only shared access.
+(module bad_shared_view_foreign)
+(import "safe.core" :use [SharedView])
+(import "safe.vec" :use [SliceMut])
+(impl [T] SharedView (SliceMut T))
+(defn main [] (-> i64) 0)

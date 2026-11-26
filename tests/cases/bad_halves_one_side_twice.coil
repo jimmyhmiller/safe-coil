@@ -1,0 +1,13 @@
+;;; Each half is one place: it is not lent exclusively to both calls of a par.
+(module bad_halves_one_side_twice)
+(import "safe.vec" :use [Vec SliceMut Halves])
+(import "safe.par" :use [par])
+(defn fill! [(s (mut (SliceMut i64))) (value i64)] (-> i64)
+  (for i (range 0 (SliceMut::len s)) (set! (SliceMut::at-mut (mut s) i) value))
+  0)
+(defn main [] (-> i64)
+  (let [(mut v) (Vec::new [i64])]
+    (for i (range 0 4) (Vec::push! (mut v) 0))
+    (let [(mut all) (Vec::slice-mut (mut v) 0 4)
+          (mut h) (SliceMut::split (mut all) 2)]
+      (par (fill! (mut (field h left)) 1) (fill! (mut (field h left)) 2)))))

@@ -383,6 +383,12 @@ Found by the differential run:
   view was made from, so it lets that reference outlive the view, and treats two
   fields of one view as two places. The checker refuses both.
 
+- **A closure has one kind.** The model copies a closure that captured only
+  shared references, and so will not take one that captured something
+  exclusively where such a closure is asked for. Coil never copies a closure and
+  runs one only through an exclusive reference to it, so it takes either. The
+  checker may accept a program the model refuses for that alone; `diff.py`
+  counts them apart (`closure-kind`).
 - **`par` takes no view.** The model lets a view be an argument of a `par`
   call. `safe.par` passes each argument through a type parameter, which the
   checker never lets a view be.

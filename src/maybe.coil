@@ -10,12 +10,16 @@
 (module safe.maybe)
 (export Maybe MaybeMut if-found when-found if-found-mut)
 (import "coil.primitive" :as primitive)
-(import "safe.core" :use [unsafe lend lend-mut View])
+(import "safe.core" :use [unsafe lend lend-mut View SharedView])
 
 ;;; A shared reference to a T, or nothing.
 (defstruct Maybe [T] [(at (ptr T))])
 
 (impl [T] View (Maybe T))
+
+;;; It gives only shared access, so a function that took what it found in
+;;; exclusively may still give one back, and the result copied.
+(impl [T] SharedView (Maybe T))
 
 ;;; An exclusive reference to a T, or nothing. It is moved, never copied: two of
 ;;; them would be two ways to change the same T.

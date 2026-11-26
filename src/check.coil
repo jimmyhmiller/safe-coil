@@ -233,6 +233,18 @@
 
 ;;; Is T a view whose drop uses nothing it borrowed, marked `safe.core.QuietDrop`
 ;;; by the module that defines it (see `check-quiet-drop!`)?
+(defn cross-thread? [(t Code)] (-> bool)
+  (and (view-type? t)
+       (match (primitive/code-type-traits t)
+         (primitive/TraitsAre [names] (name-in? `safe.core.CrossThread names))
+         (primitive/TraitsUnknown [] false))))
+
+(defn shared-view? [(t Code)] (-> bool)
+  (and (view-type? t)
+       (match (primitive/code-type-traits t)
+         (primitive/TraitsAre [names] (name-in? `safe.core.SharedView names))
+         (primitive/TraitsUnknown [] false))))
+
 (defn quiet-drop? [(t Code)] (-> bool)
   (and (view-type? t)
        (match (primitive/code-type-traits t)
@@ -1024,7 +1036,9 @@
         held (if (and (trusted-field? (mut cx) (get e 1)) (head-is? (type-of (get e 1)) `ptr))
                  (get (type-of (get e 1)) 1)
                  (pointee (type-of (get e 1))))]
-    (when (and (field-form? (get e 1)) (raw-field? held))
+    ; a field that is a view is lent like any place: a view is never stored, so
+    ; no other can be put in its place through the reference
+    (when (and (field-form? (get e 1)) (raw-field? held) (not (view-type? held)))
       (need-unsafe! cx e "an exclusive reference to a field that is raw memory"))
     (if (= (len q) 1)
         (use-place (mut cx) e (get q 0) (WExcl))
@@ -1169,9 +1183,16 @@
 
 ;;; A view is passed only where the callee asked for that view by name. A
 ;;; parameter that is a type parameter could store it.
-(defn check-view-argument! [(arg Code) (param Code)] (-> i64)
+;;; A view is never handed to a type parameter, which could store it. `par`'s
+;;; own expansion is the exception, for a view that may cross to another thread:
+;;; it hands its helpers `(mut name)` for each argument only to take its address
+;;; and check its type, and that code is the library's, as `println`'s expansion
+;;; is.
+(defn check-view-argument! [(call Code) (arg Code) (param Code)] (-> i64)
   (if (and (view-type? (pointee (type-of arg)))
-           (not (primitive/code-eq (type-base (pointee param)) (type-base (pointee (type-of arg))))))
+           (not (primitive/code-eq (type-base (pointee param)) (type-base (pointee (type-of arg)))))
+           (not (and (primitive/code-macro? arg) (expanded-by? call `(safe.par.par))
+                     (cross-thread? (pointee (type-of arg))))))
       (fail! arg "safe: a view is passed where it could be stored; it can only be a local, an argument that names its type, or a result")
       0))
 
@@ -1279,7 +1300,7 @@
             (let [param (if known (get params (- i 1 before)) `unknown)
                   r (eval-arg (mut cx) arg param (callee-result kind name signature) e)
                   carried (.loans (use-value cx arg r (WShared)))]
-              (check-view-argument! arg param)
+              (check-view-argument! e arg param)
               (check-dyn-argument! (mut cx) arg param)
               (when (view-type? (pointee (type-of arg)))
                 (set! all (union all (view-argument-loans (mut cx) arg param r))))
@@ -1304,7 +1325,8 @@
         (unless (args-apart? (get each i) (get each j))
           (fail! e "safe: one argument of this call lends a place exclusively and another still holds a loan on it"))))
     ; a view over an exclusive reference gives exclusive access, so there is one of it
-    (when (and (view-type? (type-of e)) (not (owner-type? cx (type-of e))))
+    (when (and (view-type? (type-of e)) (not (owner-type? cx (type-of e)))
+               (not (shared-view? (type-of e))))
       (for l (iter all)
         (when (loan-excl? l)
           (fail! e "safe: a view that can be copied is made from an exclusive reference; a view over one is moved, so its type needs a Drop"))))
@@ -1367,7 +1389,7 @@
           (guard-raw-flow! cx e arg)
           (let [r (eval-arg (mut cx) arg `unknown `unknown e)
                 lent-now (.loans (use-value cx arg r (WShared)))]
-            (check-view-argument! arg `unknown)
+            (check-view-argument! e arg `unknown)
             (hold! (mut cx) -1 lent-now)
             (set! borrowed (union borrowed lent-now))))))
     (drop-loans-to! (mut cx) loans)
@@ -1813,7 +1835,9 @@
            (block :found
              (for part (iter form)
                (when (match (primitive/code-decl part)
-                       (primitive/Declared [_ _ name _] (primitive/code-eq name `safe.core.QuietDrop))
+                       (primitive/Declared [_ _ name _] (or (primitive/code-eq name `safe.core.QuietDrop)
+                                                            (primitive/code-eq name `safe.core.SharedView)
+                                                            (primitive/code-eq name `safe.core.CrossThread)))
                        (_ false))
                  (return-from :found true)))
              false))
@@ -1822,8 +1846,8 @@
           (primitive/Declared [declared _ _ _]
             (if (primitive/code-eq declared module)
                 0
-                (fail! form "safe: only the module that declares a view may say its drop is quiet")))
-          (_ (fail! form "safe: only the module that declares a view may say its drop is quiet"))))
+                (fail! form "safe: only the module that declares a view may say its drop is quiet, that it is shared, or that it crosses threads")))
+          (_ (fail! form "safe: only the module that declares a view may say its drop is quiet, that it is shared, or that it crosses threads"))))
       0))
 
 ;;; Is the module record M one of the program's own, to be checked? This module

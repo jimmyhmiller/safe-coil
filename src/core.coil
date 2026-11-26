@@ -54,6 +54,18 @@
 ;;; ends, since its drop may still use them.
 (deftrait QuietDrop [Self])
 
+;;; `(impl SharedView TYPE)`: a view that gives only shared access to what it
+;;; was made from, however that was lent. Such a view can be copied even when
+;;; made from an exclusive reference, as `fn get(&mut self) -> Option<&V>`'s
+;;; result is: every copy keeps the loan, and none changes anything. Only the
+;;; module that declares TYPE may say it.
+(deftrait SharedView [Self])
+
+;;; `(impl CrossThread TYPE)`: a view that may be lent to the other thread of a
+;;; `par` call. A view tied to the thread it was made on, as a held lock is, does
+;;; not say it. Only the module that declares TYPE may say it.
+(deftrait CrossThread [Self])
+
 ;;; A collection whose elements are reached by position: `count` of them, and
 ;;; `item` lends the one at I. An index out of range stops the program.
 (deftrait Each [Self Item]
