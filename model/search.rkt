@@ -755,7 +755,7 @@
             (cons (fresh 'p)
                   (cond [(and (zero? j) (pair? Ts)) 'T]
                         [(zero? (random 12)) '(out (box int))]
-                        [(and (zero? j) (zero? (random 2)))
+                        [(and (<= j 1) (zero? (random 2)))
                          `(,(pick '(ref mut)) ,(pick '((box int) (box int) (box (box int)) int (Pair) (Opt (box int)) (pool (box int)))))]
                         [else (gen-type)]))))
         ;; a reference result usually has a parameter it could come from
@@ -767,13 +767,19 @@
                            (define inner (match σ [`(box ,σ2) (if (zero? (random 2)) σ2 σ)] [_ σ]))
                            `(,(if (zero? (random 3)) 'ref k) ,inner)])
                         (gen-type)))
-        (list (fresh 'f) Ts params ret))))
+        ;; with two or more references, the result may say which it comes from
+        (define borrows
+          (and (>= (length refs) 2) (second-class? ret) (zero? (random 2))
+               (let ([some (filter (λ (_) (zero? (random 2))) refs)])
+                 (map car (if (null? some) (list (pick refs)) some)))))
+        (list (fresh 'f) Ts params ret borrows))))
   ;; A function calls only earlier ones, so every program terminates. A body the
   ;; rules refuse is tried again a few times and then left out: one bad function
   ;; would otherwise refuse the whole program, and few calls would ever run.
   (define-values (fns call-sigs)
     (for/fold ([fns stock] [call-sigs stock-sigs]) ([s sigs])
-      (match-define (list f Ts params ret) s)
+      (match-define (list f Ts params ret borrows) s)
+      (define bdecl (if borrows (list `(borrows ,f ,borrows)) '()))
       (define fn
         (for/or ([try 5])
           (define fn `(defn ,f ,Ts ,(for/list ([p params]) (list (car p) (cdr p))) ,ret
@@ -782,9 +788,9 @@
                              ;; an out parameter is usually filled first
                              (for/fold ([b (gen-expr params call-sigs ret (random 3))]) ([o outs])
                                (if (zero? (random 4)) b `(seq (set! (* ,o) (box ,(random 3))) ,b)))))))
-          (and (check-fn (append prelude fns (list fn)) fn) fn)))
+          (and (check-fn (append prelude fns bdecl (list fn)) fn) fn)))
       (if fn
-          (values (append fns (list fn)) (append call-sigs (list (list f Ts (map cdr params) ret))))
+          (values (append fns bdecl (list fn)) (append call-sigs (list (list f Ts (map cdr params) ret))))
           (values fns call-sigs))))
   `(program (,@prelude ,@fns)
             ,(gen-expr '() call-sigs (pick '(int int int unit (box int) (Opt (box int)))) (+ 1 (random 4)))))
@@ -802,7 +808,7 @@
 (define features
   '(("references" ref mut) ("calls" call) ("fields" :) ("match" match match-ref match-mut)
     ("views" view) ("pools" insert remove at) ("take/unbox" take unbox) ("loops" while)
-    ("break" break) ("globals" with) ("par" par) ("threads" spawn spawn-fn) ("raw pointers" addr)
+    ("break" break) ("borrows" borrows) ("globals" with) ("par" par) ("threads" spawn spawn-fn) ("raw pointers" addr)
     ("closures" lam lamo) ("closure calls" apply) ("out" out) ("return" return)))
 
 ;; -> the first counterexample, or #f

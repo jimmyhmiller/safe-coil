@@ -337,6 +337,65 @@
     (reject "what a lock holds is not freed while the lock lives, even after its last use"
      ,(prog '() '(let ([b (box (box 1))])
                    (let ([g (new (view Lock) (mut (* b)))]) (set! b (box (box 2)))))))
+    ;; ================================================== two-phase borrows
+    (accept "a later argument reads what an earlier one lends exclusively"
+     ,(prog '((defn put () ((m (mut (box int))) (n int)) unit (set! (* m) (box n))))
+            '(let ([x (box 1)]) (seq (call put () (mut x) (+ (* x) 1)) (* x)))))
+    (reject "a later argument borrows what an earlier one lends exclusively"
+     ,(prog '((defn alias () ((m (mut (box int))) (r (ref int))) int (seq (set! (* m) (box 5)) (* r))))
+            '(let ([x (box 1)]) (call alias () (mut x) (ref (* x))))))
+    (reject "a later argument writes what an earlier one lends exclusively"
+     ,(prog '((defn put () ((m (mut (box int))) (n int)) unit (set! (* m) (box n))))
+            '(let ([x (box 1)]) (seq (call put () (mut x) (seq (set! x (box 2)) 1)) (* x)))))
+
+    ;; ================================================== what a result borrows from
+    (accept "a result its borrows says comes from one argument leaves the other free"
+     ,(prog '((defn first-of () ((a (ref int)) (b (ref int))) (ref int) a)
+              (borrows first-of (a)))
+            '(let ([x (box 1)])
+               (let ([y (box 2)])
+                 (let ([r (call first-of () (ref (* x)) (ref (* y)))])
+                   (seq (set! y (box 3)) (* r)))))))
+    (reject "without a borrows, the result borrows from every reference argument"
+     ,(prog '((defn first-of () ((a (ref int)) (b (ref int))) (ref int) a))
+            '(let ([x (box 1)])
+               (let ([y (box 2)])
+                 (let ([r (call first-of () (ref (* x)) (ref (* y)))])
+                   (seq (set! y (box 3)) (* r)))))))
+    (reject "a result keeps the argument its borrows names lent"
+     ,(prog '((defn first-of () ((a (ref int)) (b (ref int))) (ref int) a)
+              (borrows first-of (a)))
+            '(let ([x (box 1)])
+               (let ([y (box 2)])
+                 (let ([r (call first-of () (ref (* x)) (ref (* y)))])
+                   (seq (set! x (box 3)) (* r)))))))
+    (reject "a function returns what a parameter its borrows leaves out was lent"
+     ,(prog '((defn second-of () ((a (ref int)) (b (ref int))) (ref int) b)
+              (borrows second-of (a)))
+            '(let ([x (box 1)])
+               (let ([y (box 2)])
+                 (let ([r (call second-of () (ref (* x)) (ref (* y)))])
+                   (seq (set! y (box 3)) (* r)))))))
+    (reject "a function returns early what a parameter its borrows leaves out was lent"
+     ,(prog '((defn second-of () ((a (ref int)) (b (ref int))) (ref int)
+                (seq (return b (ref int)) a))
+              (borrows second-of (a)))
+            '(let ([x (box 1)])
+               (let ([y (box 2)])
+                 (let ([r (call second-of () (ref (* x)) (ref (* y)))])
+                   (seq (set! y (box 3)) (* r)))))))
+    (reject "a borrows names a parameter that takes no reference"
+     ,(prog '((defn pick () ((a (ref int)) (n int)) (ref int) a)
+              (borrows pick (n)))
+            '(let ([x (box 1)]) (* (* (call pick () (ref (* x)) 0))))))
+    (accept "a borrows of an exclusive reference keeps it lent exclusively, the other argument free"
+     ,(prog '((defn grab () ((a (mut int)) (b (ref int))) (mut int) a)
+              (borrows grab (a)))
+            '(let ([x (box 1)])
+               (let ([y (box 2)])
+                 (let ([r (call grab () (mut (* x)) (ref (* y)))])
+                   (seq (set! y (box 3)) (seq (set! (* r) 4) (* x))))))))
+
     (accept "a shared view whose drop reads what it holds"
      ,(prog '() '(let ([b (box (box 1))])
                    (seq (let ([w (new (view Watch) (ref (* b)))]) unit) (* (* b))))))

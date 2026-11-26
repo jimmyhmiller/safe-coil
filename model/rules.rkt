@@ -62,7 +62,9 @@
     (no-restore "a function may leave part of what an exclusive parameter refers to moved")
     (break-forgets "what a loop moved before a break is forgotten after the loop")
     (return-escape "a value returned early may hold a loan on the function's own storage")
-    (out-unfilled "a function may leave its out parameter unfilled")))
+    (out-unfilled "a function may leave its out parameter unfilled")
+    (borrows-unchecked "a function may return a loan from a parameter its borrows declaration leaves out")
+    (two-phase-unchecked "an argument lent exclusively may be lent again by a later argument of the call")))
 (define (mutant? m) (eq? (mutant) m))
 
 (define-language Safe
@@ -74,7 +76,10 @@
             (view V ((fld ρ) ...))
             (view V ((fld ρ) ...) f)
             (global g σ e)
-            (defn f (T ...) ((x τ) ...) τ e))
+            (defn f (T ...) ((x τ) ...) τ e)
+            ;; what f's result may borrow from: the parameters named, and no
+            ;; others; without one, any reference parameter
+            (borrows f (x ...)))
   ;; storable types; what a view's field can be; all types. A closure that owns
   ;; what it captured is storable; one that borrows is second-class, exclusive
   ;; when it captured something exclusively. An out parameter refers to a place
@@ -128,8 +133,9 @@
 ;; program each time was most of the cost of a check.
 (struct program-decls (list))
 ;; The seventh element says what a `return` must give back: the function's
-;; result type and its parameters (a closure's captures count as parameters), or
-;; #f outside any function.
+;; result type, its parameters (a closure's captures count as parameters) and
+;; those its result may borrow from (`all` without a `borrows`), or #f outside
+;; any function.
 (define (make-Σ decls [Ts '()] [fn #f]) (list (mutant) 'safe 'noloop Ts (program-decls decls) '() fn))
 (define (in-unsafe? Σ) (eq? (second Σ) 'unsafe))
 (define (in-loop? Σ) (eq? (third Σ) 'loop))
@@ -582,7 +588,7 @@
                      [`(box ,_) #t]
                      [`(,(or 'mut 'out) ,_)
                       (match (fn-of Σ)
-                        [(list _ params) (and (memq (place-root (norm p2)) params) #t)]
+                        [(list _ params _) (and (memq (place-root (norm p2)) params) #t)]
                         [_ #f])]
                      [_ #f])
                    (movable? Σ Γ p2))]
@@ -776,11 +782,11 @@
   ;; may carry only the loans a result may. Whatever an exclusive or out
   ;; parameter refers to must be whole. τ is the type the form has where it is
   ;; written; nothing after it runs.
-  [(where (τ_r (x_p ...)) ,(fn-of (term Σ)))
+  [(where (τ_r (x_p ...) any_only) ,(fn-of (term Σ)))
    (side-condition ,(wf? (term Σ) (term τ)))
    (chk Σ Γ Λ e τ_r L Γ_1)
    (side-condition ,(or (mutant? 'return-escape)
-                        (return-ok? (term Σ) (term Γ_1) (term Λ) (term L) (term (x_p ...)))))
+                        (return-ok? (term Σ) (term Γ_1) (term Λ) (term L) (term (x_p ...)) (term any_only))))
    (where Γ_2 ,(make-dead (term Γ_1)))
    -------------------------------------------- "return"
    (chk Σ Γ Λ (return e τ) τ () Γ_2)]
@@ -861,14 +867,16 @@
 
   ;; ---- calls
 
-  ;; A returned reference borrows from every reference argument of the call.
-  ;; A place passed as `(out p)` holds a value once the call returns.
+  ;; A returned reference borrows from every reference argument of the call, or
+  ;; from those its `borrows` names. A place passed as `(out p)` holds a value
+  ;; once the call returns.
   [(where (defn f (T ...) ((x_p τ_p) ...) τ_r any_b) ,(find-decl (term Σ) 'defn (term f)))
    (side-condition ,(and (= (length (term (T ...))) (length (term (σ ...))))
                          (andmap (λ (t) (wf? (term Σ) t)) (term (σ ...)))))
    (where (τ_a ...) ,(for/list ([t (term (τ_p ...))]) (subst t (term (T ...)) (term (σ ...)))))
    (where τ_ra ,(subst (term τ_r) (term (T ...)) (term (σ ...))))
-   (chk-args Σ Γ Λ (e ...) (τ_a ...) L Γ_1)
+   (chk-args-each Σ Γ Λ (e ...) (τ_a ...) (L_a ...) Γ_1)
+   (where L ,(borrowed-loans (term Σ) (term f) (term (x_p ...)) (term (L_a ...))))
    (where L_r ,(if (and (second-class? (term τ_ra)) (not (mutant? 'no-call-loans))) (term L) '()))
    (where Γ_2 ,(for/fold ([g (term Γ_1)]) ([a (term (e ...))])
                  (match a [`(out ,p) (mark-filled g p)] [_ g])))
@@ -1005,6 +1013,18 @@
    -------------------------------------------- "free"
    (chk Σ Γ Λ (free e) unit () Γ_1)])
 
+;; Two-phase borrows: an argument lent exclusively is only reserved while the
+;; arguments after it are evaluated (they may read it, never write or move it),
+;; and is lent exclusively when the call begins, when no other argument may still
+;; hold a loan on any of it.
+(define (reserve L)
+  (for/list ([l L]) (match l [(list p 'mut) (list p 'shr)] [_ l])))
+(define (args-apart? L1 L2)
+  (or (mutant? 'two-phase-unchecked)
+      (not (for*/or ([a L1] [b L2])
+             (and (or (eq? (cadr a) 'mut) (eq? (cadr b) 'mut))
+                  (overlap? (car a) (car b)))))))
+
 ;; arguments, left to right: each one's loans are alive while the rest are evaluated
 (define-judgment-form Safe
   #:mode (chk-args I I I I I O O)
@@ -1016,11 +1036,28 @@
   ;; a closure that borrows shared goes where one that may borrow exclusively is asked for
   [(chk ,(Σ+* (term Σ) (term (e_r ...))) Γ Λ e_1 τ_a L_1 Γ_1)
    (side-condition ,(fits? (term τ_a) (term τ_1)))
-   (where Λ_1 ,(add-loans (term Λ) (term tmp) (if (mutant? 'no-arg-loans) '() (term L_1))))
+   (where Λ_1 ,(add-loans (term Λ) (term tmp) (if (mutant? 'no-arg-loans) '() (reserve (term L_1)))))
    (chk-args Σ Γ_1 Λ_1 (e_r ...) (τ_r ...) L_2 Γ_2)
+   (side-condition ,(args-apart? (term L_1) (term L_2)))
    (where L ,(union (term L_1) (term L_2)))
    -------------------------------------------- "arg"
    (chk-args Σ Γ Λ (e_1 e_r ...) (τ_1 τ_r ...) L Γ_2)])
+
+;; the same, with each argument's loans apart
+(define-judgment-form Safe
+  #:mode (chk-args-each I I I I I O O)
+  #:contract (chk-args-each Σ Γ Λ (e ...) (τ ...) (L ...) Γ)
+
+  [-------------------------------------------- "no-args-each"
+   (chk-args-each Σ Γ Λ () () () Γ)]
+
+  [(chk ,(Σ+* (term Σ) (term (e_r ...))) Γ Λ e_1 τ_a L_1 Γ_1)
+   (side-condition ,(fits? (term τ_a) (term τ_1)))
+   (where Λ_1 ,(add-loans (term Λ) (term tmp) (if (mutant? 'no-arg-loans) '() (reserve (term L_1)))))
+   (chk-args-each Σ Γ_1 Λ_1 (e_r ...) (τ_r ...) (L_r ...) Γ_2)
+   (side-condition ,(args-apart? (term L_1) (foldl union '() (term (L_r ...)))))
+   -------------------------------------------- "arg-each"
+   (chk-args-each Σ Γ Λ (e_1 e_r ...) (τ_1 τ_r ...) (L_1 L_r ...) Γ_2)])
 
 ;; one arm: x holds the payload (or a reference to it, carrying L_x)
 (define-judgment-form Safe
@@ -1066,7 +1103,7 @@
 ;; carry only the loans the caller lent: nothing on the function's own storage,
 ;; nothing on a global, whose loan lasts only for its `with`. What an exclusive
 ;; or out parameter refers to must be whole.
-(define (return-ok? Σ Γ Λ L params)
+(define (return-ok? Σ Γ Λ L params [only 'all])
   (define vars (vars-of Γ))
   (define after-locals
     (for/fold ([L L]) ([e vars] #:unless (memq (car e) params))
@@ -1076,14 +1113,18 @@
       (and L (exit-scope (car e) (cadr e) Λ L))))
   (and after-params
        (not (for/or ([l after-params]) (match (place-root (car l)) [`(glob ,_) #t] [_ #f])))
+       ;; with a `borrows`, only on what the parameters it names were lent
+       (or (eq? only 'all) (mutant? 'borrows-unchecked)
+           (for/and ([l after-params])
+             (match (place-root (car l)) [`(ext ,x) (and (memq x only) #t)] [_ #t])))
        (for/and ([e vars] #:when (memq (car e) params))
          (restored? Σ (car e) (cadr e) (caddr e)))))
 
 ;; The body of a function, a closure or a drop: its parameters (and a closure's
 ;; captures, which are parameters to it) hold loans on what the caller lent; an
 ;; out parameter refers to a place that holds nothing yet.
-(define (check-body decls Ts params τr body)
-  (define Σ (make-Σ decls Ts (list τr (map car params))))
+(define (check-body decls Ts params τr body [only 'all])
+  (define Σ (make-Σ decls Ts (list τr (map car params) only)))
   (define Γ (for/list ([p params])
               (list (car p) (cadr p) (match (cadr p) [`(out ,_) '(gone (*))] [_ 'live]) 'none)))
   (define Λ (for/list ([p params] #:when (second-class? (cadr p)))
@@ -1096,7 +1137,7 @@
           (and (equal? τ τr)
                (or (dead? Γ-out)
                    (mutant? 'no-return-check)
-                   (return-ok? Σ Γ-out Λ L (map car params))))]
+                   (return-ok? Σ Γ-out Λ L (map car params) only)))]
          [#f #f])
        Γ))
 
@@ -1108,7 +1149,7 @@
   (define all (append caps params))
   (and (distinct? (map car all))
        (andmap (λ (c) (wf? Σ (cadr c))) caps)
-       (let ([Σb (make-Σ decls (tparams Σ) (list τr (map car all)))]
+       (let ([Σb (make-Σ decls (tparams Σ) (list τr (map car all) 'all))]
              [Γ (for/list ([p all])
                   (list (car p) (cadr p) (match (cadr p) [`(out ,_) '(gone (*))] [_ 'live]) 'none))]
              [Λ (for/list ([p all] #:when (second-class? (cadr p)))
@@ -1126,10 +1167,27 @@
 
 (define (check-fn decls fn)
   (match fn
-    [`(defn ,_ ,Ts ,params ,τr ,body)
-     (and (distinct? (append Ts (map cadr decls)))
-          (check-body decls Ts params τr body)
+    [`(defn ,f ,Ts ,params ,τr ,body)
+     (and (distinct? (append Ts (decl-names decls)))
+          (check-body decls Ts params τr body (borrows-of decls f))
           #t)]))
+
+;; The names the declarations define: a `borrows` defines none, it says more
+;; about a function.
+(define (decl-names decls)
+  (map cadr (filter (λ (d) (not (eq? (car d) 'borrows))) decls)))
+
+;; The parameters f's `borrows` names, or `all`.
+(define (borrows-of decls f)
+  (or (for/first ([d decls] #:when (and (eq? (car d) 'borrows) (eq? (cadr d) f))) (caddr d))
+      'all))
+
+;; The loans a call's result may carry: those of every argument, or of the ones
+;; the callee's `borrows` names.
+(define (borrowed-loans Σ f params Ls)
+  (define only (borrows-of (decls-of Σ) f))
+  (for/fold ([L '()]) ([x params] [l Ls])
+    (if (or (eq? only 'all) (memq x only)) (union L l) L)))
 
 ;; a global's first value is built without running any of the program
 (define (constant? e)
@@ -1143,7 +1201,7 @@
   (match d
     [`(,(or 'struct 'sum) ,_ ,Ts ((,names ,ts) ...))
      (and (distinct? Ts) (distinct? names)
-          (distinct? (append Ts (map cadr decls)))
+          (distinct? (append Ts (decl-names decls)))
           (andmap (λ (t) (wf? (make-Σ decls Ts) t)) ts))]
     [`(view ,V ((,names ,ts) ...) . ,drop)
      (define Σ (make-Σ decls))
@@ -1164,13 +1222,24 @@
      (and (wf? (make-Σ decls) σ)
           (constant? e)
           (equal? (one-answer 'check-decl (judgment-holds (chk ,(make-Σ decls) () () ,e τ L Γ) τ)) σ))]
-    [`(defn . ,_) (check-fn decls d)]))
+    [`(defn . ,_) (check-fn decls d)]
+    ;; names a function, once, and only parameters of it that take a reference
+    [`(borrows ,f ,xs)
+     (match (for/first ([e decls] #:when (and (eq? (car e) 'defn) (eq? (cadr e) f))) e)
+       [`(defn ,_ ,_ ,params ,_ ,_)
+        (and (distinct? xs)
+             (= 1 (for/sum ([e decls]) (if (and (eq? (car e) 'borrows) (eq? (cadr e) f)) 1 0)))
+             (for/and ([x xs])
+               (match (assq x params)
+                 [(list _ t) (second-class? t)]
+                 [#f #f])))]
+       [#f #f])]))
 
 (define (check-program prog)
   (match prog
     [`(program ,decls ,main)
      (and (redex-match? Safe prog prog)
-          (distinct? (map cadr decls))
+          (distinct? (decl-names decls))
           (andmap (λ (d) (check-decl decls d)) decls)
           (match (one-answer 'check-program (judgment-holds (chk ,(make-Σ decls) () () ,main τ L Γ) (τ L)))
             [(list τ '()) (not (second-class? τ))]

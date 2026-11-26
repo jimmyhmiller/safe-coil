@@ -84,7 +84,9 @@
                     [_ (bail "an ill-typed program")])]
     [`(at ,q ,_) (match (place-type Σ Γ q)
                    [`(pool ,σ) σ]
-                   [_ (bail "an ill-typed program")])]))
+                   [_ (bail "an ill-typed program")])]
+    ;; what is no place: the rules refuse the program
+    [_ (bail "an ill-typed program")]))
 
 ;; the view q is, when `(: q fld)` is a reference held in a view; else #f
 (define (view-reference Σ Γ q fld)
@@ -549,6 +551,8 @@
       "\n")]
     [`(global ,g ,σ ,e)
      (format "(defglobal g-~a ~a ~a)" g (coil-type σ) (plain (make-Σ ds) '() e))]
+    ;; said on the function itself, as an annotation
+    [`(borrows ,_ ,_) ""]
     [`(defn ,f ,Ts ,params ,τr ,body)
      (define Σ (make-Σ ds Ts))
      ;; the function a view's drop runs is given the view as Coil's drop has it
@@ -559,8 +563,15 @@
        (string-append*
         (for/list ([p params] #:unless (or (ref? (cadr p)) (match (cadr p) [`(out ,_) #t] [_ #f])))
           (format "(mut ~a) ~a " (var-name (car p)) (var-name (car p))))))
-     (format "(defn ~a~a [~a] (-> ~a)\n  ~a)"
-             (fn-name f) (type-params Ts)
+     ;; what the result may borrow from, when the model says
+     (define borrows
+       (for/or ([d ds]) (match d [`(borrows ,(== f) ,xs) xs] [_ #f])))
+     (format "(defn ~a~a~a [~a] (-> ~a)\n  ~a)"
+             (fn-name f)
+             (if borrows
+                 (format " :safe/borrows ~s" (string-join (map var-name borrows)))
+                 "")
+             (type-params Ts)
              (string-join (for/list ([p params])
                             (format "(~a ~a)" (var-name (car p))
                                     (if dropping (format "(ref ~a)" (view-name dropping)) (coil-type (cadr p))))))
