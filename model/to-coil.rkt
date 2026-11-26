@@ -244,7 +244,12 @@
     [_ #f]))
 (define (discarded Σ Γ e)
   (define τ (type-of Σ Γ e))
-  (cond [(not (ends-in-place? e)) (value Σ Γ e)]
+  (cond ;; each branch of a conditional is thrown away on its own
+        [(match e [`(if0 ,_ ,e2 ,e3) (or (ends-in-place? e2) (ends-in-place? e3))] [_ #f])
+         (match e
+           [`(if0 ,e1 ,e2 ,e3)
+            (format "(if (= ~a 0) (do ~a 0) (do ~a 0))" (plain Σ Γ e1) (discarded Σ Γ e2) (discarded Σ Γ e3))])]
+        [(not (ends-in-place? e)) (value Σ Γ e)]
         [(ref? τ) (value Σ Γ e)]
         ;; a view is never passed for a type parameter; one that is moved has a
         ;; function of its own to take it

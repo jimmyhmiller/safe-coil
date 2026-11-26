@@ -284,14 +284,16 @@ run fails if the checker accepts anything the model refuses.
 checker at a time and requires `diff.py` to find a program the weakened checker
 wrongly accepts.
 
-On the model's 118 cases and 4000 random programs (seed 7), 4030 can be written
-as Coil. The compiler refuses 1726 of them itself. On the other 2304 the checker
-accepts nothing the model refuses: 1588 accepted by both, 687 refused by both,
-and 29 refused only by the checker, each for one of the differences below. All
-nineteen weakenings are caught, by a hand-written case or by the differential
+On the model's 161 cases and 4000 random programs (seed 7), 3396 can be written
+as Coil; 765 use something Coil cannot express (most often a closure that
+returns a reference, or one that owns a capture that is not a borrow). The
+compiler refuses 1460 of them itself. On the other 1933 the checker accepts
+nothing the model refuses: 1327 accepted by both, 580 refused by both, and 26
+refused only by the checker, each for one of the differences below. All 25
+weakenings are caught, 24 by a hand-written case and one by the differential
 run.
 
-`tests/run.py` has 100 hand-written cases. Every `ok_` case and both examples
+`tests/run.py` has 125 hand-written cases. Every `ok_` case and both examples
 also run clean under `--sanitize=address` and `--sanitize=thread`.
 
 ### Where Coil and the model differ
@@ -383,12 +385,17 @@ racket model/search.rkt teeth       # each rule weakened in turn: the search mus
 racket model/search.rkt teeth 20000 no-union par-split   # only those weakenings
 ```
 
-`teeth` is the check on the search itself. `rules.rkt` lists 24 ways to weaken
+`teeth` is the check on the search itself. `rules.rkt` lists 35 ways to weaken
 one rule (`mutants`), and the machine can drop its run-time check on globals.
-`teeth` fails unless the search finds a program that goes wrong under each one.
+`teeth` fails unless a hand-written case or the search finds a program that goes
+wrong under each one.
 The programs a seed gives depend on the rules, because a function body the
 rules refuse is generated again, so `teeth` looks through four seeds before it
 says a weakening was not found.
+
+Four seeds of 20000 programs find no counterexample under the rules as they
+are. All 36 weakenings are found: 34 at 5000 programs a seed, and two (an
+exclusive reference copied, a later branch's loans forgotten) at 20000.
 
 ## What the rules are stricter about than they need to be
 

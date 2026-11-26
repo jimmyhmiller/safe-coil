@@ -792,7 +792,12 @@
 (define (mentions? t heads)
   (let loop ([t t])
     (and (pair? t) (or (and (memq (car t) heads) #t) (ormap loop t)))))
-(define (own-part prog) (list-tail (cadr prog) (+ (length prelude) (length stock))))
+(define (own-part prog)
+  ;; a generated program has the prelude and the stock functions first; a
+  ;; hand-written case only the prelude
+  (define ds (cadr prog))
+  (define k (+ (length prelude) (length stock)))
+  (list-tail ds (if (>= (length ds) k) k (min (length ds) (length prelude)))))
 
 (define features
   '(("references" ref mut) ("calls" call) ("fields" :) ("match" match match-ref match-mut)
