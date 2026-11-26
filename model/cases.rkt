@@ -17,6 +17,14 @@
     (sum Opt (T) ((None unit) (Some T)))
     (view Two ((l (ref (box int))) (r (mut int))))
     (view Peek ((s (ref int)) (i int)))
+    ;; a lock: its drop reads what it holds, as a subscript's code after its yield does
+    (view Lock ((r (mut (box int)))) unlock)
+    (defn unlock () ((g (view Lock))) unit (seq (* (* (: g r))) unit))
+    ;; a view that holds a view
+    (view Nest ((in (view Peek)) (k (ref int))))
+    ;; a view that is shared, whose drop reads what it holds
+    (view Watch ((r (ref (box int)))) unwatch)
+    (defn unwatch () ((w (view Watch))) unit (seq (* (* (: w r))) unit))
     (global g1 (box int) (box 0))
     (global g2 (Opt (box int)) (inj (Opt (box int)) Some (box 1)))))
 
@@ -138,8 +146,10 @@
             '(let ([r (let ([a (box 3)]) (call inner () (ref a)))]) (* r))))
     (reject "a reference inside a box is not a type"
      ,(prog '() '(let ([a 1]) (let ([b (box (ref a))]) 0))))
-    (reject "an owner cannot be moved out of a box by naming it"
+    (accept "an owner is moved out of a box by naming it; the box is freed empty"
      ,(prog '() '(let ([a (box (box 1))]) (let ([b (* a)]) (* b)))))
+    (reject "what was moved out of a box is not there to read"
+     ,(prog '() '(let ([a (box (box 1))]) (let ([b (* a)]) (* (* a))))))
     (reject "take from a place that is lent"
      ,(prog '() '(let ([a (box (box 1))])
                    (let ([r (ref (* (* a)))])
@@ -173,8 +183,174 @@
                 (let ([r (ref (* (* y)))]) (seq (set! (* x) (box 2)) (* r)))))
             '(let ([p (new (Pair) (box 1) (box 2))])
                (call both () (mut (: p a)) (mut (: p a))))))
-    (reject "an owner cannot be moved out of a field by naming it"
-     ,(prog '() '(let ([p (new (Pair) (box 1) (box 2))]) (let ([b (: p a)]) (* b)))))
+    (accept "an owner is moved out of a field; the rest is dropped with the struct"
+     ,(prog '() '(let ([p (new (Pair) (box 1) (box 2))]) (let ([b (: p a)]) (+ (* b) (* (: p b)))))))
+
+    ;; ================================================== parts moved and given back
+    (accept "a field moved out and given back, then the whole is used"
+     ,(prog '((defn eat () ((b (box int))) int (* b)))
+            '(let ([p (new (Pair) (box 1) (box 2))])
+               (seq (call eat () (: p a)) (seq (set! (: p a) (box 3)) (let ([q p]) (* (: q a))))))))
+    (reject "a struct with a field moved out is not moved whole"
+     ,(prog '((defn eat () ((b (box int))) int (* b)))
+            '(let ([p (new (Pair) (box 1) (box 2))])
+               (seq (call eat () (: p a)) (let ([q p]) (* (: q a)))))))
+    (reject "a struct with a field moved out is not lent whole"
+     ,(prog '((defn eat () ((b (box int))) int (* b))
+              (defn first () ((p (ref (Pair)))) int (* (: (* p) a))))
+            '(let ([p (new (Pair) (box 1) (box 2))])
+               (seq (call eat () (: p a)) (call first () (ref p))))))
+    (accept "the other field of a struct with a field moved out is used"
+     ,(prog '((defn eat () ((b (box int))) int (* b)))
+            '(let ([p (new (Pair) (box 1) (box 2))])
+               (+ (call eat () (: p a)) (* (: p b))))))
+    (reject "a field of what was moved out cannot be assigned"
+     ,(prog '((defn eat () ((p (Wrap (Pair)))) int (* (: (: p v) b))))
+            '(let ([w (new (Wrap (Pair)) (new (Pair) (box 1) (box 2)) 0)])
+               (seq (call eat () w) (seq (set! (: (: w v) a) (box 5)) unit)))))
+    (accept "a part moved out in one branch is given back after it"
+     ,(prog '((defn eat () ((b (box int))) int (* b)))
+            '(let ([p (new (Pair) (box 1) (box 2))])
+               (seq (if0 0 (seq (call eat () (: p a)) unit) unit)
+                    (seq (set! (: p a) (box 4)) (* (: p a)))))))
+    (reject "a part moved out in one branch is not there after it"
+     ,(prog '((defn eat () ((b (box int))) int (* b)))
+            '(let ([p (new (Pair) (box 1) (box 2))])
+               (seq (if0 0 (seq (call eat () (: p a)) unit) unit) (* (: p a))))))
+    (accept "what an exclusive parameter refers to is moved out and put back"
+     ,(prog '((defn eat () ((b (box int))) int (* b))
+              (defn swap-in () ((m (mut (Pair)))) int
+                (let ([old (: (* m) a)]) (seq (set! (: (* m) a) (box 7)) (call eat () old)))))
+            '(let ([p (new (Pair) (box 1) (box 2))]) (seq (call swap-in () (mut p)) (* (: p a))))))
+    (reject "what an exclusive parameter refers to is left with a part moved out"
+     ,(prog '((defn eat () ((b (box int))) int (* b))
+              (defn steal () ((m (mut (Pair)))) int (call eat () (: (* m) a))))
+            '(let ([p (new (Pair) (box 1) (box 2))]) (seq (call steal () (mut p)) (* (: p a))))))
+    (accept "an element of a pool is given a new value"
+     ,(prog '() '(let ([p (pool-new (box int))])
+                   (let ([h (insert p (box 1))]) (seq (set! (at p h) (box 2)) (* (at p h)))))))
+    (reject "an owner is not moved out through a reference that is no parameter: nothing gives it back"
+     ,(prog '() '(let ([i 2]) (while i (seq (with mut g1 v (seq (* v) unit)) (set! i (+ i -1)))))))
+    (accept "a variable made with nothing in it is filled through an out parameter"
+     ,(prog '((defn fill () ((r (out (box int)))) unit (set! (* r) (box 4))))
+            '(let ([x (uninit (box int))]) (seq (call fill () (out x)) (* x)))))
+    (reject "a variable with nothing in it is not read"
+     ,(prog '() '(let ([x (uninit (box int))]) (* x))))
+    (reject "an out parameter that is not filled"
+     ,(prog '((defn skip () ((r (out (box int)))) unit unit))
+            '(let ([x (uninit (box int))]) (seq (call skip () (out x)) (* x)))))
+    (reject "an out parameter is not read before it is filled"
+     ,(prog '((defn peek () ((r (out (box int)))) unit (seq (* (* r)) (set! (* r) (box 1)))))
+            '(let ([x (uninit (box int))]) (seq (call peek () (out x)) (* x)))))
+    (reject "a place that holds a value is not passed as an out parameter"
+     ,(prog '((defn fill () ((r (out (box int)))) unit (set! (* r) (box 4))))
+            '(let ([x (box 1)]) (seq (call fill () (out x)) (* x)))))
+    (accept "a part moved out is filled again through an out parameter"
+     ,(prog '((defn fill () ((r (out (box int)))) unit (set! (* r) (box 4)))
+              (defn eat () ((b (box int))) int (* b)))
+            '(let ([p (new (Pair) (box 1) (box 2))])
+               (seq (call eat () (: p a)) (seq (call fill () (out (: p a))) (* (: p a)))))))
+
+    ;; ================================================== break and return
+    (accept "a loop moves a variable and then breaks; after it, the variable is gone"
+     ,(prog '((defn eat () ((b (box int))) int (* b)))
+            '(let ([a (box 1)]) (seq (while 1 (seq (call eat () a) (break))) 5))))
+    (reject "what a loop moved before a break is not there after the loop"
+     ,(prog '((defn eat () ((b (box int))) int (* b)))
+            '(let ([a (box 1)]) (seq (while 1 (seq (call eat () a) (break))) (* a)))))
+    (accept "a loop moves a variable before a break and gives it a value again"
+     ,(prog '((defn eat () ((b (box int))) int (* b)))
+            '(let ([a (box 1)]) (seq (while 1 (seq (call eat () a) (break))) (seq (set! a (box 2)) (* a))))))
+    (reject "a loop that moves without breaking moves again on its next turn"
+     ,(prog '((defn eat () ((b (box int))) int (* b)))
+            '(let ([a (box 1)]) (let ([i 2]) (while i (seq (call eat () a) (set! i (+ i -1))))))))
+    (accept "an early return"
+     ,(prog '((defn pick () ((r (ref (box int))) (c int)) (ref int)
+                (seq (if0 c (return (ref (* (* r))) unit) unit) (ref (* (* r))))))
+            '(let ([a (box 3)]) (let ([r (call pick () (ref a) 0)]) (* r)))))
+    (reject "an early return of a reference to a local"
+     ,(prog '((defn bad () ((c int)) (ref int)
+                (let ([x 3]) (seq (if0 c (return (ref x) unit) unit) (call bad () 1)))))
+            '(let ([r (call bad () 0)]) (* r))))
+    (reject "an early return leaves what an exclusive parameter refers to with a part moved out"
+     ,(prog '((defn eat () ((b (box int))) int (* b))
+              (defn steal () ((m (mut (Pair))) (c int)) int
+                (let ([n (call eat () (: (* m) a))])
+                  (seq (if0 c (return n unit) unit) (seq (set! (: (* m) a) (box 1)) n)))))
+            '(let ([p (new (Pair) (box 1) (box 2))]) (seq (call steal () (mut p) 0) (* (: p a))))))
+    (reject "an early return of a reference to a global"
+     ,(prog '((defn leak () () (ref (box int)) (with ref g1 x (return x (ref (box int))))))
+            '(let ([r (call leak ())]) (* (* r)))))
+
+    ;; ================================================== closures
+    (accept "a closure that borrows: called twice"
+     ,(prog '()
+            '(let ([n 1])
+               (let ([f (lam ([r (mut int) (mut n)]) () unit (set! (* r) (+ (* r) 1)))])
+                 (seq (apply f) (seq (apply f) n))))))
+    (reject "what a closure captured exclusively is not read while it is used"
+     ,(prog '()
+            '(let ([n 1])
+               (let ([f (lam ([r (mut int) (mut n)]) () unit (set! (* r) (+ (* r) 1)))])
+                 (seq (apply f) (seq n (apply f)))))))
+    (reject "a closure's capture cannot be freed under it"
+     ,(prog '()
+            '(let ([b (box 1)])
+               (let ([f (lam ([r (ref int) (ref (* b))]) () int (* r))])
+                 (seq (set! b (box 2)) (apply f))))))
+    (reject "a closure cannot leave the scope of what it borrows"
+     ,(prog '()
+            '(let ([f (let ([x 3]) (lam ([r (ref int) (ref x)]) () int (* r)))]) (apply f))))
+    (accept "a closure passed to a function that calls it"
+     ,(prog '((defn twice () ((f (fnb mut () unit))) unit (seq (apply f) (apply f))))
+            '(let ([n 0])
+               (seq (call twice () (lam ([r (mut int) (mut n)]) () unit (set! (* r) (+ (* r) 1)))) n))))
+    (reject "a closure's argument cannot reach what it captured exclusively"
+     ,(prog '()
+            '(let ([b (box 1)])
+               (let ([f (lam ([m (mut (box int)) (mut b)]) ((r (ref int))) int (seq (set! (* m) (box 2)) (* r)))])
+                 (apply f (ref (* b)))))))
+    (reject "two results of a closure that captured exclusively are not alive at once"
+     ,(prog '()
+            '(let ([b (box 1)])
+               (let ([f (lam ([m (mut (box int)) (mut b)]) () (mut (box int)) m)])
+                 (let ([x (apply f)])
+                   (let ([y (mut (* (* x)))])
+                     (let ([z (apply f)]) (seq (set! (* z) (box 5)) (* y)))))))))
+    (accept "a closure that owns what it captured, kept and called later"
+     ,(prog '((defn run () ((f (fno () int))) int (+ (apply f) (apply f))))
+            '(let ([f (lamo ([c (box int) (box 5)]) () int (seq (set! c (box (+ (* c) 1))) (* c)))])
+               (call run () f))))
+    (reject "a closure that owns what it captured cannot move it away"
+     ,(prog '((defn eat () ((b (box int))) int (* b))
+              (defn run () ((f (fno () int))) int (+ (apply f) (apply f))))
+            '(call run () (lamo ([c (box int) (box 5)]) () int (call eat () c)))))
+    (reject "a closure that owns what it captured cannot capture a reference"
+     ,(prog '((defn run () ((f (fno () int))) int (apply f)))
+            '(let ([f (let ([x 4]) (lamo ([r (ref int) (ref x)]) () int (* r)))]) (call run () f))))
+    (accept "a closure that owns what it captured, run on a thread"
+     ,(prog '() '(join (spawn-fn (lamo ([c (box int) (box 5)]) () int (* c))))))
+
+    ;; ================================================== views that run code when dropped
+    (accept "a lock whose drop reads what it holds"
+     ,(prog '() '(let ([b (box 1)]) (seq (let ([g (new (view Lock) (mut b))]) unit) (* b)))))
+    (reject "what a lock holds is not freed while the lock lives, even after its last use"
+     ,(prog '() '(let ([b (box (box 1))])
+                   (let ([g (new (view Lock) (mut (* b)))]) (set! b (box (box 2)))))))
+    (accept "a shared view whose drop reads what it holds"
+     ,(prog '() '(let ([b (box (box 1))])
+                   (seq (let ([w (new (view Watch) (ref (* b)))]) unit) (* (* b))))))
+    (reject "what a shared view with a drop holds is not freed while the view lives, even after its last use"
+     ,(prog '() '(let ([b (box (box 1))])
+                   (let ([w (new (view Watch) (ref (* b)))]) (set! b (box (box 2)))))))
+    (accept "a view that holds a view"
+     ,(prog '() '(let ([a 1]) (let ([b 2])
+                   (let ([n (new (view Nest) (new (view Peek) (ref a) 0) (ref b))])
+                     (+ (* (: (: n in) s)) (* (: n k))))))))
+    (reject "a view that holds a view keeps the inner one's loans"
+     ,(prog '() '(let ([a (box 1)]) (let ([b 2])
+                   (let ([n (new (view Nest) (new (view Peek) (ref (* a)) 0) (ref b))])
+                     (seq (set! a (box 3)) (* (: (: n in) s))))))))
 
     ;; ================================================== sums and match
     (accept "match by value: the arm owns the payload"

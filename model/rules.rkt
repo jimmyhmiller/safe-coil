@@ -4,13 +4,15 @@
 ;; Storable types (σ) are what memory can hold: plain data, owners (a box is a
 ;; heap allocation freed when its owner goes out of scope; a pool owns its
 ;; elements), structs and sums of those, raw pointers, handles, type parameters.
-;; Second-class types are references and views (a struct with reference
-;; fields): a local, an argument or a result, never stored.
+;; Second-class types are references, views (a struct with reference
+;; fields) and closures that borrow what they capture: a local, an argument or a
+;; result, never stored. A closure that owns what it captures is storable.
 ;;
 ;; The judgment is algorithmic:   (chk Σ Γ Λ e τ L Γ′)
 ;;   Σ   where we are: the declarations, the function's type parameters, whether
 ;;       inside `unsafe`, whether inside a loop
-;;   Γ   each variable in scope, its type, and whether it has been moved
+;;   Γ   each variable in scope, its type, which parts of it have been moved, and
+;;       what was moved on the way to each `break` of the loop being checked
 ;;   Λ   the loans alive here: who holds each, on which place, shared or exclusive
 ;;   τ   the type of e
 ;;   L   the loans the VALUE of e carries (empty unless τ is second-class)
@@ -18,7 +20,7 @@
 ;; Λ is an input only: a loan lives exactly as long as the scope of its holder.
 (require redex/reduction-semantics)
 (provide Safe chk check-program check-fn mutant mutants
-         make-Σ fields-of variants-of subst copy? second-class? exclusive?)
+         make-Σ fields-of variants-of subst copy? second-class? exclusive? view-drop)
 
 ;; Testing the tests: with one part of one rule left out, the random search must
 ;; find a program that goes wrong. Never set in a real check. The value is also
@@ -49,30 +51,50 @@
     (par-split "the two calls of a par are checked apart")
     (spawn-ref "a thread is given a reference")
     (dead-source "a reference lent again is forgotten once its own name is no longer used")
-    (raw-anywhere "a raw pointer is read outside unsafe")))
+    (raw-anywhere "a raw pointer is read outside unsafe")
+    (clo-no-loans "a closure carries no loans from what it captures")
+    (clo-shared-call "calling a closure that captured exclusively does not lend it exclusively")
+    (clo-moves "an owning closure's body may move what it captured")
+    (clo-own-ref "an owning closure may capture a reference")
+    (drop-view-unpinned "a view that is dropped lets its loans go at its last use")
+    (part-unmarked "moving part of a variable is not remembered")
+    (set-inside-moved "a part of something moved away can be assigned")
+    (no-restore "a function may leave part of what an exclusive parameter refers to moved")
+    (break-forgets "what a loop moved before a break is forgotten after the loop")
+    (return-escape "a value returned early may hold a loan on the function's own storage")
+    (out-unfilled "a function may leave its out parameter unfilled")))
 (define (mutant? m) (eq? (mutant) m))
 
 (define-language Safe
   (prog ::= (program (decl ...) e))
+  ;; A view may name a function its drop runs: one that takes the view, as a
+  ;; subscript's code after its `yield` does.
   (decl ::= (struct S (T ...) ((fld σ) ...))
             (sum S (T ...) ((K σ) (K σ) ...))
             (view V ((fld ρ) ...))
+            (view V ((fld ρ) ...) f)
             (global g σ e)
             (defn f (T ...) ((x τ) ...) τ e))
-  ;; storable types; what a view's field can be; all types
-  (σ ::= int unit (box σ) (ptr σ) (pool σ) (handle σ) (task σ) (S σ ...) T)
-  (ρ ::= σ (ref σ) (mut σ))
-  (τ ::= ρ (view V))
+  ;; storable types; what a view's field can be; all types. A closure that owns
+  ;; what it captured is storable; one that borrows is second-class, exclusive
+  ;; when it captured something exclusively. An out parameter refers to a place
+  ;; that holds nothing yet, which the callee must fill.
+  (σ ::= int unit (box σ) (ptr σ) (pool σ) (handle σ) (task σ) (S σ ...) T
+         (fno (τ ...) τ))
+  (ρ ::= σ (ref σ) (mut σ) (view V))
+  (τ ::= ρ (fnb k (τ ...) τ) (out σ))
   (e ::= n unit p
          (let ([x e]) e) (seq e e) (if0 e e e) (+ e e)
-         (while e e) (break)
-         (box e) (unbox e) (ref p) (mut p) (set! p e) (take p e)
+         (while e e) (break) (return e τ)
+         (box e) (unbox e) (ref p) (mut p) (out p) (set! p e) (take p e) (uninit σ)
          (new τ e ...) (inj σ K e)
          (match e ((K x) e) ...) (match-ref p ((K x) e) ...) (match-mut p ((K x) e) ...)
          (pool-new σ) (insert p e) (remove p x)
          (call f (σ ...) e ...)
+         (lam ([x τ e] ...) ((x τ) ...) τ e) (lamo ([x τ e] ...) ((x τ) ...) τ e)
+         (apply p e ...)
          (par (call f (σ ...) e ...) (call f (σ ...) e ...))
-         (spawn (call f (σ ...) e ...)) (join e)
+         (spawn (call f (σ ...) e ...)) (spawn-fn e) (join e)
          (with w g x e)
          (unsafe e) (addr p) (load e) (store e e) (alloc e) (free e))
   ;; a variable, what a box or reference points at, a field, a pool element
@@ -80,8 +102,16 @@
   (n ::= integer)
   (w ::= ref mut)
   (k ::= shr mut)
-  (s ::= live moved)
-  (Γ ::= ((x τ s) ...))
+  ;; what of a variable is still there: all of it, none of it, or all but the
+  ;; parts at these paths (a path is fields and `*`s from the variable)
+  (s ::= live moved (gone π ...))
+  (π ::= (step ...))
+  (step ::= * fld)
+  ;; the same, joined over every `break` of the loop being checked; none when
+  ;; no break has been seen
+  (b ::= none s)
+  ;; An unreachable point (after a break or a return) has `%dead` first.
+  (Γ ::= ((x τ s b) ...))
   ;; a loan's place is rooted at a local, at what a reference parameter refers
   ;; to, or at a global; every element of a pool is one place
   (q ::= x (ext x) (glob g) (* q) (: q fld) (elem q))
@@ -97,19 +127,23 @@
 ;; by identity: it looks Σ up in a table on every step, and hashing the whole
 ;; program each time was most of the cost of a check.
 (struct program-decls (list))
-(define (make-Σ decls [Ts '()]) (list (mutant) 'safe 'noloop Ts (program-decls decls) '()))
+;; The seventh element says what a `return` must give back: the function's
+;; result type and its parameters (a closure's captures count as parameters), or
+;; #f outside any function.
+(define (make-Σ decls [Ts '()] [fn #f]) (list (mutant) 'safe 'noloop Ts (program-decls decls) '() fn))
 (define (in-unsafe? Σ) (eq? (second Σ) 'unsafe))
 (define (in-loop? Σ) (eq? (third Σ) 'loop))
 (define (tparams Σ) (fourth Σ))
 (define (decls-of Σ) (program-decls-list (fifth Σ)))
-(define (Σ-unsafe Σ) (list (first Σ) 'unsafe (third Σ) (fourth Σ) (fifth Σ) (sixth Σ)))
-(define (Σ-loop Σ) (list (first Σ) (second Σ) 'loop (fourth Σ) (fifth Σ) (sixth Σ)))
+(define (fn-of Σ) (seventh Σ))
+(define (Σ-set Σ i v) (list-set Σ i v))
+(define (Σ-unsafe Σ) (Σ-set Σ 1 'unsafe))
+(define (Σ-loop Σ) (Σ-set Σ 2 'loop))
 ;; The variables that what runs after the expression being checked still names.
 (define (Σ-live Σ) (sixth Σ))
 ;; Σ for an expression that the expressions `later` run after.
 (define (Σ+ Σ . later)
-  (list (first Σ) (second Σ) (third Σ) (fourth Σ) (fifth Σ)
-        (remove-duplicates (append (append-map uses later) (sixth Σ)))))
+  (Σ-set Σ 5 (remove-duplicates (append (append-map uses later) (sixth Σ)))))
 
 ;; Σ for an expression that each of the expressions `laters` runs after. A list
 ;; of expressions is not an expression: `(x y)` is two variables, where a form
@@ -134,6 +168,10 @@
     [`(call ,_ ,_ ,es ...) (append-map uses es)]
     [`(with ,_ ,_ ,x ,e) (cons x (uses e))]
     [`(break) '()]
+    [`(return ,e ,_) (uses e)]
+    [`(uninit ,_) '()]
+    ;; a closure's body is a function of its own: what it names is not ours
+    [`(,(or 'lam 'lamo) ([,_ ,_ ,es] ...) ,_ ,_ ,_) (append-map uses es)]
     [(cons (? symbol?) rest) (append-map uses rest)]
     [_ (error 'uses "not an expression: ~a" t)]))
 (define (find-decl Σ kind name)
@@ -145,12 +183,16 @@
   (match τ
     [(? symbol? t) (let ([i (index-of Ts t)]) (if i (list-ref σs i) t))]
     [`(view ,_) τ]
-    [(cons head args) (cons head (for/list ([a args]) (subst a Ts σs)))]))
+    ['() '()]
+    [`(fnb ,k ,τs ,τr) `(fnb ,k ,(subst τs Ts σs) ,(subst τr Ts σs))]
+    [`(fno ,τs ,τr) `(fno ,(subst τs Ts σs) ,(subst τr Ts σs))]
+    [(cons head args) (cons (if (pair? head) (subst head Ts σs) head)
+                            (for/list ([a args]) (subst a Ts σs)))]))
 
 ;; -> ((fld τ) ...) for a struct or view type, else #f
 (define (fields-of Σ τ)
   (match τ
-    [`(view ,V) (match (find-decl Σ 'view V) [`(view ,_ ,fields) fields] [_ #f])]
+    [`(view ,V) (match (find-decl Σ 'view V) [`(view ,_ ,fields . ,_) fields] [_ #f])]
     [(cons (? symbol? S) args)
      (match (find-decl Σ 'struct S)
        [`(struct ,_ ,Ts ((,fs ,ts) ...))
@@ -177,21 +219,43 @@
   (match τ
     [(or 'int 'unit) #t]
     [(? symbol? t) (and (memq t (tparams Σ)) #t)]
-    [`(,(or 'box 'ptr 'pool 'handle 'task 'ref 'mut) ,σ) (wf? Σ σ)]
+    [`(,(or 'box 'ptr 'pool 'handle 'task 'ref 'mut 'out) ,σ) (wf? Σ σ)]
     [`(view ,V) (and (find-decl Σ 'view V) #t)]
+    [`(fnb ,k (,τs ...) ,τr) (and (memq k '(shr mut)) (andmap (λ (t) (wf? Σ t)) (cons τr τs)))]
+    [`(fno (,τs ...) ,τr) (andmap (λ (t) (wf? Σ t)) (cons τr τs))]
     [(cons (? symbol? S) args)
      (let ([d (or (find-decl Σ 'struct S) (find-decl Σ 'sum S))])
        (and d (= (length (caddr d)) (length args)) (andmap (λ (a) (wf? Σ a)) args)))]
     [_ #f]))
 
-(define (second-class? τ) (match τ [`(,(or 'ref 'mut 'view) ,_) #t] [_ #f]))
+(define (second-class? τ)
+  (match τ [`(,(or 'ref 'mut 'view 'out) ,_) #t] [`(fnb . ,_) #t] [_ #f]))
 ;; a second-class value that cannot be copied: it gives exclusive access
-(define (exclusive? Σ τ)
+(define (exclusive? Σ τ [seen '()])
   (match τ
-    [`(mut ,_) #t]
-    [`(view ,_) (for/or ([f (fields-of Σ τ)]) (match (cadr f) [`(mut ,_) #t] [_ #f]))]
+    [`(,(or 'mut 'out) ,_) #t]
+    [`(fnb mut . ,_) #t]
+    [`(view ,V) (and (not (memq V seen))
+                     (for/or ([f (fields-of Σ τ)]) (exclusive? Σ (cadr f) (cons V seen))))]
     [_ #f]))
 (define (kind-of Σ τ) (if (exclusive? Σ τ) 'mut 'shr))
+;; the function a view's drop runs, or #f
+(define (view-drop Σ τ)
+  (match τ
+    [`(view ,V) (match (find-decl Σ 'view V) [`(view ,_ ,_ ,f) f] [_ #f])]
+    [_ #f]))
+;; A view that is dropped: one that gives exclusive access, or one whose drop
+;; runs code. Naming one moves it, and it keeps its loans until its scope ends,
+;; since its drop may use what it borrowed.
+(define (dropped-view? Σ τ)
+  (match τ
+    [`(view ,_) (and (or (exclusive? Σ τ)
+                         (and (view-drop Σ τ) #t)
+                         (for/or ([f (fields-of Σ τ)]) (dropped-view? Σ (cadr f))))
+                     #t)]
+    [_ #f]))
+;; a second-class value that is moved when it is named
+(define (moved-second? Σ τ) (or (exclusive? Σ τ) (dropped-view? Σ τ)))
 
 ;; a storable type whose values own nothing. A type parameter may stand for an owner.
 (define (copy? Σ σ [seen '()])
@@ -200,6 +264,7 @@
     [(? symbol?) (mutant? 'copy-typevar)]
     [`(,(or 'ptr 'handle) ,_) #t]
     [`(,(or 'box 'pool 'task) ,_) #f]
+    [`(fno . ,_) #f]
     [_ (let ([parts (or (fields-of Σ σ) (variants-of Σ σ))])
          (and parts
               (not (member σ seen))
@@ -210,15 +275,15 @@
 
 (define (lookup Γ x)
   (match (assq x Γ)
-    [(list _ τ 'live) τ]
-    [(list _ τ 'moved) (if (mutant? 'no-moves) τ #f)]
+    [(list _ τ 'moved _) (if (mutant? 'no-moves) τ #f)]
+    [(list _ τ _ _) τ]
     [_ #f]))
 
 (define (place-type Σ Γ p)
   (match p
     [(? symbol? x) (lookup Γ x)]
     [`(* ,p2) (match (place-type Σ Γ p2)
-                [`(,(or 'box 'ref 'mut) ,σ) σ]
+                [`(,(or 'box 'ref 'mut 'out) ,σ) σ]
                 [_ #f])]
     [`(: ,p2 ,fld) (let* ([t (place-type Σ Γ p2)]
                           [fs (and t (fields-of Σ t))])
@@ -257,7 +322,7 @@
   (match p
     [(? symbol?) #t]
     [`(* ,p2) (and (or (mutant? 'write-through-shared)
-                       (match (place-type Σ Γ p2) [`(,(or 'box 'mut) ,_) #t] [_ #f]))
+                       (match (place-type Σ Γ p2) [`(,(or 'box 'mut 'out) ,_) #t] [_ #f]))
                    (writable? Σ Γ p2))]
     [`(,_ ,p2 ,_) (writable? Σ Γ p2)]))
 (define (through-shared? Σ Γ p)
@@ -288,8 +353,12 @@
   (define (kept? h)
     (or (memq h later)
         (match (assq h Γ)
-          [(list _ τ _) (or (not (second-class? τ))
-                            (match τ [`(view ,_) (exclusive? Σ τ)] [_ #f]))]
+          [(list _ τ _ _) (or (not (second-class? τ))
+                              (match τ
+                                [`(view ,_) (if (mutant? 'drop-view-unpinned)
+                                                (exclusive? Σ τ)
+                                                (dropped-view? Σ τ))]
+                                [_ #f]))]
           [_ #t])))
   (define holders (remove-duplicates (map car Λ)))
   (define live
@@ -355,32 +424,190 @@
         [(or (mutant? 'global-escape) (mutant? 'no-escape)) (filter (negate bad?) L)]
         [else #f]))
 
-(define (mark-moved Γ x)
-  (if (mutant? 'no-moves)
+;; ---- what of each variable is still there
+
+;; The path of a place from its variable: (x step ...), or #f when the place is
+;; an element of a pool, which only the whole pool is known about.
+(define (path-of p)
+  (match p
+    [(? symbol? x) (list x)]
+    [`(* ,p2) (let ([r (path-of p2)]) (and r (append r '(*))))]
+    [`(: ,p2 ,fld) (let ([r (path-of p2)]) (and r (append r (list fld))))]
+    [`(at ,_ ,_) #f]))
+;; the path of the part of p a moved part could be in: up to its first pool element
+(define (reach-of p)
+  (match p
+    [(? symbol? x) (list x)]
+    [`(* ,p2) (append (reach-of p2) '(*))]
+    [`(: ,p2 ,fld) (append (reach-of p2) (list fld))]
+    [`(at ,p2 ,_) (reach-of p2)]))
+(define (list-prefix? a b) (and (<= (length a) (length b)) (equal? a (take b (length a)))))
+(define (paths-overlap? a b) (or (list-prefix? a b) (list-prefix? b a)))
+
+(define (state-of Γ x) (match (assq x Γ) [(list _ _ s _) s] [_ #f]))
+(define (set-state Γ x s2)
+  (for/list ([e Γ]) (if (eq? (car e) x) (list x (cadr e) s2 (cadddr e)) e)))
+
+;; is every part of the place p there to be read, lent or moved?
+(define (available? Γ p)
+  (match-define (cons x π) (reach-of p))
+  (match (state-of Γ x)
+    ['live #t]
+    ['moved (mutant? 'no-moves)]
+    [`(gone ,πs ...) (not (for/or ([g πs]) (paths-overlap? g π)))]
+    [#f #f]))
+
+;; part π of a variable in state s is moved
+(define (state-minus s π)
+  (cond [(null? π) 'moved]
+        [else (match s
+                ['moved 'moved]
+                ['live `(gone ,π)]
+                [`(gone ,πs ...) `(gone ,@(filter (λ (g) (not (list-prefix? π g))) πs) ,π)])]))
+;; part π is given a value again
+(define (state-plus s π)
+  (cond [(null? π) 'live]
+        [else (match s
+                ['live 'live]
+                ['moved 'moved]
+                [`(gone ,πs ...)
+                 (define left (filter (λ (g) (not (list-prefix? π g))) πs))
+                 (if (null? left) 'live `(gone ,@left))])]))
+;; can the place p be assigned? Its variable and every part above it must be
+;; there; p itself, or parts of it, may have been moved.
+(define (assignable? Γ p)
+  ;; an element of a pool is never moved out: its pool must be there
+  (match-define (cons x π) (or (path-of p) (reach-of p)))
+  (match (state-of Γ x)
+    ['live #t]
+    ['moved (or (null? π) (mutant? 'set-inside-moved))]
+    [`(gone ,πs ...) (or (mutant? 'set-inside-moved)
+                         (not (for/or ([g πs]) (and (list-prefix? g π) (not (equal? g π))))))]
+    [#f #f]))
+(define (mark-moved Γ p)
+  (match-define (cons x π) (path-of p))
+  (if (or (mutant? 'no-moves) (and (pair? π) (mutant? 'part-unmarked)))
       Γ
-      (for/list ([b Γ]) (if (eq? (car b) x) (list x (cadr b) 'moved) b))))
-;; the type of x when it is a variable that was moved out of, else #f
-(define (moved-type Γ x)
-  (match (assq x Γ)
-    [(list _ τ 'moved) (and (not (second-class? τ)) τ)]
-    [_ #f]))
-(define (mark-live Γ x)
-  (for/list ([b Γ]) (if (eq? (car b) x) (list x (cadr b) 'live) b)))
+      (set-state Γ x (state-minus (state-of Γ x) π))))
+(define (mark-filled Γ p)
+  (match (path-of p)
+    [(cons x π) (set-state Γ x (state-plus (state-of Γ x) π))]
+    [#f Γ]))
+;; Γ as if nothing had been moved: for the type of a place that holds nothing
+(define (all-live Γ) (for/list ([e Γ]) (list (car e) (cadr e) 'live (cadddr e))))
+;; is the place p exactly a part that has been moved, to be filled through an
+;; out parameter?
+(define (empty-place? Γ p)
+  (define path (path-of p))
+  (and path
+       (match (state-of Γ (car path))
+         ['moved (null? (cdr path))]
+         [`(gone ,πs ...) (and (member (cdr path) πs) #t)]
+         [_ #f])))
+
+(define (state-join a b)
+  (match* (a b)
+    [('live s) s]
+    [(s 'live) s]
+    [('moved _) 'moved]
+    [(_ 'moved) 'moved]
+    [(`(gone ,xs ...) `(gone ,ys ...))
+     (define all (remove-duplicates (append xs ys)))
+     `(gone ,@(filter (λ (g) (not (for/or ([h all]) (and (list-prefix? h g) (not (equal? h g)))))) all))]))
+(define (break-join a b)
+  (cond [(eq? a 'none) b] [(eq? b 'none) a] [else (state-join a b)]))
+
+;; An unreachable point: after a break or a return.
+(define dead-mark '(%dead unit live none))
+(define (dead? Γ) (and (pair? Γ) (eq? (caar Γ) '%dead)))
+(define (vars-of Γ) (if (dead? Γ) (cdr Γ) Γ))
+(define (make-dead Γ) (if (dead? Γ) Γ (cons dead-mark Γ)))
+
 (define (remove-var Γ x) (filter (λ (b) (not (eq? (car b) x))) Γ))
+(define (bind-var Γ x τ) (let ([vs (vars-of Γ)])
+                           (define bound (cons (list x τ 'live 'none) vs))
+                           (if (dead? Γ) (make-dead bound) bound)))
+;; Two ways the program may have come: a variable is moved after it if it was
+;; on either way, and an unreachable way does not count.
 (define (join Γ1 Γ2)
-  (for/list ([a Γ1] [b Γ2])
-    (list (car a) (cadr a) (if (and (eq? (caddr a) 'live) (eq? (caddr b) 'live)) 'live 'moved))))
+  (define d1 (dead? Γ1))
+  (define d2 (dead? Γ2))
+  (define body
+    (for/list ([a (vars-of Γ1)] [b (vars-of Γ2)])
+      (list (car a) (cadr a)
+            (cond [d1 (caddr b)] [d2 (caddr a)] [else (state-join (caddr a) (caddr b))])
+            (break-join (cadddr a) (cadddr b)))))
+  (if (and d1 d2) (make-dead body) body))
+;; A break: what each variable is here joins what it is at the loop's other breaks.
+(define (record-break Γ)
+  (make-dead (for/list ([e (vars-of Γ)]) (list (car e) (cadr e) (caddr e) (break-join (cadddr e) (caddr e))))))
+(define (same-states? Γ1 Γ2)
+  (equal? (map caddr (vars-of Γ1)) (map caddr (vars-of Γ2))))
+;; A loop is left when its condition is 0 (the state after the condition) or by
+;; a break; the breaks seen outside it are the outer loop's again.
+(define (clear-breaks Γ)
+  (define vs (for/list ([e (vars-of Γ)]) (list (car e) (cadr e) (caddr e) 'none)))
+  (if (dead? Γ) (make-dead vs) vs))
+(define (loop-exit Γ-outer Γ-cond Γ-body)
+  (for/list ([o (vars-of Γ-outer)] [c (vars-of Γ-cond)] [e (vars-of Γ-body)])
+    (list (car o) (cadr o)
+          (if (mutant? 'break-forgets) (caddr c) (break-join (caddr c) (cadddr e)))
+          (cadddr o))))
+
+;; Can the part of an exclusive or out parameter's referent be left as it is
+;; when the function returns? It must all be there.
+(define (restored? Σ x τ s)
+  (match τ
+    [`(,(or 'mut 'out) ,_)
+     (match s
+       [`(gone ,πs ...) (or (mutant? (if (eq? (car τ) 'out) 'out-unfilled 'no-restore))
+                            (not (for/or ([g πs]) (and (pair? g) (eq? (car g) '*)))))]
+       [_ #t])]
+    [`(fnb . ,_) #t]
+    [`(view ,_) #t]
+    [`(ref ,_) #t]
+    [_ #t]))
+
+;; Can the owner at p be moved out of it? A variable can, and so can a field of
+;; a struct and what a box or an exclusive reference holds, along a path of
+;; those. An element of a pool, a view's field and anything behind a shared
+;; reference cannot: `take` gets an owner out of those.
+(define (movable? Σ Γ p)
+  (match p
+    [(? symbol?) #t]
+    ;; through an exclusive reference only when it is a parameter (a closure's
+    ;; capture counts): the function's every way out checks it is given back
+    [`(* ,p2) (and (match (place-type Σ Γ p2)
+                     ['(box . ,_) #t]
+                     [`(box ,_) #t]
+                     [`(,(or 'mut 'out) ,_)
+                      (match (fn-of Σ)
+                        [(list _ params) (and (memq (place-root (norm p2)) params) #t)]
+                        [_ #f])]
+                     [_ #f])
+                   (movable? Σ Γ p2))]
+    [`(: ,p2 ,_) (and (match (place-type Σ Γ p2) [`(view ,_) #f] [_ #t])
+                      (movable? Σ Γ p2))]
+    [_ #f]))
+
+;; can a value of type GOT be given where WANT is asked for?
+(define (fits? got want)
+  (or (equal? got want)
+      (match* (got want)
+        [(`(fnb shr ,τs ,τr) `(fnb mut ,τs2 ,τr2)) (and (equal? τs τs2) (equal? τr τr2))]
+        [(_ _) #f])))
 
 ;; what naming a place as a value does
-;;   copy   plain data is copied             move   an owner is moved (variables only)
+;;   copy   plain data is copied             move   an owner is moved
 ;;   copy2  a shared reference or view is copied, loans and all
-;;   move2  an exclusive one is moved
+;;   move2  an exclusive one is moved (variables only)
 (define (read-kind Σ Γ p)
   (define τ (place-type Σ Γ p))
   (cond [(not τ) #f]
-        [(second-class? τ) (if (exclusive? Σ τ) (and (symbol? p) 'move2) 'copy2)]
+        [(match τ [`(out ,_) #t] [_ #f]) #f]
+        [(second-class? τ) (if (moved-second? Σ τ) (and (symbol? p) 'move2) 'copy2)]
         [(copy? Σ τ) 'copy]
-        [(symbol? p) 'move]
+        [(movable? Σ Γ p) 'move]
         [else #f]))
 
 ;; ---------------------------------------------------------------- the rules
@@ -402,28 +629,34 @@
 
   [(side-condition ,(eq? 'copy (read-kind (term Σ) (term Γ) (term p))))
    (where σ ,(place-type (term Σ) (term Γ) (term p)))
+   (side-condition ,(available? (term Γ) (term p)))
    (side-condition ,(read-ok? (active (term Σ) (term Γ) (term Λ)) (term p)))
    -------------------------------------------- "copy"
    (chk Σ Γ Λ p σ () Γ)]
 
-  ;; only a whole variable can be moved; `take` gets an owner out of anywhere else
-  [(side-condition ,(eq? 'move (read-kind (term Σ) (term Γ) (term x))))
-   (where σ ,(place-type (term Σ) (term Γ) (term x)))
-   (side-condition ,(write-ok? (active (term Σ) (term Γ) (term Λ)) (term x)))
-   (where Γ_1 ,(mark-moved (term Γ) (term x)))
+  ;; a variable, a field of a struct, or what a box or exclusive reference holds;
+  ;; the part moved is gone until it is given a value again
+  [(side-condition ,(eq? 'move (read-kind (term Σ) (term Γ) (term p))))
+   (where σ ,(place-type (term Σ) (term Γ) (term p)))
+   (side-condition ,(available? (term Γ) (term p)))
+   (side-condition ,(write-ok? (active (term Σ) (term Γ) (term Λ)) (term p)))
+   (where Γ_1 ,(mark-moved (term Γ) (term p)))
    -------------------------------------------- "move"
-   (chk Σ Γ Λ x σ () Γ_1)]
+   (chk Σ Γ Λ p σ () Γ_1)]
 
   [(side-condition ,(eq? 'copy2 (read-kind (term Σ) (term Γ) (term p))))
    (where τ ,(place-type (term Σ) (term Γ) (term p)))
+   (side-condition ,(available? (term Γ) (term p)))
    (side-condition ,(read-ok? (active (term Σ) (term Γ) (term Λ)) (term p)))
    (where L ,(loans-of (term Λ) (place-root (term p))))
    -------------------------------------------- "copy-ref"
    (chk Σ Γ Λ p τ L Γ)]
 
-  ;; an exclusive reference is moved, and must not be reborrowed at the time
+  ;; an exclusive reference, or a view that is dropped, is moved, and must not
+  ;; be reborrowed at the time
   [(side-condition ,(eq? 'move2 (read-kind (term Σ) (term Γ) (term x))))
    (where τ ,(place-type (term Σ) (term Γ) (term x)))
+   (side-condition ,(available? (term Γ) (term x)))
    (side-condition ,(write-ok? (active (term Σ) (term Γ) (term Λ)) (term x)))
    (where L ,(loans-of (term Λ) (term x)))
    (where Γ_1 ,(if (mutant? 'copy-mut) (term Γ) (mark-moved (term Γ) (term x))))
@@ -431,17 +664,32 @@
    (chk Σ Γ Λ x τ L Γ_1)]
 
   [(where σ ,(place-type (term Σ) (term Γ) (term p)))
+   (side-condition ,(available? (term Γ) (term p)))
    (side-condition ,(read-ok? (active (term Σ) (term Γ) (term Λ)) (term p)))
    (where L ,(shared-loans (term Σ) (term Γ) (term Λ) (term p)))
    -------------------------------------------- "borrow"
    (chk Σ Γ Λ (ref p) (ref σ) L Γ)]
 
   [(where σ ,(place-type (term Σ) (term Γ) (term p)))
+   (side-condition ,(available? (term Γ) (term p)))
    (side-condition ,(writable? (term Σ) (term Γ) (term p)))
    (side-condition ,(write-ok? (active (term Σ) (term Γ) (term Λ)) (term p)))
    (where L ,(exclusive-loans (term p)))
    -------------------------------------------- "borrow-mut"
    (chk Σ Γ Λ (mut p) (mut σ) L Γ)]
+
+  ;; a place that holds nothing, lent to be filled: a call it is passed to fills it
+  [(where σ ,(place-type (term Σ) (all-live (term Γ)) (term p)))
+   (side-condition ,(empty-place? (term Γ) (term p)))
+   (side-condition ,(writable? (term Σ) (term Γ) (term p)))
+   (side-condition ,(write-ok? (active (term Σ) (term Γ) (term Λ)) (term p)))
+   (where L ,(exclusive-loans (term p)))
+   -------------------------------------------- "out"
+   (chk Σ Γ Λ (out p) (out σ) L Γ)]
+
+  [(side-condition ,(wf? (term Σ) (term σ)))
+   -------------------------------------------- "uninit"
+   (chk Σ Γ Λ (uninit σ) σ () Γ)]
 
   [(chk Σ Γ Λ e σ () Γ_1)
    -------------------------------------------- "box"
@@ -451,11 +699,13 @@
    -------------------------------------------- "unbox"
    (chk Σ Γ Λ (unbox e) σ () Γ_1)]
 
-  ;; the loans of e_1's value belong to x, and count while x is still named
+  ;; The loans of e_1's value belong to x, and count while x is still named. A
+  ;; `let` of `(uninit σ)` makes a variable with nothing in it yet.
   [(chk ,(Σ+ (term Σ) (term e_2)) Γ Λ e_1 τ_1 L_1 Γ_1)
    (side-condition ,(not (assq (term x) (term Γ_1))))
    (where Λ_2 ,(add-loans (term Λ) (term x) (if (mutant? 'no-let-loans) '() (term L_1))))
-   (where Γ_b ,(cons (term (x τ_1 live)) (term Γ_1)))
+   (where Γ_b ,(let ([g (bind-var (term Γ_1) (term x) (term τ_1))])
+                 (match (term e_1) [`(uninit ,_) (set-state g (term x) 'moved)] [_ g])))
    (chk Σ Γ_b Λ_2 e_2 τ_2 L_2 Γ_2)
    (where L_3 ,(exit-scope (term x) (term τ_1) (term Λ_2) (term L_2)))
    (where Γ_3 ,(remove-var (term Γ_2) (term x)))
@@ -467,26 +717,30 @@
    -------------------------------------------- "seq"
    (chk Σ Γ Λ (seq e_1 e_2) τ_2 L_2 Γ_2)]
 
-  ;; the new value is computed first; then the place must be whole, reachable
-  ;; for writing, and free of loans, because its old value is dropped
+  ;; The new value is computed first. Then the place must be reachable for
+  ;; writing and free of loans, because its old value is dropped. A part that
+  ;; was moved away, or holds parts that were, is whole again after it; a part
+  ;; inside one that was moved away is not there to be written.
   [(chk ,(Σ+ (term Σ) (term p)) Γ Λ e σ () Γ_1)
    (where σ ,(place-type (term Σ) (term Γ_1) (term p)))
+   (side-condition ,(assignable? (term Γ_1) (term p)))
    (side-condition ,(writable? (term Σ) (term Γ_1) (term p)))
    (side-condition ,(write-ok? (active (term Σ) (term Γ_1) (term Λ)) (term p)))
+   (where Γ_2 ,(mark-filled (term Γ_1) (term p)))
    -------------------------------------------- "set"
-   (chk Σ Γ Λ (set! p e) unit () Γ_1)]
+   (chk Σ Γ Λ (set! p e) unit () Γ_2)]
 
-  ;; a variable that was moved out of holds nothing to drop, so nothing can be
-  ;; lent from it: giving it a value makes it whole again
+  ;; a variable whose whole value was moved
   [(chk ,(Σ+ (term Σ) (term x)) Γ Λ e σ () Γ_1)
-   (where σ ,(moved-type (term Γ_1) (term x)))
-   (where Γ_2 ,(mark-live (term Γ_1) (term x)))
+   (where (x σ moved b) ,(assq (term x) (term Γ_1)))
+   (where Γ_2 ,(mark-filled (term Γ_1) (term x)))
    -------------------------------------------- "set-moved"
    (chk Σ Γ Λ (set! x e) unit () Γ_2)]
 
   ;; the same, and the old value is the result instead of being dropped
   [(chk ,(Σ+ (term Σ) (term p)) Γ Λ e σ () Γ_1)
    (where σ ,(place-type (term Σ) (term Γ_1) (term p)))
+   (side-condition ,(available? (term Γ_1) (term p)))
    (side-condition ,(writable? (term Σ) (term Γ_1) (term p)))
    (side-condition ,(write-ok? (active (term Σ) (term Γ_1) (term Λ)) (term p)))
    -------------------------------------------- "take"
@@ -500,18 +754,36 @@
    -------------------------------------------- "if0"
    (chk Σ Γ Λ (if0 e_1 e_2 e_3) τ L Γ_4)]
 
-  ;; A loop's body may run again, so it leaves every outer variable as it found
-  ;; it. A break then needs no state of its own.
-  ;; What the loop names is named again by its next turn.
-  [(chk ,(Σ+ (term Σ) (term e_c) (term e_b)) Γ Λ e_c int L_c Γ_1)
+  ;; A loop's body may run again, so when its end is reached it leaves every
+  ;; outer variable as the condition found it. The loop is left when the
+  ;; condition is 0 or by a break: after it, a variable is moved if it was on
+  ;; either way. What the loop names is named again by its next turn.
+  [(where Γ_0 ,(clear-breaks (term Γ)))
+   (chk ,(Σ+ (term Σ) (term e_c) (term e_b)) Γ_0 Λ e_c int L_c Γ_1)
    (chk ,(Σ-loop (Σ+ (term Σ) (term e_c) (term e_b))) Γ_1 Λ e_b τ_b L_b Γ_2)
-   (side-condition ,(or (mutant? 'loop-moves) (equal? (term Γ_2) (term Γ))))
+   (side-condition ,(or (mutant? 'loop-moves) (dead? (term Γ_2)) (same-states? (term Γ_2) (term Γ_0))))
+   (where Γ_3 ,(let ([out (loop-exit (term Γ) (term Γ_1) (term Γ_2))])
+                 (if (dead? (term Γ)) (make-dead out) out)))
    -------------------------------------------- "while"
-   (chk Σ Γ Λ (while e_c e_b) unit () Γ_2)]
+   (chk Σ Γ Λ (while e_c e_b) unit () Γ_3)]
 
   [(side-condition ,(in-loop? (term Σ)))
+   (where Γ_1 ,(record-break (term Γ)))
    -------------------------------------------- "break"
-   (chk Σ Γ Λ (break) unit () Γ)]
+   (chk Σ Γ Λ (break) unit () Γ_1)]
+
+  ;; Leave the function with e's value: every local's scope ends, and the value
+  ;; may carry only the loans a result may. Whatever an exclusive or out
+  ;; parameter refers to must be whole. τ is the type the form has where it is
+  ;; written; nothing after it runs.
+  [(where (τ_r (x_p ...)) ,(fn-of (term Σ)))
+   (side-condition ,(wf? (term Σ) (term τ)))
+   (chk Σ Γ Λ e τ_r L Γ_1)
+   (side-condition ,(or (mutant? 'return-escape)
+                        (return-ok? (term Σ) (term Γ_1) (term Λ) (term L) (term (x_p ...)))))
+   (where Γ_2 ,(make-dead (term Γ_1)))
+   -------------------------------------------- "return"
+   (chk Σ Γ Λ (return e τ) τ () Γ_2)]
 
   ;; ---- structs, views, sums
 
@@ -521,7 +793,7 @@
    -------------------------------------------- "new"
    (chk Σ Γ Λ (new σ e ...) σ () Γ_1)]
 
-  ;; a view borrows from every reference it is built from
+  ;; a view borrows from every reference (and view) it is built from
   [(where ((fld τ_f) ...) ,(fields-of (term Σ) (term (view V))))
    (chk-args Σ Γ Λ (e ...) (τ_f ...) L Γ_1)
    (where L_v ,(if (mutant? 'view-no-loans) '() (term L)))
@@ -546,6 +818,7 @@
   ;; looked at, so what they name is still named then.
   [(where σ_s ,(place-type (term Σ) (term Γ) (term p)))
    (where ((K σ_K) ...) ,(variants-of (term Σ) (term σ_s)))
+   (side-condition ,(available? (term Γ) (term p)))
    (side-condition ,(read-ok? (active (Σ+* (term Σ) (term (e_a ...))) (term Γ) (term Λ)) (term p)))
    (where L_x ,(shared-loans (term Σ) (term Γ) (term Λ) (term p)))
    (chk-arms Σ Γ Λ (((K x) e_a) ...) ((ref σ_K) ...) L_x τ L Γ_1)
@@ -554,6 +827,7 @@
 
   [(where σ_s ,(place-type (term Σ) (term Γ) (term p)))
    (where ((K σ_K) ...) ,(variants-of (term Σ) (term σ_s)))
+   (side-condition ,(available? (term Γ) (term p)))
    (side-condition ,(writable? (term Σ) (term Γ) (term p)))
    (side-condition ,(write-ok? (active (Σ+* (term Σ) (term (e_a ...))) (term Γ) (term Λ)) (term p)))
    (where L_x ,(exclusive-loans (term p)))
@@ -569,6 +843,7 @@
 
   [(chk ,(Σ+ (term Σ) (term p)) Γ Λ e σ () Γ_1)
    (where (pool σ) ,(place-type (term Σ) (term Γ_1) (term p)))
+   (side-condition ,(available? (term Γ_1) (term p)))
    (side-condition ,(writable? (term Σ) (term Γ_1) (term p)))
    (side-condition ,(write-ok? (active (term Σ) (term Γ_1) (term Λ)) (term p)))
    -------------------------------------------- "insert"
@@ -576,6 +851,8 @@
 
   [(where (pool σ) ,(place-type (term Σ) (term Γ) (term p)))
    (where (handle σ) ,(lookup (term Γ) (term x)))
+   (side-condition ,(available? (term Γ) (term p)))
+   (side-condition ,(available? (term Γ) (term x)))
    (side-condition ,(read-ok? (active (term Σ) (term Γ) (term Λ)) (term x)))
    (side-condition ,(writable? (term Σ) (term Γ) (term p)))
    (side-condition ,(write-ok? (active (term Σ) (term Γ) (term Λ)) (term p)))
@@ -584,7 +861,8 @@
 
   ;; ---- calls
 
-  ;; a returned reference borrows from every reference argument of the call
+  ;; A returned reference borrows from every reference argument of the call.
+  ;; A place passed as `(out p)` holds a value once the call returns.
   [(where (defn f (T ...) ((x_p τ_p) ...) τ_r any_b) ,(find-decl (term Σ) 'defn (term f)))
    (side-condition ,(and (= (length (term (T ...))) (length (term (σ ...))))
                          (andmap (λ (t) (wf? (term Σ) t)) (term (σ ...)))))
@@ -592,8 +870,59 @@
    (where τ_ra ,(subst (term τ_r) (term (T ...)) (term (σ ...))))
    (chk-args Σ Γ Λ (e ...) (τ_a ...) L Γ_1)
    (where L_r ,(if (and (second-class? (term τ_ra)) (not (mutant? 'no-call-loans))) (term L) '()))
+   (where Γ_2 ,(for/fold ([g (term Γ_1)]) ([a (term (e ...))])
+                 (match a [`(out ,p) (mark-filled g p)] [_ g])))
    -------------------------------------------- "call"
-   (chk Σ Γ Λ (call f (σ ...) e ...) τ_ra L_r Γ_1)]
+   (chk Σ Γ Λ (call f (σ ...) e ...) τ_ra L_r Γ_2)]
+
+  ;; A closure that borrows: it carries the loans of what it captured, and its
+  ;; body is a function of its own over the captures and the parameters.
+  [(side-condition ,(andmap (λ (t) (and (second-class? t) (not (dropped-view? (term Σ) t))
+                                        (not (match t [`(out ,_) #t] [_ #f]))))
+                            (term (τ_c ...))))
+   (chk-args Σ Γ Λ (e_c ...) (τ_c ...) L Γ_1)
+   (where k ,(if (ormap (λ (t) (exclusive? (term Σ) t)) (term (τ_c ...))) 'mut 'shr))
+   (side-condition ,(check-closure (term Σ) (term ((x_c τ_c) ...)) (term ((x τ) ...)) (term τ_r) (term e_b) #f))
+   (where L_f ,(if (mutant? 'clo-no-loans) '() (term L)))
+   -------------------------------------------- "lam"
+   (chk Σ Γ Λ (lam ([x_c τ_c e_c] ...) ((x τ) ...) τ_r e_b) (fnb k (τ ...) τ_r) L_f Γ_1)]
+
+  ;; A closure that owns what it captured, which is moved into it: it is
+  ;; storable, and calling it may change what it holds.
+  [(side-condition ,(or (mutant? 'clo-own-ref) (andmap (λ (t) (not (second-class? t))) (term (τ_c ...)))))
+   (chk-args Σ Γ Λ (e_c ...) (τ_c ...) L Γ_1)
+   (side-condition ,(check-closure (term Σ) (term ((x_c τ_c) ...)) (term ((x τ) ...)) (term τ_r) (term e_b) #t))
+   -------------------------------------------- "lamo"
+   (chk Σ Γ Λ (lamo ([x_c τ_c e_c] ...) ((x τ) ...) τ_r e_b) (fno (τ ...) τ_r) () Γ_1)]
+
+  ;; Calling a closure that borrows uses what it borrowed: its result carries
+  ;; those loans, and a loan on the closure itself, exclusive when it captured
+  ;; something exclusively. It is lent so while its arguments are evaluated.
+  [(where (fnb k (τ_a ...) τ_r) ,(place-type (term Σ) (term Γ) (term x)))
+   (side-condition ,(available? (term Γ) (term x)))
+   (side-condition ,(if (and (eq? (term k) 'mut) (not (mutant? 'clo-shared-call)))
+                        (write-ok? (active (Σ+* (term Σ) (term (e ...))) (term Γ) (term Λ)) (term x))
+                        (read-ok? (active (Σ+* (term Σ) (term (e ...))) (term Γ) (term Λ)) (term x))))
+   (where k_c ,(if (mutant? 'clo-shared-call) 'shr (term k)))
+   (where Λ_1 ,(add-loans (term Λ) (term tmp) (term ((x k_c)))))
+   (chk-args ,(Σ+ (term Σ) (term x)) Γ Λ_1 (e ...) (τ_a ...) L Γ_1)
+   (where L_r ,(if (second-class? (term τ_r))
+                   (union (term L) (union (loans-of (term Λ) (term x)) (term ((x k_c)))))
+                   '()))
+   -------------------------------------------- "apply"
+   (chk Σ Γ Λ (apply x e ...) τ_r L_r Γ_1)]
+
+  ;; Calling a closure that owns what it captured changes it: it is lent
+  ;; exclusively for the call. Its result can borrow only from the arguments.
+  [(where (fno (τ_a ...) τ_r) ,(place-type (term Σ) (term Γ) (term p)))
+   (side-condition ,(available? (term Γ) (term p)))
+   (side-condition ,(writable? (term Σ) (term Γ) (term p)))
+   (side-condition ,(write-ok? (active (Σ+* (term Σ) (term (e ...))) (term Γ) (term Λ)) (term p)))
+   (where Λ_1 ,(add-loans (term Λ) (term tmp) (exclusive-loans (term p))))
+   (chk-args ,(Σ+ (term Σ) (term p)) Γ Λ_1 (e ...) (τ_a ...) L Γ_1)
+   (where L_r ,(if (second-class? (term τ_r)) (term L) '()))
+   -------------------------------------------- "apply-own"
+   (chk Σ Γ Λ (apply p e ...) τ_r L_r Γ_1)]
 
   ;; two calls run at the same time: their arguments are checked as the
   ;; arguments of one call, so nothing lent exclusively to one reaches the other
@@ -623,6 +952,11 @@
    -------------------------------------------- "spawn"
    (chk Σ Γ Λ (spawn (call f (σ ...) e ...)) (task σ_ra) () Γ_1)]
 
+  ;; a closure that owns what it captured, run on a thread of its own
+  [(chk Σ Γ Λ e (fno () σ) () Γ_1)
+   -------------------------------------------- "spawn-fn"
+   (chk Σ Γ Λ (spawn-fn e) (task σ) () Γ_1)]
+
   [(chk Σ Γ Λ e (task σ) () Γ_1)
    -------------------------------------------- "join"
    (chk Σ Γ Λ (join e) σ () Γ_1)]
@@ -632,7 +966,7 @@
   [(where (global g σ any_i) ,(find-decl (term Σ) 'global (term g)))
    (side-condition ,(not (assq (term x) (term Γ))))
    (where Λ_1 ,(cons (list (term x) (term (glob g)) (if (eq? (term w) 'mut) 'mut 'shr)) (term Λ)))
-   (where Γ_b ,(cons (term (x (w σ) live)) (term Γ)))
+   (where Γ_b ,(bind-var (term Γ) (term x) (term (w σ))))
    (chk Σ Γ_b Λ_1 e τ L Γ_1)
    (where L_2 ,(exit-global (term x) (term g) (term L)))
    (where Γ_2 ,(remove-var (term Γ_1) (term x)))
@@ -679,7 +1013,9 @@
   [-------------------------------------------- "no-args"
    (chk-args Σ Γ Λ () () () Γ)]
 
-  [(chk ,(Σ+* (term Σ) (term (e_r ...))) Γ Λ e_1 τ_1 L_1 Γ_1)
+  ;; a closure that borrows shared goes where one that may borrow exclusively is asked for
+  [(chk ,(Σ+* (term Σ) (term (e_r ...))) Γ Λ e_1 τ_a L_1 Γ_1)
+   (side-condition ,(fits? (term τ_a) (term τ_1)))
    (where Λ_1 ,(add-loans (term Λ) (term tmp) (if (mutant? 'no-arg-loans) '() (term L_1))))
    (chk-args Σ Γ_1 Λ_1 (e_r ...) (τ_r ...) L_2 Γ_2)
    (where L ,(union (term L_1) (term L_2)))
@@ -693,7 +1029,7 @@
 
   [(side-condition ,(not (assq (term x) (term Γ))))
    (where Λ_1 ,(add-loans (term Λ) (term x) (if (mutant? 'match-no-loans) '() (term L_x))))
-   (where Γ_b ,(cons (term (x τ_x live)) (term Γ)))
+   (where Γ_b ,(bind-var (term Γ) (term x) (term τ_x)))
    (chk Σ Γ_b Λ_1 e τ L_2 Γ_2)
    (where L_3 ,(exit-scope (term x) (term τ_x) (term Λ_1) (term L_2)))
    (where Γ_3 ,(remove-var (term Γ_2) (term x)))
@@ -725,33 +1061,82 @@
     [(list r) r]
     [_ (error who "the rules gave more than one answer: ~a" rs)]))
 
-;; A function's second-class parameters hold loans on what the caller lent. Its
-;; result may carry only those: nothing rooted at the function's own storage.
+;; Leaving a function, early or at its end, with a value carrying L: every
+;; local's scope ends (newest first), and then the parameters'. The value may
+;; carry only the loans the caller lent: nothing on the function's own storage,
+;; nothing on a global, whose loan lasts only for its `with`. What an exclusive
+;; or out parameter refers to must be whole.
+(define (return-ok? Σ Γ Λ L params)
+  (define vars (vars-of Γ))
+  (define after-locals
+    (for/fold ([L L]) ([e vars] #:unless (memq (car e) params))
+      (and L (exit-scope (car e) (cadr e) Λ L))))
+  (define after-params
+    (for/fold ([L after-locals]) ([e vars] #:when (memq (car e) params))
+      (and L (exit-scope (car e) (cadr e) Λ L))))
+  (and after-params
+       (not (for/or ([l after-params]) (match (place-root (car l)) [`(glob ,_) #t] [_ #f])))
+       (for/and ([e vars] #:when (memq (car e) params))
+         (restored? Σ (car e) (cadr e) (caddr e)))))
+
+;; The body of a function, a closure or a drop: its parameters (and a closure's
+;; captures, which are parameters to it) hold loans on what the caller lent; an
+;; out parameter refers to a place that holds nothing yet.
+(define (check-body decls Ts params τr body)
+  (define Σ (make-Σ decls Ts (list τr (map car params))))
+  (define Γ (for/list ([p params])
+              (list (car p) (cadr p) (match (cadr p) [`(out ,_) '(gone (*))] [_ 'live]) 'none)))
+  (define Λ (for/list ([p params] #:when (second-class? (cadr p)))
+              (list (car p) `(ext ,(car p)) (kind-of Σ (cadr p)))))
+  (and (distinct? (map car params))
+       (andmap (λ (p) (wf? Σ (cadr p))) params)
+       (wf? Σ τr)
+       (match (one-answer 'check-body (judgment-holds (chk ,Σ ,Γ ,Λ ,body τ L Γ_out) (τ L Γ_out)))
+         [(list τ L Γ-out)
+          (and (equal? τ τr)
+               (or (dead? Γ-out)
+                   (mutant? 'no-return-check)
+                   (return-ok? Σ Γ-out Λ L (map car params))))]
+         [#f #f])
+       Γ))
+
+;; A closure's body, over its captures and its parameters. An owning closure's
+;; captures stay in it from one call to the next, so the body must leave them
+;; there; a borrowing closure's are references, made again for every call.
+(define (check-closure Σ caps params τr body own?)
+  (define decls (decls-of Σ))
+  (define all (append caps params))
+  (and (distinct? (map car all))
+       (andmap (λ (c) (wf? Σ (cadr c))) caps)
+       (let ([Σb (make-Σ decls (tparams Σ) (list τr (map car all)))]
+             [Γ (for/list ([p all])
+                  (list (car p) (cadr p) (match (cadr p) [`(out ,_) '(gone (*))] [_ 'live]) 'none))]
+             [Λ (for/list ([p all] #:when (second-class? (cadr p)))
+                  (list (car p) `(ext ,(car p)) (kind-of Σ (cadr p))))])
+         (and (andmap (λ (p) (wf? Σb (cadr p))) params)
+              (wf? Σb τr)
+              (match (one-answer 'check-closure (judgment-holds (chk ,Σb ,Γ ,Λ ,body τ L Γ_out) (τ L Γ_out)))
+                [(list τ L Γ-out)
+                 (and (equal? τ τr)
+                      (or (dead? Γ-out) (return-ok? Σb Γ-out Λ L (map car all)))
+                      (or (not own?) (mutant? 'clo-moves)
+                          (dead? Γ-out)
+                          (for/and ([c caps]) (eq? (state-of Γ-out (car c)) 'live))))]
+                [#f #f])))))
+
 (define (check-fn decls fn)
   (match fn
     [`(defn ,_ ,Ts ,params ,τr ,body)
-     (define Σ (make-Σ decls Ts))
-     (and (distinct? (map car params))
-          (distinct? (append Ts (map cadr decls)))
-          (andmap (λ (p) (wf? Σ (cadr p))) params)
-          (wf? Σ τr)
-          (let* ([Γ (for/list ([p params]) (list (car p) (cadr p) 'live))]
-                 [Λ (for/list ([p params] #:when (second-class? (cadr p)))
-                      (list (car p) `(ext ,(car p)) (kind-of Σ (cadr p))))])
-            (match (one-answer 'check-fn (judgment-holds (chk ,Σ ,Γ ,Λ ,body τ L Γ) (τ L)))
-              [(list τ L)
-               (and (equal? τ τr)
-                    (or (mutant? 'no-return-check)
-                        (for/fold ([L L]) ([p params])
-                          (and L (exit-scope (car p) (cadr p) Λ L))))
-                    #t)]
-              [#f #f])))]))
+     (and (distinct? (append Ts (map cadr decls)))
+          (check-body decls Ts params τr body)
+          #t)]))
 
 ;; a global's first value is built without running any of the program
 (define (constant? e)
   (not (let loop ([t e])
          (and (pair? t)
-              (or (memq (car t) '(call par spawn join with unsafe while load store alloc free))
+              (or (memq (car t) '(call par spawn spawn-fn join with unsafe while load store alloc free
+                                  lam lamo apply return out))
                   (ormap loop t))))))
 
 (define (check-decl decls d)
@@ -760,8 +1145,21 @@
      (and (distinct? Ts) (distinct? names)
           (distinct? (append Ts (map cadr decls)))
           (andmap (λ (t) (wf? (make-Σ decls Ts) t)) ts))]
-    [`(view ,_ ((,names ,ts) ...))
-     (and (distinct? names) (andmap (λ (t) (wf? (make-Σ decls) t)) ts))]
+    [`(view ,V ((,names ,ts) ...) . ,drop)
+     (define Σ (make-Σ decls))
+     (and (distinct? names) (andmap (λ (t) (wf? Σ t)) ts)
+          ;; a view holds no view that holds it
+          (not (let inside? ([t `(view ,V)] [seen '()])
+                 (for/or ([f (or (fields-of Σ t) '())])
+                   (match (cadr f)
+                     [`(view ,W) (or (eq? W V) (and (not (memq W seen)) (inside? (cadr f) (cons W seen))))]
+                     [_ #f]))))
+          ;; the function its drop runs takes the view and gives nothing back
+          (match drop
+            ['() #t]
+            [(list f) (match (find-decl Σ 'defn f)
+                        [`(defn ,_ () ((,_ (view ,(== V)))) unit ,_) #t]
+                        [_ #f])]))]
     [`(global ,_ ,σ ,e)
      (and (wf? (make-Σ decls) σ)
           (constant? e)

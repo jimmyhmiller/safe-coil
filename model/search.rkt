@@ -40,7 +40,14 @@
     (defn some () ((o (ref (Opt (box int)))) (d (ref (box int)))) (ref (box int))
       (match-ref (* o) ((None u) d) ((Some x) x)))
     (defn id (T) ((x T)) T x)
-    (defn wrap (T) ((x T)) (Wrap T) (new (Wrap T) x 0))))
+    (defn wrap (T) ((x T)) (Wrap T) (new (Wrap T) x 0))
+    (defn call-it () ((f (fnb shr () int))) int (apply f))
+    (defn call-twice () ((f (fnb mut () int))) int (+ (apply f) (apply f)))
+    (defn run-own () ((f (fno () int))) int (+ (apply f) (apply f)))
+    (defn fill () ((r (out (box int)))) unit (set! (* r) (box 4)))
+    (defn swap-in () ((m (mut (Pair)))) int
+      (let ([old (: (* m) a)]) (seq (set! (: (* m) a) (box 7)) (* old))))
+    (defn lock () ((r (mut (box int)))) (view Lock) (new (view Lock) r))))
 (define stock-sigs
   (for/list ([fn stock])
     (match-define `(defn ,f ,Ts ((,_ ,τs) ...) ,τr ,_) fn)
@@ -48,6 +55,8 @@
 
 (define tvars (make-parameter '()))
 (define in-loop (make-parameter #f))
+;; the result type of the function (or closure) being generated, for a return
+(define fn-ret (make-parameter #f))
 
 (define (pick xs) (list-ref xs (random (length xs))))
 (define base-storables
@@ -58,11 +67,15 @@
   (if (and (pair? (tvars)) (zero? (random 3)))
       (pick '(T T (box T) (Opt T) (Wrap T)))
       (pick base-storables)))
+(define closure-types
+  '((fnb shr () int) (fnb mut () int) (fnb shr () (ref int)) (fnb mut () (mut (box int)))
+    (fnb shr ((ref int)) int) (fno () int) (fno ((ref int)) int)))
 (define (gen-type)
-  (case (random 12)
+  (case (random 14)
     [(0 1) `(ref ,(gen-storable))]
     [(2 3) `(mut ,(gen-storable))]
-    [(4) (pick '((view Two) (view Peek)))]
+    [(4) (pick '((view Two) (view Peek) (view Lock) (view Nest) (view Watch)))]
+    [(5) (pick closure-types)]
     [else (gen-storable)]))
 
 (define (storable? τ) (not (second-class? τ)))
@@ -72,8 +85,9 @@
     [(or 'int 'unit) #t]
     [(? symbol?) #f]
     [`(,(or 'ptr 'handle) ,_) #t]
-    [`(,(or 'box 'pool) ,_) #f]
-    [_ (andmap (λ (part) (plain? (cadr part))) (or (fields σ) (variants σ)))]))
+    [`(,(or 'box 'pool 'task) ,_) #f]
+    [`(fno . ,_) #f]
+    [_ (andmap (λ (part) (plain? (cadr part))) (or (fields σ) (variants σ) '()))]))
 
 (define counter 0)
 (define (fresh base) (set! counter (add1 counter)) (string->symbol (format "~a~a" base counter)))
@@ -119,6 +133,7 @@
   (define (sub t [dd (sub1 d)]) (gen-expr env sigs t dd))
   (define (in-scope x τx t [dd (sub1 d)]) (gen-expr (cons (cons x τx) env) sigs t dd))
 
+  (define (leaf-of t) (gen-expr env sigs t 0))
   (define (leaf)
     (match τ
       ['int (if (and (pair? here) (< (random 4) 3)) (pick here) (random 3))]
@@ -145,9 +160,104 @@
        (if (and (pair? here) (zero? (random 3)))
            (pick here)
            `(new ,τ ,@(for/list ([f (fields τ)]) (sub (cadr f) 0))))]
+      [`(fnb ,k ,τs ,τr)
+       (if (and (pair? here) (zero? (random 3))) (pick here) (gen-closure #f k τs τr))]
+      [`(fno ,τs ,τr)
+       (if (and (pair? here) (zero? (random 3))) (pick here) (gen-closure #t #f τs τr))]
+      ;; a place lent to be filled: usually one that holds a value, which the
+      ;; rules refuse; `gen-out` makes the ones that hold nothing
+      [`(out ,σ) (let ([ts (of-type σ)]) (if (pair? ts) `(out ,(pick ts)) `(out ,(fresh 'nowhere))))]
       [_ (cond [(and (pair? here) (zero? (random 2))) (pick here)]
                [(fields τ) => (λ (fs) `(new ,τ ,@(for/list ([f fs]) (sub (cadr f) 0))))]
                [else (let ([v (pick (variants τ))]) `(inj ,τ ,(car v) ,(sub (cadr v) 0)))])]))
+
+  ;; A closure over captures from what is in scope: borrows of places for one
+  ;; that borrows, owners or copies for one that owns (and now and then a
+  ;; borrow, which the rules must refuse). Its body reads through what it
+  ;; captured.
+  (define (gen-closure own? k τs τr)
+    ;; a closure's body is generated with no type parameters in scope, so it
+    ;; captures nothing whose type mentions one
+    (define (mentions-tvar? t) (let loop ([t t]) (or (and (symbol? t) (memq t (tvars)) #t) (and (pair? t) (ormap loop t)))))
+    (define ts (filter (λ (pt) (and (storable? (cdr pt)) (not (mentions-tvar? (cdr pt))))) ps))
+    ;; usually each capture borrows from a variable no other capture does
+    (define used-roots '())
+    (define caps
+      (for/list ([i (random 3)])
+        (define y (fresh 'c))
+        (cond
+          [(and own? (or (null? ts) (< (random 5) 4)))
+           (define t (pick '((box int) (box int) int (box (box int)) (Pair) (Opt (box int)))))
+           (list y t (gen-expr env sigs t 0))]
+          [(null? ts) (list y 'int (random 3))]
+          [else
+           (define apart (let ([a (filter (λ (pt) (not (memq (root (car pt)) used-roots))) ts)])
+                           (if (and (pair? a) (< (random 4) 3)) a ts)))
+           (match-define (cons p σ) (let ([inner (filter (λ (pt) (pair? (car pt))) apart)])
+                                      (if (and (pair? inner) (zero? (random 2))) (pick inner) (pick apart))))
+           (set! used-roots (cons (root p) used-roots))
+           (define w (if (and (eq? k 'mut) (zero? i)) 'mut (pick '(ref ref mut))))
+           (list y `(,w ,σ) `(,w ,p))])))
+    ;; a borrowing closure's captures are second-class; plain ones are passed as borrows
+    (define caps2
+      (if own? caps
+          (for/list ([c caps])
+            (match c [(list y 'int v) (list y '(ref int) (let ([s (filter (λ (pt) (equal? (cdr pt) 'int)) ps)])
+                                                             (if (pair? s) `(ref ,(car (pick s))) v)))]
+                     [_ c]))))
+    (define params (for/list ([t τs]) (cons (fresh 'a) t)))
+    (define benv (append (for/list ([c caps2]) (cons (car c) (cadr c))) params))
+    (define body
+      (parameterize ([fn-ret τr] [in-loop #f] [tvars '()])
+        (define main (gen-expr benv sigs τr (random 3)))
+        (define mine (filter (λ (pt) (eq? (cdr pt) 'int)) (places benv)))
+        (define moves (if (and own? (pair? caps2) (zero? (random 3)))
+                          (let ([c (pick caps2)]) (if (plain? (cadr c)) '() (list `(seq ,(car c) unit))))
+                          '()))
+        (for/fold ([b main]) ([r (append moves (if (pair? mine) (list (car (pick mine))) '()))])
+          `(seq ,r ,b))))
+    `(,(if own? 'lamo 'lam) ,(for/list ([c caps2]) (list (car c) (cadr c) (caddr c)))
+                            ,(for/list ([p params]) (list (car p) (cdr p)))
+                            ,τr ,body))
+  ;; A place with nothing in it (a new variable, or a part just moved away),
+  ;; filled by a call through an out parameter, then read.
+  (define (gen-out)
+    (define fillers (filter (λ (s) (and (null? (cadr s)) (ormap (λ (t) (match t [`(out ,_) #t] [_ #f])) (caddr s)))) sigs))
+    (define sig (pick fillers))
+    (match-define (list f _ τs _) sig)
+    (define at (index-where τs (λ (t) (match t [`(out ,_) #t] [_ #f]))))
+    (define σ (cadr (list-ref τs at)))
+    (define y (fresh 'v))
+    (define (the-call target)
+      `(call ,f () ,@(for/list ([t τs] [i (in-naturals)]) (if (= i at) `(out ,target) (sub t 0)))))
+    (define reads (let ([ints (for/list ([pt (places (list (cons y σ)))] #:when (eq? (cdr pt) 'int)) (car pt))])
+                    (if (pair? ints) (pick ints) 'unit)))
+    (case (random 3)
+      [(0) `(let ([,y (uninit ,σ)]) (seq ,(if (zero? (random 4)) 'unit (the-call y)) (seq ,reads ,(sub τ))))]
+      [(1) `(let ([,y ,(sub σ 0)]) (seq (seq ,y unit) (seq ,(the-call y) (seq ,reads ,(sub τ)))))]
+      [else
+       ;; a part of a struct moved away and filled again
+       (define w (fresh 'v))
+       `(let ([,w (new (Pair) (box 1) (box 2))])
+          (seq (seq (: ,w a) unit)
+               (seq ,(if (equal? σ '(box int)) `(call ,f () ,@(for/list ([t τs] [i (in-naturals)]) (if (= i at) `(out (: ,w a)) (sub t 0)))) 'unit)
+                    (seq (* (: ,w a)) ,(sub τ)))))]))
+
+  ;; `(apply f args…)` with arguments from what is in scope ENV: a reference
+  ;; argument borrows a place there, or one bound around the call
+  (define (apply-with f τs env)
+    (define outer '())
+    (define args
+      (for/list ([t τs])
+        (match t
+          [`(,(and k (or 'ref 'mut)) ,σ)
+           (define ts (for/list ([pt (places env)] #:when (equal? (cdr pt) σ)) (car pt)))
+           (cond [(and (pair? ts) (< (random 4) 3)) `(,k ,(pick ts))]
+                 [else (define y (fresh 'v))
+                       (set! outer (cons (list y (gen-expr env sigs σ 0)) outer))
+                       `(,k ,y)])]
+          [_ (gen-expr env sigs t 0)])))
+    (for/fold ([e `(apply ,f ,@args)]) ([o outer]) `(let ([,(car o) ,(cadr o)]) ,e)))
 
   (define (bind)
     (define y (fresh 'v))
@@ -250,11 +360,25 @@
     (cond [(null? ok) (sub τ)]
           [(zero? (random 3)) (or (aimed) (plain))]
           [else (plain)]))
-  ;; a call made for what it does
+  ;; a call made for what it does; when it is given a place to change, what is
+  ;; there is read afterwards
   (define (call-for-effect)
-    (if (null? sigs)
-        'unit
-        (let ([sig (pick sigs)]) (call-with sig (instantiate-any sig)))))
+    (define changers
+      (for*/list ([s sigs] #:when (null? (cadr s))
+                  [t (caddr s)] #:when (match t [`(mut ,_) #t] [_ #f])
+                  [pt ps] #:when (equal? (cdr pt) (cadr t)))
+        (list s t (car pt))))
+    (cond
+      [(null? sigs) 'unit]
+      [(and (pair? changers) (zero? (random 2)))
+       (match-define (list sig t p) (pick changers))
+       (match-define (list f _ τs _) sig)
+       (define at (index-of τs t))
+       (define inside (for/list ([pt (places env)] #:when (and (eq? (root (car pt)) (root p)) (eq? (cdr pt) 'int)))
+                        (car pt)))
+       `(seq (call ,f () ,@(for/list ([u τs] [i (in-naturals)]) (if (= i at) `(mut ,p) (sub u 0))))
+             ,(if (pair? inside) (pick inside) 'unit))]
+      [else (let ([sig (pick sigs)]) (call-with sig (instantiate-any sig)))]))
   ;; An owner is used up somewhere (straight away, in one branch, in a match
   ;; arm, in a loop) and then used again: the shape every move error has.
   (define (move-hazard)
@@ -264,16 +388,26 @@
         (cons (fresh 'v) t)))
     (define own (if (and (pair? existing) (zero? (random 2))) (pick existing) fresh-one))
     (define x (car own))
+    ;; what is used up: the variable, or a part of it (a field, what a box
+    ;; holds), or what an exclusive parameter in scope refers to
+    (define parts
+      (for/list ([pt (append (places (list own))
+                             (append* (for/list ([b env] #:when (match (cdr b) [`(mut ,_) #t] [_ #f]))
+                                        (cdr (places (list b))))))]
+                 #:when (and (storable? (cdr pt)) (not (plain? (cdr pt)))
+                             (not (match (car pt) [`(at . ,_) #t] [_ #f]))))
+        pt))
+    (match-define (cons tp tτ) (if (and (pair? parts) (zero? (random 2))) (pick parts) own))
     (define (use-up)
-      (define takers (filter (λ (s) (and (null? (cadr s)) (member (cdr own) (caddr s)))) sigs))
+      (define takers (filter (λ (s) (and (null? (cadr s)) (member tτ (caddr s)))) sigs))
       (cond [(and (pair? takers) (zero? (random 2)))
              (match-define (list f _ τs _) (pick takers))
-             (define at (index-of τs (cdr own)))
-             `(seq (call ,f () ,@(for/list ([t τs] [i (in-naturals)]) (if (= i at) x (sub t 0)))) unit)]
-            [(zero? (random 2)) (let ([y (fresh 'v)]) `(let ([,y ,x]) unit))]
-            [else `(seq ,x unit)]))
+             (define at (index-of τs tτ))
+             `(seq (call ,f () ,@(for/list ([t τs] [i (in-naturals)]) (if (= i at) tp (sub t 0)))) unit)]
+            [(zero? (random 2)) (let ([y (fresh 'v)]) `(let ([,y ,tp]) unit))]
+            [else `(seq ,tp unit)]))
     (define used
-      (case (random 8)
+      (case (random 10)
         [(0) (use-up)]
         [(1) `(if0 ,(random 2) ,(use-up) unit)]
         [(2 3) `(if0 ,(random 2) unit ,(use-up))]
@@ -281,13 +415,29 @@
                 ((None ,(fresh 'v)) unit) ((Some ,(fresh 'v)) ,(use-up)))]
         [(5 6) (let ([i (fresh 'i)])
                  `(let ([,i 2]) (while ,i (seq ,(use-up) (set! ,i (+ ,i -1))))))]
+        ;; used up, and the loop left at once
+        [(7 8) (let ([i (fresh 'i)])
+                 `(let ([,i 2]) (while ,i (seq ,(if (zero? (random 3)) `(if0 ,(random 2) (break) unit) 'unit)
+                                               (seq ,(use-up) ,(if (zero? (random 4)) `(set! ,i (+ ,i -1)) '(break)))))))]
         [else `(seq ,(use-up) ,(use-up))]))
-    (define mine (filter (λ (pt) (eq? (root (car pt)) x)) (places (list own))))
+    (define mine (filter (λ (pt) (eq? (root (car pt)) (root tp))) (places (cons own env))))
     (define ints (for/list ([pt mine] #:when (eq? (cdr pt) 'int)) (car pt)))
-    (define again (cond [(zero? (random 3)) 'unit]
-                        [(and (pair? ints) (zero? (random 2))) (pick ints)]
-                        [else x]))
-    (define body `(seq ,used (seq ,again ,(sub τ))))
+    (define inside (for/list ([pt mine] #:when (and (pair? (car pt)) (storable? (cdr pt))
+                                                    (not (equal? (car pt) tp))
+                                                    (let loop ([q (car pt)]) (and (pair? q) (or (equal? (cadr q) tp) (loop (cadr q)))))))
+                     pt))
+    (define again (case (random 7)
+                    [(0) 'unit]
+                    [(1 2) (if (pair? ints) (pick ints) tp)]
+                    ;; given a value again, then used
+                    [(3) `(seq (set! ,tp ,(sub tτ 0)) ,(if (pair? ints) (pick ints) tp))]
+                    ;; a part of what was moved away is assigned
+                    [(4) (if (pair? inside)
+                             (match-let ([(cons q σ) (pick inside)]) `(set! ,q ,(sub σ 0)))
+                             tp)]
+                    [else tp]))
+    (define restore (if (and (not (eq? (root tp) x)) (< (random 4) 3)) `(set! ,tp ,(sub tτ 0)) 'unit))
+    (define body `(seq ,used (seq ,again (seq ,restore ,(sub τ)))))
     (if (eq? own fresh-one) `(let ([,x ,(sub (cdr own) 0)]) ,body) body))
   (define (maybe-unsafe e) (if (zero? (random 2)) `(unsafe ,e) e))
   (define (gen-raw)
@@ -338,7 +488,8 @@
         (for/list ([pt (places (list (cons y τy)))] #:when (and (pair? (car pt)) (storable? (cdr pt)))) pt))
       (case (cond [(and (pair? entered) (zero? (random 2))) 15]
                   [(and (pair? sums) (zero? (random 3))) 5]
-                  [else (random 18)])
+                  [(and (pair? held) (zero? (random 4))) 22]
+                  [else (random 22)])
         ;; a borrow of something whose scope has already ended
         [(13)
          (define y (fresh 'v))
@@ -370,6 +521,12 @@
                    ,(call-with sig targs env))]
                [else (borrowed)])]
         [(2) (if (pair? held) (let ([h (pick held)]) `(let ,(cdr h) ,(car h))) (borrowed))]
+        ;; what a closure already held gives back, held in turn
+        [(22 23)
+         (define giving (for/list ([h held] #:when (match (cdr h) [`(fnb ,_ ,_ ,τr) (second-class? τr)] [_ #f])) h))
+         (if (pair? giving)
+             (match-let ([(cons f `(fnb ,_ ,τs ,τr)) (pick giving)]) `(let ,τr ,(apply-with f τs env)))
+             (borrowed))]
         [(3 17)
          (and τr
               (let* ([one (inner-borrow env τr)]
@@ -405,8 +562,48 @@
          (define x (fresh 'v))
          `(scoped (,w ,σ) ,x ,(λ (body) `(with ,w ,g ,x ,body)))]
         [(8) (and τr `(let ,τr ,(gen-expr env sigs τr (min (sub1 d) (random 2)))))]
+        ;; a closure over borrows of what is in scope
+        [(18 19)
+         (define t (pick (filter (λ (t) (eq? (car t) 'fnb)) closure-types)))
+         `(let ,t ,(gen-expr env sigs t 0))]
+        ;; a lock: dropped at the end of its scope, and its drop reads what it holds
+        [(20)
+         ;; usually one inside something else, which can be freed under it
+         (define boxes (for/list ([pt (storable-places env)] #:when (equal? (cdr pt) '(box int))) (car pt)))
+         (define inner (filter pair? boxes))
+         (cond [(and (pair? inner) (zero? (random 2))) `(let (view Watch) (new (view Watch) (ref ,(pick inner))))]
+               [(and (pair? inner) (< (random 4) 3)) `(let (view Lock) (new (view Lock) (mut ,(pick inner))))]
+               [(pair? boxes) `(let (view Lock) (new (view Lock) (mut ,(pick boxes))))]
+               [else (borrowed)])]
+        ;; a closure that owns what it captured, made in a scope that then ends
+        [(21)
+         (define y (fresh 'v))
+         (define c (fresh 'c))
+         `(let (fno () int)
+            (let ([,y (box ,(random 3))])
+              (lamo ([,c (ref (box int)) (ref ,y)]) () int ,(if (zero? (random 2)) 1 `(* (* ,c))))))]
         [else (borrowed)]))
     (define (reads-through y env)
+      (define τy (cdr (assq y env)))
+      (match τy
+        [`(,(or 'fnb 'fno) . ,_) (apply-through y τy env)]
+        [_ (reads-through-place y env)]))
+    ;; call a closure held, with arguments from what is in scope, and read
+    ;; through what it gives back
+    (define (apply-through y τy env)
+      (define τs (match τy [`(fnb ,_ ,τs ,_) τs] [`(fno ,τs ,_) τs]))
+      (define τr (match τy [`(fnb ,_ ,_ ,τr) τr] [`(fno ,_ ,τr) τr]))
+      (define call (apply-with y τs env))
+      (define z (fresh 'v))
+      (match τr
+        [`(,(or 'ref 'mut) int) `(let ([,z ,call]) (* ,z))]
+        [`(ref (box int)) `(let ([,z ,call]) (* (* ,z)))]
+        ;; given an exclusive reference, write through it
+        [`(mut (box int)) (if (zero? (random 2))
+                              `(let ([,z ,call]) (* (* ,z)))
+                              `(let ([,z ,call]) (set! (* ,z) (box ,(random 3)))))]
+        [_ call]))
+    (define (reads-through-place y env)
       (define mine (filter (λ (pt) (eq? (root (car pt)) y)) (places env)))
       (define ints (for/list ([pt mine] #:when (eq? (cdr pt) 'int)) (car pt)))
       (define sums (for/list ([pt mine] #:when (and (storable? (cdr pt)) (variants (cdr pt)))) pt))
@@ -526,6 +723,23 @@
        [(20) (gen-take)]
        [(21) (if (in-loop) `(seq (break) ,(sub τ 0)) (leaf))]
        [(22) (gen-spawn)]
+       [(23) (match (fn-ret)
+               [#f (leaf)]
+               ;; a reference returned early: often to a local of this function
+               [`(,(and k (or 'ref 'mut)) ,σ)
+                #:when (zero? (random 2))
+                (define y (fresh 'v))
+                `(let ([,y ,(sub σ 0)])
+                   (seq (if0 ,(sub 'int 0) (return (,k ,y) ,'unit) unit) ,(in-scope y σ τ)))]
+               [r `(seq (if0 ,(sub 'int 0) (return ,(sub r) unit) unit) ,(sub τ))])]
+       [(24) (gen-out)]
+       ;; a closure, called once or twice, then the rest
+       [(25) (let* ([f (fresh 'v)] [t (pick closure-types)]
+                    [τs (match t [`(fnb ,_ ,τs ,_) τs] [`(fno ,τs ,_) τs])]
+                    [env2 (cons (cons f t) env)]
+                    [call (λ () `(seq ,(apply-with f τs env2) unit))])
+               `(let ([,f ,(leaf-of t)])
+                  (seq ,(call) ,(if (zero? (random 2)) `(seq ,(call) ,(in-scope f t τ)) (in-scope f t τ)))))]
        [else (leaf)])]))
 
 (define (gen-program)
@@ -540,6 +754,7 @@
           (for/list ([j (add1 (random 3))])
             (cons (fresh 'p)
                   (cond [(and (zero? j) (pair? Ts)) 'T]
+                        [(zero? (random 12)) '(out (box int))]
                         [(and (zero? j) (zero? (random 2)))
                          `(,(pick '(ref mut)) ,(pick '((box int) (box int) (box (box int)) int (Pair) (Opt (box int)) (pool (box int)))))]
                         [else (gen-type)]))))
@@ -562,7 +777,11 @@
       (define fn
         (for/or ([try 5])
           (define fn `(defn ,f ,Ts ,(for/list ([p params]) (list (car p) (cdr p))) ,ret
-                        ,(parameterize ([tvars Ts]) (gen-expr params call-sigs ret (random 3)))))
+                        ,(parameterize ([tvars Ts] [fn-ret ret])
+                           (let ([outs (for/list ([p params] #:when (match (cdr p) [`(out ,_) #t] [_ #f])) (car p))])
+                             ;; an out parameter is usually filled first
+                             (for/fold ([b (gen-expr params call-sigs ret (random 3))]) ([o outs])
+                               (if (zero? (random 4)) b `(seq (set! (* ,o) (box ,(random 3))) ,b)))))))
           (and (check-fn (append prelude fns (list fn)) fn) fn)))
       (if fn
           (values (append fns (list fn)) (append call-sigs (list (list f Ts (map cdr params) ret))))
@@ -578,7 +797,8 @@
 (define features
   '(("references" ref mut) ("calls" call) ("fields" :) ("match" match match-ref match-mut)
     ("views" view) ("pools" insert remove at) ("take/unbox" take unbox) ("loops" while)
-    ("break" break) ("globals" with) ("par" par) ("threads" spawn) ("raw pointers" addr)))
+    ("break" break) ("globals" with) ("par" par) ("threads" spawn spawn-fn) ("raw pointers" addr)
+    ("closures" lam lamo) ("closure calls" apply) ("out" out) ("return" return)))
 
 ;; -> the first counterexample, or #f
 (define (search n seed #:quiet [quiet #f])
@@ -622,6 +842,18 @@
 (define (search-seeds n)
   (for/or ([seed '(1 2 3 4)]) (search n seed #:quiet #t)))
 
+;; The hand-written cases under the rules as they are now: the first one the
+;; rules should refuse but take, and that goes wrong when it runs.
+(define (case-counterexample)
+  (for/or ([c cases])
+    (match-define (list want _ prog) c)
+    (and (eq? want 'reject)
+         (check-program prog)
+         (let ([ran (run prog)])
+           (match ran
+             [(list 'stuck _) (list prog ran)]
+             [_ #f])))))
+
 (define (teeth n only)
   (define (try what thunk)
     (define found (thunk))
@@ -633,7 +865,7 @@
   (define results
     (append
      (for/list ([m mutants] #:when (or (null? only) (memq (car m) only)))
-       (try (cadr m) (λ () (parameterize ([mutant (car m)]) (search-seeds n)))))
+       (try (cadr m) (λ () (parameterize ([mutant (car m)]) (or (case-counterexample) (search-seeds n))))))
      (if (or (null? only) (memq 'no-global-check only))
          (list (try "a global is entered without the run-time check"
                     (λ () (parameterize ([check-globals? #f]) (search-seeds n)))))

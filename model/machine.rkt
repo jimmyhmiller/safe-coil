@@ -19,6 +19,8 @@
 (struct stuck (why) #:transparent)
 (struct panic (why) #:transparent)
 (struct brk ())
+;; a `return`: the value the function gives back
+(struct ret (v))
 (struct cell (v live? heap?) #:mutable)
 
 ;; Testing the tests: without the run-time check on globals, the search must
@@ -47,6 +49,9 @@
     (match τ
       [`(view ,V) (map car (caddr (find 'view V)))]
       [(cons S _) (map car (cadddr (find 'struct S)))]))
+  ;; the function a view's drop runs, or #f
+  (define (view-drop V)
+    (match (find 'view V) [`(view ,_ ,_ ,f) f] [_ #f]))
 
   (define (alloc! v heap?)
     (set! next (add1 next))
@@ -113,6 +118,9 @@
   (define (owning? v)
     (match v
       [`(own ,_) #t]
+      [`(oclo ,_) #t]
+      ;; a view whose drop runs code is moved, so that the code runs once
+      [`(rec (%drop . ,_) . ,_) #t]
       [`(task ,_) #t]
       [`(tbl . ,_) #t]
       [`(rec (,_ . ,vs) ...) (ormap owning? vs)]
@@ -125,6 +133,15 @@
        (unless (cell-live? c) (raise (stuck "double free")))
        (drop-val! (cell-v c))
        (kill! a)]
+      [`(oclo ,a)
+       (define c (hash-ref store a))
+       (unless (cell-live? c) (raise (stuck "double free")))
+       (match (cell-v c)
+         [`(env ,caps ,_ ,_)
+          (for ([cap caps]) (end-scope! (cdr cap)))])
+       (kill! a)]
+      [`(rec (%drop . ,V) . ,fs)
+       (drop-val! (invoke (find 'defn (view-drop V)) (list `(rec ,@fs))))]
       [`(rec (,_ . ,vs) ...) (for-each drop-val! vs)]
       [`(var ,_ ,pv) (drop-val! pv)]
       [`(tbl (,_ . ,vs) ...) (for-each drop-val! vs)]
@@ -140,9 +157,9 @@
     (drop-val! (cell-v (hash-ref store a)))
     (kill! a))
 
-  ;; run thunk, then cleanup; a break passing through runs it too
+  ;; run thunk, then cleanup; a break or a return passing through runs it too
   (define (scoped cleanup thunk)
-    (define r (with-handlers ([brk? (λ (b) (cleanup) (raise b))]) (thunk)))
+    (define r (with-handlers ([(λ (x) (or (brk? x) (ret? x))) (λ (b) (cleanup) (raise b))]) (thunk)))
     (cleanup)
     r)
 
@@ -167,15 +184,29 @@
     (let loop ([es es] [acc '()])
       (if (null? es)
           (reverse acc)
-          (let ([v (with-handlers ([brk? (λ (b) (for-each drop-val! acc) (raise b))])
+          (let ([v (with-handlers ([(λ (x) (or (brk? x) (ret? x))) (λ (b) (for-each drop-val! acc) (raise b))])
                      (ev (car es) env))])
             (loop (cdr es) (cons v acc))))))
 
   (define (invoke fn vs)
     (match-define `(defn ,_ ,_ ,params ,_ ,body) fn)
-    (define cells (for/list ([v vs]) (alloc! v #f)))
-    (scoped (λ () (for-each end-scope! (reverse cells)))
-            (λ () (ev body (for/fold ([h (hasheq)]) ([p params] [a cells]) (hash-set h (car p) a))))))
+    (run-body body (for/list ([p params] [v vs]) (cons (car p) (alloc! v #f))) '()))
+  ;; a body over variables in cells: the cells in OWN end with it, the others
+  ;; (an owning closure's captures) stay
+  (define (run-body body own others)
+    (with-handlers ([ret? ret-v])
+      (scoped (λ () (for-each end-scope! (reverse (map cdr own))))
+              (λ () (ev body (for/fold ([h (hasheq)]) ([c (append others own)]) (hash-set h (car c) (cdr c))))))))
+  (define (apply-closure f vs)
+    (match f
+      [`(clo ,caps ,ps ,body)
+       (run-body body (append (for/list ([c caps]) (cons (car c) (alloc! (cdr c) #f)))
+                              (for/list ([x ps] [v vs]) (cons x (alloc! v #f))))
+                 '())]
+      [`(oclo ,a)
+       (match-define `(env ,caps ,ps ,body) (read! (cons a '())))
+       (run-body body (for/list ([x ps] [v vs]) (cons x (alloc! v #f))) caps)]
+      [_ (raise (stuck (format "a call of ~a" f)))]))
 
   (define (bind-arm x v body env)
     (define a (alloc! v #f))
@@ -228,6 +259,18 @@
              (loop))))
        'unit]
       [`(break) (raise (brk))]
+      [`(return ,e1 ,_) (raise (ret (ev e1 env)))]
+      [`(uninit ,_) 'moved]
+      [`(lam ([,ys ,_ ,es] ...) ((,ps ,_) ...) ,_ ,body)
+       `(clo ,(map cons ys (ev-list es env)) ,ps ,body)]
+      [`(lamo ([,ys ,_ ,es] ...) ((,ps ,_) ...) ,_ ,body)
+       (define vs (ev-list es env))
+       `(oclo ,(alloc! `(env ,(for/list ([y ys] [v vs]) (cons y (alloc! v #t))) ,ps ,body) #t))]
+      [`(apply ,p ,args ...)
+       (define ad (addr p env))
+       (define f (read! ad))
+       (when (eq? f 'moved) (raise (stuck "a call of a moved closure")))
+       (apply-closure f (ev-list args env))]
       [`(box ,e1) `(own ,(alloc! (ev e1 env) #t))]
       [`(unbox ,e1)
        (match (ev e1 env)
@@ -235,7 +278,7 @@
           (define v (read! (cons a '())))
           (kill! a)
           v])]
-      [`(,(or 'ref 'mut 'addr) ,p) (let ([ad (addr p env)]) `(ptr ,(car ad) ,(cdr ad)))]
+      [`(,(or 'ref 'mut 'out 'addr) ,p) (let ([ad (addr p env)]) `(ptr ,(car ad) ,(cdr ad)))]
       [`(set! ,p ,e1)
        (define v (ev e1 env))
        (define ad (addr p env))
@@ -249,7 +292,10 @@
        (write! ad v)
        old]
       [`(new ,τ ,es ...)
-       `(rec ,@(map cons (field-names τ) (ev-list es env)))]
+       (define fs (map cons (field-names τ) (ev-list es env)))
+       (match τ
+         [`(view ,V) #:when (view-drop V) `(rec (%drop . ,V) ,@fs)]
+         [_ `(rec ,@fs)])]
       [`(inj ,_ ,K ,e1) `(var ,K ,(ev e1 env))]
       [`(match ,e1 ,arms ...)
        (match (ev e1 env)
@@ -317,6 +363,21 @@
        (set! next (add1 next))
        (hash-set! tasks next (cons (by-cell mine) v))
        `(task ,next)]
+      [`(spawn-fn ,e1)
+       (define f (ev e1 env))
+       (define outer-log log)
+       (define outer-held held)
+       (set! log (make-hash))
+       (set! held '())
+       (define v (with-handlers ([brk? (λ (_) (raise (stuck "a break with no loop around it")))])
+                   (begin0 (apply-closure f '()) (drop-val! f))))
+       (define mine log)
+       (set! log outer-log)
+       (set! held outer-held)
+       (when log (for ([k (in-hash-keys mine)]) (hash-set! log k #t)))
+       (set! next (add1 next))
+       (hash-set! tasks next (cons (by-cell mine) v))
+       `(task ,next)]
       [`(join ,e1) (match (ev e1 env) [`(task ,id) (finish! id)])]
       [`(with ,w ,g ,x ,body)
        (define st (hash-ref lent g))
@@ -351,6 +412,7 @@
   (with-handlers ([stuck? (λ (s) (list 'stuck (stuck-why s)))]
                   [panic? (λ (s) (list 'panic (panic-why s)))]
                   [brk? (λ (_) (list 'stuck "a break with no loop around it"))]
+                  [ret? (λ (_) (list 'stuck "a return outside a function"))]
                   [(λ (x) (eq? x 'timeout)) (λ (_) (list 'timeout))])
     (define order
       (for/list ([d decls] #:when (eq? (car d) 'global))
