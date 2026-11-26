@@ -91,6 +91,14 @@ adds the rest of the model:
   whose captures are reference parameters, checked as any function is. A
   closure that owns what it captured (`lambda-own`) holds no reference, so it can
   be stored, returned and sent to another thread.
+- **What a view type says.** Only the module that declares a view may say of it:
+  `QuietDrop`, its drop uses nothing it borrowed, so its loans end at its last
+  use; `SharedView`, it gives only shared access, so it may be copied even when
+  made from an exclusive reference (a function taking `(mut c)` may give back a
+  `Maybe`, as Rust's `fn get(&mut self) -> Option<&V>` does); `CrossThread`, it
+  may be lent to `par`'s other thread. A view that gives exclusive access is
+  moved, never copied, and a field of a view that is itself a view is a place of
+  its own, lent like any other.
 - **Views the program declares.** `defview` and `defsubscript` make views with
   no `unsafe` in the program: the generated code follows the raw pointers, and
   the code the program writes (a subscript's code before and after its yield)
@@ -137,7 +145,7 @@ operations are allowed.
 
 | Module | What it gives |
 |---|---|
-| `safe.core` | `unsafe`; `borrow` and `borrow-mut`, a reference as a value; `replace!`, which swaps an owner out of a place; `move`; `each` and `each-mut`, a loop over a list, a slice or a string; `size` and `nth`, a `(slice T)` read with every index checked; the traits `View` and `QuietDrop`; the annotation `:safe/borrows` |
+| `safe.core` | `unsafe`; `borrow` and `borrow-mut`, a reference as a value; `replace!`, which swaps an owner out of a place; `move`; `each` and `each-mut`, a loop over a list, a slice or a string; `size` and `nth`, a `(slice T)` read with every index checked; the traits `View`, `QuietDrop`, `SharedView` and `CrossThread`; the annotation `:safe/borrows` |
 | `safe.loop` | `(for (ref x) xs …)` and `(for (mut x) xs …)` over a safe collection, each element by reference; any other `for` is Coil's |
 | `safe.fn` | `(deffn NAME [T…] [PARAM-TYPE…] RESULT)` declares a closure type; `(lambda NAME [(ref x) (mut y) (z (ref PLACE))…] [params…] body…)` makes one that borrows what it captures, `(lambda-own NAME [x (y VALUE)…] [params…] body…)` one of `NAME-own` that owns them; `(NAME::run (mut f) args…)` calls either; `(NAME-own::call-once f args…)` calls one and frees it, so `(spawn (NAME-own::call-once f))` runs it on a thread |
 | `safe.view` | `(defview NAME [T…] [(field TYPE)…])`, a view whose fields may be references or views: `NAME::new`, `NAME::field`, `NAME::field-mut`. `(defsubscript NAME [T…] [params…] (-> (ref R) or (mut R)) before… (yield PLACE) after…)`: `NAME::open` runs `before` and gives a view of `PLACE`, read with `NAME::get` and `NAME::get-mut`; `after` runs when the view is dropped |
@@ -146,7 +154,7 @@ operations are allowed.
 | `safe.maybe` | `(Maybe T)` and `(MaybeMut T)`: a reference or nothing, for a lookup's result (Coil keeps references out of `Option`). `Maybe::found`, `Maybe::nothing`, `found?`, `get`; `(if-found [x m] then else)`, `when-found`, `if-found-mut`. It is a view: it keeps what it was found in lent |
 | `safe.pool` | `(Pool T)`, a collection that owns its elements, and `(Handle T)`, plain data checked when it is used: `insert!`, `remove!`, `at`, `at-mut`, `live?`, `len`, `handles` |
 | `safe.global` | `defglobal`, `with-ref`, `with-mut`: a global lent for a scope, with exclusivity checked when the scope is entered |
-| `safe.vec` | `(Vec T)`, a growable list that owns its elements: `push!`, `pop!`, `at`, `at-mut`, `swap!`, `insert!`, `remove!`, `clear!`; `(len v)`, `(get v i)` (a copy, for plain data) and `(set! (mut v) i x)` as for Coil's own collections. `(Vec::slice v from to)` is a `(Slice T)`, part of the list lent shared: `len`, `at`, `part`. `(Vec::slice-mut (mut v) from to)` is a `(SliceMut T)`, part of it lent exclusively: `len`, `at`, `at-mut`, `part`, `part-mut`. An index out of range stops the program |
+| `safe.vec` | `(Vec T)`, a growable list that owns its elements: `push!`, `pop!`, `at`, `at-mut`, `swap!`, `insert!`, `remove!`, `clear!`; `(len v)`, `(get v i)` (a copy, for plain data) and `(set! (mut v) i x)` as for Coil's own collections. `(Vec::slice v from to)` is a `(Slice T)`, part of the list lent shared: `len`, `at`, `part`. `(Vec::slice-mut (mut v) from to)` is a `(SliceMut T)`, part of it lent exclusively: `len`, `at`, `at-mut`, `get`, `part`, `part-mut`, and `split`, which gives `(Halves T)`: `left` and `right`, both lent exclusively at once. An index out of range stops the program |
 | `safe.str` | `Str`, text that owns its bytes: `Str::from "…"`, `len`, `byte`, `push!`, `push-text!`, `push-int!`, `append!`, `eq?`, `copy`; `Str::slice` is a `(Slice u8)` of its bytes, with `from-slice` and `push-slice!` to copy one. It prints with `{}`. `(str-of "x={} y={}" x y)` is a new `Str` formatted as `println` formats, and `(str-push! (mut s) "…" args…)` adds to one |
 | `safe.map` | `(Map K V)`, a hash table that owns its keys and values; K needs `Hash` and `Eq`: `insert!`, `remove!`, `has?`, `at`, `at-mut`, `len`; `(each-entry [key value table] …)` walks it, as `first`/`next`/`key-at`/`value-at` do by hand |
 | `safe.par` | `(par (f a…) (g b…))`: two calls at once, on two threads |
@@ -262,6 +270,9 @@ clean under `--sanitize=address`:
 | `shapes.coil` | a scene of owned trait objects, one a group of others |
 | `pipeline.coil` | generic `map`, `filter`, `fold` and sort taking closures; a list of stored rules, each an owning closure |
 | `sim.coil` | rabbits and foxes in a `Pool`: entities naming each other by handle, removed while others hold handles |
+| `lru.coil` | a least-recently-used cache: a doubly linked list in a `Pool`, linked by handle, and a `Map` of keys to entries |
+| `msort.coil` | a parallel merge sort: a slice split into halves sorted on two threads with `par` |
+| `vm.coil` | a tiny language compiled to bytecode and run on a stack machine: trees of boxed sums, jumps patched after the fact, a call stack |
 | `wordcount.coil` | words counted on four threads into a shared table, through a channel |
 
 ### par
@@ -389,9 +400,12 @@ Found by the differential run:
   runs one only through an exclusive reference to it, so it takes either. The
   checker may accept a program the model refuses for that alone; `diff.py`
   counts them apart (`closure-kind`).
-- **`par` takes no view.** The model lets a view be an argument of a `par`
-  call. `safe.par` passes each argument through a type parameter, which the
-  checker never lets a view be.
+- **`par` takes a view only by reference, and only one that may cross
+  threads.** The model lets a view be an argument of a `par` call. `safe.par`
+  passes each argument through a type parameter, which the checker never lets a
+  view be, except that its own expansion may hand its helpers `(mut v)` or
+  `(borrow v)` for a view whose module says it is `CrossThread` (`Slice`,
+  `SliceMut`, `Halves`; not a held lock).
 - **A shared match on a plain-data payload reads a copy.** Coil copies such a
   payload into the arm, so the Coil form lends the copy. The checker refuses a
   reference to it that leaves the arm; the model lets a reference to the

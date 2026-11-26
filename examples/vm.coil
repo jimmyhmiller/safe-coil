@@ -1,0 +1,190 @@
+;;; A tiny language compiled to bytecode and run on a stack machine: arithmetic,
+;;; variables, comparisons, while loops and functions with recursion. Safe Coil
+;;; throughout.
+;;;
+;;;   coil run examples/vm.coil --use safe.check
+(module example.vm)
+(import "safe.vec" :use [Vec])
+(import "safe.str" :use [Str str-of])
+(import "safe.box" :use [Box])
+(import "safe.map" :use [Map])
+(import "safe.loop" :use [for])
+(import "safe.core" :use [borrow])
+
+;; ---- the program, as a tree ------------------------------------------------------
+
+(defsum Expr
+  (Num [(n i64)])
+  (Var [(slot i64)])
+  (Add [(a (Box Expr)) (b (Box Expr))])
+  (Sub [(a (Box Expr)) (b (Box Expr))])
+  (Mul [(a (Box Expr)) (b (Box Expr))])
+  (Less [(a (Box Expr)) (b (Box Expr))])
+  (Call [(func i64) (args (Vec Expr))]))
+
+(defsum Stmt
+  (Set [(slot i64) (value Expr)])
+  (While [(test Expr) (body (Vec Stmt))])
+  (If [(test Expr) (yes (Vec Stmt)) (no (Vec Stmt))])
+  (Return [(value Expr)])
+  (Print [(value Expr)]))
+
+(defstruct Func [(name Str) (params i64) (locals i64) (body (Vec Stmt))])
+
+;; ---- bytecode --------------------------------------------------------------------
+
+(defsum Op
+  (Push [(n i64)])
+  (Load [(slot i64)])
+  (Store [(slot i64)])
+  (Plus) (Minus) (Times) (Lt)
+  (Jump [(to i64)])
+  (JumpIfZero [(to i64)])
+  (CallOp [(func i64) (args i64)])
+  (Ret)
+  (Out))
+
+(defstruct Chunk [(ops (Vec Op)) (locals i64)])
+
+(defn emit! [(c (mut (Vec Op))) (op Op)] (-> i64)
+  (Vec::push! (mut c) op)
+  (- (len c) 1))
+
+(defn compile-expr [(e (ref Expr)) (c (mut (Vec Op)))] (-> void)
+  (match e
+    (Num [n] (emit! (mut c) (Push n)))
+    (Var [slot] (emit! (mut c) (Load slot)))
+    (Add [a b] (compile-expr (Box::get a) (mut c)) (compile-expr (Box::get b) (mut c)) (emit! (mut c) (Plus)))
+    (Sub [a b] (compile-expr (Box::get a) (mut c)) (compile-expr (Box::get b) (mut c)) (emit! (mut c) (Minus)))
+    (Mul [a b] (compile-expr (Box::get a) (mut c)) (compile-expr (Box::get b) (mut c)) (emit! (mut c) (Times)))
+    (Less [a b] (compile-expr (Box::get a) (mut c)) (compile-expr (Box::get b) (mut c)) (emit! (mut c) (Lt)))
+    (Call [func args]
+          (for (ref arg) args (compile-expr arg (mut c)))
+          (emit! (mut c) (CallOp :func func :args (len args)))))
+  0)
+
+;;; Point the jump at AT to where the code now ends.
+(defn patch! [(c (mut (Vec Op))) (at i64)] (-> void)
+  (let [here (len c)]
+    (match (Vec::at c at)
+      (Jump [_] (set! (mut c) at (Jump here)))
+      (JumpIfZero [_] (set! (mut c) at (JumpIfZero here)))
+      (_ (panic "patch!: not a jump")))))
+
+(defn compile-block [(stmts (ref (Vec Stmt))) (c (mut (Vec Op)))] (-> void)
+  (for (ref s) stmts
+    (match s
+      (Set [slot value] (compile-expr value (mut c)) (emit! (mut c) (Store slot)))
+      (While [test body]
+             (let [top (len c)]
+               (compile-expr test (mut c))
+               (let [exit (emit! (mut c) (JumpIfZero 0))]
+                 (compile-block body (mut c))
+                 (emit! (mut c) (Jump top))
+                 (patch! (mut c) exit))))
+      (If [test yes no]
+          (compile-expr test (mut c))
+          (let [skip (emit! (mut c) (JumpIfZero 0))]
+            (compile-block yes (mut c))
+            (let [over (emit! (mut c) (Jump 0))]
+              (patch! (mut c) skip)
+              (compile-block no (mut c))
+              (patch! (mut c) over))))
+      (Return [value] (compile-expr value (mut c)) (emit! (mut c) (Ret)))
+      (Print [value] (compile-expr value (mut c)) (emit! (mut c) (Out))))))
+
+(defn compile [(f (ref Func))] (-> Chunk)
+  (let [(mut ops) (Vec::new [Op])]
+    (compile-block (field f body) (mut ops))
+    (emit! (mut ops) (Push 0))
+    (emit! (mut ops) (Ret))
+    (Chunk :ops ops :locals (.locals f))))
+
+;; ---- the machine -----------------------------------------------------------------
+
+(defstruct Frame [(func i64) (pc i64) (base i64)])
+
+(defn run [(code (ref (Vec Chunk))) (entry i64)] (-> i64)
+  (let [(mut stack) (Vec::new [i64])
+        (mut frames) (Vec::new [Frame])
+        (mut steps) 0]
+    (for i (range 0 (.locals (Vec::at code entry))) (Vec::push! (mut stack) 0))
+    (Vec::push! (mut frames) (Frame :func entry :pc 0 :base 0))
+    (block :done
+      (loop
+        (set! steps (+ steps 1))
+        (let [top (- (len frames) 1)
+              frame (get frames top)
+              ops (borrow (field (Vec::at code (.func frame)) ops))]
+          (set! (.pc (Vec::at-mut (mut frames) top)) (+ (.pc frame) 1))
+          (match (Vec::at ops (.pc frame))
+            (Push [n] (Vec::push! (mut stack) n))
+            (Load [slot] (Vec::push! (mut stack) (get stack (+ (.base frame) slot))))
+            (Store [slot] (match (Vec::pop! (mut stack))
+                            (Some [v] (set! (mut stack) (+ (.base frame) slot) v))
+                            (None [] (panic "empty stack"))))
+            (Jump [to] (set! (.pc (Vec::at-mut (mut frames) top)) to))
+            (JumpIfZero [to] (when (= (pop! (mut stack)) 0)
+                               (set! (.pc (Vec::at-mut (mut frames) top)) to)))
+            (CallOp [func args]
+                    (let [base (- (len stack) args)]
+                      (for i (range args (.locals (Vec::at code func))) (Vec::push! (mut stack) 0))
+                      (Vec::push! (mut frames) (Frame :func func :pc 0 :base base))))
+            (Ret [] (let [result (pop! (mut stack))]
+                   (while (> (len stack) (.base frame)) (pop! (mut stack)))
+                   (Vec::pop! (mut frames))
+                   (when (= (len frames) 0) (return-from :done result))
+                   (Vec::push! (mut stack) result)))
+            (Out [] (println "{}" (pop! (mut stack))))
+            (_ (let [b (pop! (mut stack))
+                     a (pop! (mut stack))]
+                 (Vec::push! (mut stack)
+                             (match (Vec::at ops (.pc frame))
+                               (Plus [] (+ a b))
+                               (Minus [] (- a b))
+                               (Times [] (* a b))
+                               (Lt [] (if (< a b) 1 0))
+                               (_ (panic "not an operator")))))))))
+      0)))
+
+(defn pop! [(s (mut (Vec i64)))] (-> i64)
+  (match (Vec::pop! (mut s)) (Some [v] v) (None [] (panic "empty stack"))))
+
+;; ---- a program -------------------------------------------------------------------
+
+(defn num [(n i64)] (-> (Box Expr)) (Box::new (Num n)))
+(defn var [(s i64)] (-> (Box Expr)) (Box::new (Var s)))
+
+(defn block1 [(s Stmt)] (-> (Vec Stmt))
+  (let [(mut v) (Vec::new [Stmt])] (Vec::push! (mut v) s) v))
+
+(defn main [] (-> i64)
+  (let [(mut funcs) (Vec::new [Func])]
+    ;; 0: fib(n) = if n < 2 then n else fib(n-1) + fib(n-2)
+    (let [(mut args1) (Vec::new [Expr])
+          (mut args2) (Vec::new [Expr])]
+      (Vec::push! (mut args1) (Sub :a (var 0) :b (num 1)))
+      (Vec::push! (mut args2) (Sub :a (var 0) :b (num 2)))
+      (Vec::push! (mut funcs)
+                  (Func :name (Str::from "fib") :params 1 :locals 1
+                        :body (block1 (If :test (Less :a (var 0) :b (num 2))
+                                          :yes (block1 (Return (Var 0)))
+                                          :no (block1 (Return (Add :a (Box::new (Call :func 0 :args args1))
+                                                                    :b (Box::new (Call :func 0 :args args2))))))))))
+    ;; 1: main: i = 0; while i < 10 { print fib(i); i = i + 1 }; return 0
+    (let [(mut body) (Vec::new [Stmt])
+          (mut loop-body) (Vec::new [Stmt])
+          (mut args) (Vec::new [Expr])]
+      (Vec::push! (mut args) (Var 0))
+      (Vec::push! (mut loop-body) (Print (Call :func 0 :args args)))
+      (Vec::push! (mut loop-body) (Set :slot 0 :value (Add :a (var 0) :b (num 1))))
+      (Vec::push! (mut body) (Set :slot 0 :value (Num 0)))
+      (Vec::push! (mut body) (While :test (Less :a (var 0) :b (num 10)) :body loop-body))
+      (Vec::push! (mut body) (Return (Num 0)))
+      (Vec::push! (mut funcs) (Func :name (Str::from "main") :params 0 :locals 1 :body body)))
+    (let [(mut code) (Vec::new [Chunk])]
+      (for (ref f) funcs (Vec::push! (mut code) (compile f)))
+      (for i (range 0 (len funcs))
+        (println "{}: {} ops" (.name (Vec::at funcs i)) (len (field (Vec::at code i) ops))))
+      (println "result {}" (run code 1))))
+  0)
