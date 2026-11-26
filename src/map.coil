@@ -138,14 +138,14 @@
 
   ;;; KEY's value, lent for as long as the table is. A key it does not hold
   ;;; stops the program: ask `has?` first.
-  (at [(m (ref (Map K V))) (key (ref K))] (-> (ref V))
+  (at :safe/borrows "m" [(m (ref (Map K V))) (key (ref K))] (-> (ref V))
     (unsafe
       (let [at (find m key)]
         (when (< at 0) (panic "safe: a Map was asked for a key it does not hold"))
         (lend (field (primitive/index (data (.entries m)) at) value)))))
 
   ;;; KEY's value, lent to be changed for as long as the table is.
-  (at-mut [(m (mut (Map K V))) (key (ref K))] (-> (mut V))
+  (at-mut :safe/borrows "m" [(m (mut (Map K V))) (key (ref K))] (-> (mut V))
     (unsafe
       (let [at (find m key)]
         (when (< at 0) (panic "safe: a Map was asked for a key it does not hold"))

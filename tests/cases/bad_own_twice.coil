@@ -1,0 +1,10 @@
+;;; One Own gives one trait object at a time.
+(module bad_own_twice)
+(import "safe.own" :use [Own own])
+(deftrait Counter [Self] (bump [(self (ptr Self))] (-> i64)))
+(defstruct Clicks [(n i64)])
+(impl Counter Clicks (bump [(self (ptr Clicks))] (-> i64) (set! (.n self) (+ (.n self) 1)) (.n self)))
+(defn both [(a (dyn Counter)) (b (dyn Counter))] (-> i64) (+ (bump a) (bump b)))
+(defn main [] (-> i64)
+  (let [(mut o) (own Counter (Clicks :n 0))]
+    (both (Own::get-mut (mut o)) (Own::get-mut (mut o)))))

@@ -1,0 +1,18 @@
+;;; A function that says its result comes from one argument leaves the others
+;;; free: the key can be a temporary, and changed while the result lives.
+(module ok_borrows)
+(import "coil.primitive" :as primitive)
+(import "safe.box" :use [Box])
+(import "safe.map" :use [Map])
+(import "safe.str" :use [Str])
+(defn first-of :safe/borrows "a" [(a (ref (Box i64))) (b (ref (Box i64)))] (-> (ref (Box i64))) a)
+(defn main [] (-> i64)
+  (let [x (Box::new 1)
+        (mut y) (Box::new 2)
+        r (first-of x y)]
+    (set! y (Box::new 3))
+    (println "{}" (primitive/load (Box::get r))))
+  (let [(mut m) (Map::new [Str i64])]
+    (Map::insert! (mut m) (Str::from "k") 4)
+    (println "{}" (primitive/load (Map::at m (Str::from "k")))))
+  0)

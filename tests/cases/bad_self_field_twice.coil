@@ -1,0 +1,8 @@
+;;; A field of a trait method's self is one place: it is not lent exclusively twice.
+(module bad_self_field_twice)
+(import "safe.vec" :use [Vec])
+(deftrait Fill [Self] (fill [(self (ptr Self))] (-> i64)))
+(defstruct Bag [(items (Vec i64))])
+(defn both [(a (mut (Vec i64))) (b (mut (Vec i64)))] (-> i64) (Vec::push! (mut a) 1) (Vec::push! (mut b) 2) 0)
+(impl Fill Bag (fill [(self (ptr Bag))] (-> i64) (both (mut (field self items)) (mut (field self items)))))
+(defn main [] (-> i64) 0)

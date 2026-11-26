@@ -1,0 +1,11 @@
+;;; The argument a :safe/borrows names stays lent while the result lives.
+(module bad_borrows_kept)
+(import "coil.primitive" :as primitive)
+(import "safe.box" :use [Box])
+(defn first-of :safe/borrows "a" [(a (ref (Box i64))) (b (ref (Box i64)))] (-> (ref (Box i64))) a)
+(defn main [] (-> i64)
+  (let [(mut x) (Box::new 1)
+        y (Box::new 2)
+        r (first-of x y)]
+    (set! x (Box::new 3))
+    (primitive/load (Box::get r))))

@@ -1,0 +1,5 @@
+;;; A function may not return what a parameter its :safe/borrows leaves out was lent.
+(module bad_borrows_body)
+(import "safe.box" :use [Box])
+(defn second-of :safe/borrows "a" [(a (ref (Box i64))) (b (ref (Box i64)))] (-> (ref (Box i64))) b)
+(defn main [] (-> i64) 0)

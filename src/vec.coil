@@ -81,6 +81,48 @@
           (do (set! (.count v) (- (.count v) 1))
               (Some (take! [T] (primitive/index (data (.items v)) (.count v))))))))
 
+  ;;; Exchange elements I and J. An index out of range stops the program.
+  (swap! [(v (mut (Vec T))) (i i64) (j i64)] (-> void)
+    (unsafe
+      (let [a (slot v i)
+            b (slot v j)]
+        (unless (= i j)
+          (let [held (take! [T] a)]
+            (store! a (take! [T] b))
+            (store! b held)))
+        0)))
+
+  ;;; Put VALUE at I, moving the elements from I on one place later. I may be
+  ;;; the length, which adds VALUE at the end.
+  (insert! [(v (mut (Vec T))) (i i64) (value T)] (-> void)
+    (unsafe
+      (when (or (< i 0) (> i (.count v)))
+        (panic "safe: index {} is out of range for inserting into a Vec of {}" i (.count v)))
+      (Vec::push! (mut v) value)
+      (let [(mut k) (- (.count v) 1)]
+        (while (> k i)
+          (Vec::swap! (mut v) k (- k 1))
+          (set! k (- k 1))))
+      0))
+
+  ;;; Take element I out, moving the elements after it one place earlier. An
+  ;;; index out of range stops the program.
+  (remove! [(v (mut (Vec T))) (i i64)] (-> T)
+    (unsafe
+      (slot v i)
+      (let [(mut k) i]
+        (while (< k (- (.count v) 1))
+          (Vec::swap! (mut v) k (+ k 1))
+          (set! k (+ k 1))))
+      (set! (.count v) (- (.count v) 1))
+      (take! [T] (primitive/index (data (.items v)) (.count v)))))
+
+  ;;; Drop every element, keeping the room.
+  (clear! [(v (mut (Vec T)))] (-> void)
+    (while (> (Vec::len v) 0)
+      (Vec::pop! (mut v)))
+    0)
+
   ;;; Element I, lent for as long as the list is.
   (at [(v (ref (Vec T))) (i i64)] (-> (ref T))
     (unsafe (lend (slot v i))))
@@ -137,6 +179,22 @@
   (part-mut [(s (mut (SliceMut T))) (from i64) (to i64)] (-> (SliceMut T))
     (unsafe
       (SliceMut :items (range-within (.items s) (.count s) from to) :count (- to from)))))
+
+;;; `(len v)`, as for Coil's own collections.
+(impl [T] Len (Vec T)
+  (len [(v (ref (Vec T)))] (-> i64) (.count v)))
+
+;;; `(get v i)`: a copy of element I, for elements that are plain data; one
+;;; that owns something is lent with `(Vec::at v i)`.
+(impl [T] Get (Vec T)
+  (get :collection/copies-element "(Vec::at v i)" [(v (ref (Vec T))) (i i64)] (-> T)
+    (unsafe (load (slot v i)))))
+
+;;; `(set! (mut v) i x)`: element I replaced, the old one dropped.
+(impl [T] Set (Vec T)
+  (set! [(v (mut (Vec T))) (i i64) (x T)] (-> i64)
+    (set! (Vec::at-mut (mut v) i) x)
+    0))
 
 (impl [T] Each (Vec T)
   (count [(xs (ref (Vec T)))] (-> i64) (Vec::len xs))

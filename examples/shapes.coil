@@ -1,0 +1,79 @@
+;;; A scene of shapes of different types, held as owned trait objects and drawn
+;;; and changed through the trait. Safe Coil throughout.
+;;;
+;;;   coil run examples/shapes.coil --use safe.check
+(module example.shapes)
+(import "safe.vec" :use [Vec])
+(import "safe.str" :use [Str])
+(import "safe.own" :use [Own own])
+(import "safe.loop" :use [for])
+
+(deftrait Shape [Self]
+  (area [(self (ptr Self))] (-> i64))
+  (grow [(self (ptr Self)) (by i64)] (-> void))
+  (describe [(self (ptr Self)) (out (mut Str))] (-> void)))
+
+(defstruct Square [(side i64)])
+(defstruct Rect [(w i64) (h i64)])
+;;; A shape made of others, and named: it owns a list of trait objects and text.
+(defstruct Group [(name Str) (parts (Vec (Own (dyn Shape))))])
+
+(impl Shape Square
+  (area [(self (ptr Square))] (-> i64) (* (.side self) (.side self)))
+  (grow [(self (ptr Square)) (by i64)] (-> void) (set! (.side self) (+ (.side self) by)) 0)
+  (describe [(self (ptr Square)) (out (mut Str))] (-> void)
+    (Str::push-text! (mut out) "square ")
+    (Str::push-int! (mut out) (.side self))))
+
+(impl Shape Rect
+  (area [(self (ptr Rect))] (-> i64) (* (.w self) (.h self)))
+  (grow [(self (ptr Rect)) (by i64)] (-> void)
+    (set! (.w self) (+ (.w self) by))
+    (set! (.h self) (+ (.h self) by))
+    0)
+  (describe [(self (ptr Rect)) (out (mut Str))] (-> void)
+    (Str::push-text! (mut out) "rect ")
+    (Str::push-int! (mut out) (.w self))
+    (Str::push-text! (mut out) "x")
+    (Str::push-int! (mut out) (.h self))))
+
+(impl Shape Group
+  (area [(self (ptr Group))] (-> i64)
+    (let [(mut total) 0]
+      (for (mut p) (field self parts)
+        (set! total (+ total (area (Own::get-mut (mut p))))))
+      total))
+  (grow [(self (ptr Group)) (by i64)] (-> void)
+    (for (mut p) (field self parts)
+      (grow (Own::get-mut (mut p)) by))
+    0)
+  (describe [(self (ptr Group)) (out (mut Str))] (-> void)
+    (Str::append! (mut out) (field self name))
+    (Str::push-text! (mut out) " of ")
+    (Str::push-int! (mut out) (Vec::len (field self parts)))))
+
+(defn report [(shapes (mut (Vec (Own (dyn Shape)))))] (-> i64)
+  (let [(mut total) 0]
+    (for (mut s) shapes
+      (let [(mut line) (Str::new)]
+        (describe (Own::get-mut (mut s)) (mut line))
+        (let [a (area (Own::get-mut (mut s)))]
+          (println "{} has area {}" line a)
+          (set! total (+ total a)))))
+    total))
+
+(defn main [] (-> i64)
+  (let [(mut shapes) (Vec::new [(Own (dyn Shape))])
+        (mut pair) (Vec::new [(Own (dyn Shape))])]
+    (Vec::push! (mut pair) (own Shape (Square :side 1)))
+    (Vec::push! (mut pair) (own Shape (Rect :w 1 :h 2)))
+    (Vec::push! (mut shapes) (own Shape (Square :side 3)))
+    (Vec::push! (mut shapes) (own Shape (Rect :w 2 :h 5)))
+    (Vec::push! (mut shapes) (own Shape (Group :name (Str::from "pair") :parts pair)))
+    (println "total {}" (report (mut shapes)))
+    (for (mut s) shapes (grow (Own::get-mut (mut s)) 1))
+    (println "after growing, total {}" (report (mut shapes)))
+    (match (Vec::pop! (mut shapes))
+      (Some [last] (println "took the group off; {} left" (Vec::len shapes)))
+      (None [] 0)))
+  0)

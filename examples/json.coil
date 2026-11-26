@@ -1,0 +1,222 @@
+;;; JSON: a parser, a printer and a path query, in safe Coil.
+;;;
+;;;   coil run examples/json.coil --use safe.check
+(module example.json)
+(import "safe.box" :use [Box])
+(import "safe.vec" :use [Vec])
+(import "safe.str" :use [Str])
+(import "safe.map" :use [Map each-entry])
+(import "safe.core" :use [replace! size nth])
+(import "safe.loop" :use [for])
+(import "safe.maybe" :use [Maybe if-found])
+(import "coil.primitive" :as primitive)
+
+(defsum Json
+  (Null)
+  (Bool [(b bool)])
+  (Num [(n i64)])
+  (Text [(s Str)])
+  (Array [(items (Vec Json))])
+  (Object [(keys (Vec Str)) (fields (Map Str Json))]))
+
+;; ---- parsing -------------------------------------------------------------------
+
+(defstruct Parser [(src Str) (pos i64)])
+
+(defn peek [(p (ref Parser))] (-> i64)
+  (if (< (.pos p) (Str::len (field p src)))
+      (primitive/cast i64 (Str::byte (field p src) (.pos p)))
+      -1))
+
+(defn bump! [(p (mut Parser))] (-> void)
+  (set! (.pos p) (+ (.pos p) 1)))
+
+(defn skip-ws! [(p (mut Parser))] (-> void)
+  (while (or (= (peek p) 32) (= (peek p) 10) (= (peek p) 9))
+    (bump! (mut p))))
+
+(defn fail [(p (ref Parser)) (what (slice u8))] (-> Str)
+  (let [(mut msg) (Str::from what)]
+    (Str::push-text! (mut msg) " at ")
+    (Str::push-int! (mut msg) (.pos p))
+    msg))
+
+(defn expect! [(p (mut Parser)) (c i64)] (-> (Result i64 Str))
+  (skip-ws! (mut p))
+  (if (= (peek p) c)
+      (do (bump! (mut p)) (Ok 0))
+      (Err (fail p "unexpected character"))))
+
+(defn word! [(p (mut Parser)) (w (slice u8))] (-> bool)
+  (let [start (.pos p)]
+    (block :out
+      (for i (range 0 (size w))
+        (unless (= (peek p) (primitive/cast i64 (nth w i)))
+          (set! (.pos p) start)
+          (return-from :out false))
+        (bump! (mut p)))
+      true)))
+
+(defn parse-string [(p (mut Parser))] (-> (Result Str Str))
+  (try
+    (try! (expect! (mut p) 34))
+    (let [(mut out) (Str::new)]
+      (while (and (!= (peek p) 34) (!= (peek p) -1))
+        (when (= (peek p) 92)
+          (bump! (mut p)))
+        (Str::push! (mut out) (primitive/cast u8 (peek p)))
+        (bump! (mut p)))
+      (try! (expect! (mut p) 34))
+      (Ok out))))
+
+(defn parse-number [(p (mut Parser))] (-> Json)
+  (let [neg (= (peek p) 45)
+        (mut n) 0]
+    (when neg (bump! (mut p)))
+    (while (and (>= (peek p) 48) (<= (peek p) 57))
+      (set! n (+ (* n 10) (- (peek p) 48)))
+      (bump! (mut p)))
+    (Num (if neg (- 0 n) n))))
+
+(defn parse-value [(p (mut Parser))] (-> (Result Json Str))
+  (try
+    (skip-ws! (mut p))
+    (let [c (peek p)]
+      (cond (= c 34) (Ok (Text (try! (parse-string (mut p)))))
+            (= c 91)
+              (do (bump! (mut p))
+                  (let [(mut items) (Vec::new [Json])]
+                    (skip-ws! (mut p))
+                    (if (= (peek p) 93)
+                        (bump! (mut p))
+                        (loop
+                          (Vec::push! (mut items) (try! (parse-value (mut p))))
+                          (skip-ws! (mut p))
+                          (if (= (peek p) 44)
+                              (bump! (mut p))
+                              (do (try! (expect! (mut p) 93)) (break)))))
+                    (Ok (Array items))))
+            (= c 123)
+              (do (bump! (mut p))
+                  (let [(mut keys) (Vec::new [Str])
+                        (mut fields) (Map::new [Str Json])]
+                    (skip-ws! (mut p))
+                    (if (= (peek p) 125)
+                        (bump! (mut p))
+                        (loop
+                          (skip-ws! (mut p))
+                          (let [key (try! (parse-string (mut p)))]
+                            (try! (expect! (mut p) 58))
+                            (let [value (try! (parse-value (mut p)))]
+                              (Vec::push! (mut keys) (Str::copy key))
+                              (Map::insert! (mut fields) key value)))
+                          (skip-ws! (mut p))
+                          (if (= (peek p) 44)
+                              (bump! (mut p))
+                              (do (try! (expect! (mut p) 125)) (break)))))
+                    (Ok (Object :keys keys :fields fields))))
+            (word! (mut p) "true") (Ok (Bool true))
+            (word! (mut p) "false") (Ok (Bool false))
+            (word! (mut p) "null") (Ok (Null))
+            (or (= c 45) (and (>= c 48) (<= c 57))) (Ok (parse-number (mut p)))
+            :else (Err (fail p "unexpected character"))))))
+
+(defn parse [(text (slice u8))] (-> (Result Json Str))
+  (let [(mut p) (Parser :src (Str::from text) :pos 0)]
+    (parse-value (mut p))))
+
+;; ---- printing -----------------------------------------------------------------
+
+(defn indent! [(out (mut Str)) (depth i64)] (-> void)
+  (for i (range 0 depth) (Str::push-text! (mut out) "  ")))
+
+(defn show [(j (ref Json)) (out (mut Str)) (depth i64)] (-> void)
+  (match j
+    (Null [] (Str::push-text! (mut out) "null"))
+    (Bool [b] (Str::push-text! (mut out) (if b "true" "false")))
+    (Num [n] (Str::push-int! (mut out) n))
+    (Text [s] (Str::push-text! (mut out) "\"") (Str::append! (mut out) s) (Str::push-text! (mut out) "\""))
+    (Array [items]
+           (Str::push-text! (mut out) "[")
+           (for i (range 0 (Vec::len items))
+             (when (> i 0) (Str::push-text! (mut out) ", "))
+             (show (Vec::at items i) (mut out) depth))
+           (Str::push-text! (mut out) "]"))
+    (Object [keys fields]
+            (Str::push-text! (mut out) "{\n")
+            (for i (range 0 (Vec::len keys))
+              (let [k (Vec::at keys i)]
+                (indent! (mut out) (+ depth 1))
+                (Str::push-text! (mut out) "\"")
+                (Str::append! (mut out) k)
+                (Str::push-text! (mut out) "\": ")
+                (show (Map::at fields k) (mut out) (+ depth 1))
+                (when (< i (- (Vec::len keys) 1)) (Str::push-text! (mut out) ","))
+                (Str::push-text! (mut out) "\n")))
+            (indent! (mut out) depth)
+            (Str::push-text! (mut out) "}"))))
+
+;; ---- querying -----------------------------------------------------------------
+
+;;; The value at PATH, a list of keys and indexes, or nothing. What it finds is
+;;; part of J: PATH is only read.
+(defn lookup :safe/borrows "j" [(j (ref Json)) (path (ref (Vec Str))) (at i64)] (-> (Maybe Json))
+  (if (= at (Vec::len path))
+      (Maybe::found j)
+      (let [step (Vec::at path at)]
+        (match j
+          (Object [_ fields]
+                  (if (Map::has? fields step)
+                      (lookup (Map::at fields step) path (+ at 1))
+                      (Maybe::nothing)))
+          (Array [items]
+                 (let [i (to-index step)]
+                   (if (and (>= i 0) (< i (Vec::len items)))
+                       (lookup (Vec::at items i) path (+ at 1))
+                       (Maybe::nothing))))
+          (_ (Maybe::nothing))))))
+
+(defn to-index [(s (ref Str))] (-> i64)
+  (let [(mut n) 0]
+    (block :out
+      (for i (range 0 (Str::len s))
+        (let [d (primitive/cast i64 (Str::byte s i))]
+          (unless (and (>= d 48) (<= d 57)) (return-from :out -1))
+          (set! n (+ (* n 10) (- d 48)))))
+      n)))
+
+(defn split [(text (ref Str)) (sep u8)] (-> (Vec Str))
+  (let [(mut out) (Vec::new [Str])
+        (mut cur) (Str::new)]
+    (for i (range 0 (Str::len text))
+      (if (= (Str::byte text i) sep)
+          (Vec::push! (mut out) (replace! (mut cur) (Str::new)))
+          (Str::push! (mut cur) (Str::byte text i))))
+    (Vec::push! (mut out) cur)
+    out))
+
+(defn total [(j (ref Json))] (-> i64)
+  (match j
+    (Num [n] n)
+    (Array [items] (let [(mut t) 0] (for (ref x) items (set! t (+ t (total x)))) t))
+    (Object [_ fields] (let [(mut t) 0] (each-entry [_ v fields] (set! t (+ t (total v)))) t))
+    (_ 0)))
+
+(defn main [] (-> i64)
+  (match (parse "{\"name\": \"coil\", \"tags\": [\"safe\", \"fast\"], \"stats\": {\"stars\": 12, \"forks\": [1, 2, 3]}, \"ok\": true, \"none\": null}")
+    (Ok [doc]
+        (let [(mut out) (Str::new)]
+          (show doc (mut out) 0)
+          (println "{}" out))
+        (for (ref q) (split (Str::from "name;tags.1;stats.forks.2;stats.missing") #\;)
+          (let [(mut out) (Str::new)]
+            (if-found [found (lookup doc (split q #\.) 0)]
+              (show found (mut out) 0)
+              (Str::push-text! (mut out) "(nothing)"))
+            (println "{} = {}" q out)))
+        (println "total = {}" (total doc)))
+    (Err [msg] (println "error: {}" msg)))
+  (match (parse "[1, 2,")
+    (Ok [_] (println "parsed?"))
+    (Err [msg] (println "error: {}" msg)))
+  0)

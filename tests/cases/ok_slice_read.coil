@@ -1,0 +1,12 @@
+;;; A string literal is read through size, nth and for, which check every index.
+(module ok_slice_read)
+(import "safe.core" :use [size nth])
+(import "safe.loop" :use [for])
+(defn vowels [(text (slice u8))] (-> i64)
+  (let [(mut n) 0]
+    (for (ref c) text
+      (when (or (= c #\a) (= c #\e) (= c #\i) (= c #\o) (= c #\u)) (set! n (+ n 1))))
+    n))
+(defn main [] (-> i64)
+  (println "{} {} {}" (size "hello") (nth "hello" 1) (vowels "a quiet afternoon"))
+  0)

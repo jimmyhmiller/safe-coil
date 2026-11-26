@@ -1,0 +1,11 @@
+;;; An argument lent exclusively is only reserved while the later arguments are
+;;; evaluated: they may read it.
+(module ok_two_phase)
+(import "safe.vec" :use [Vec])
+(defn main [] (-> i64)
+  (let [(mut v) (Vec::new [i64])]
+    (Vec::push! (mut v) (len v))
+    (Vec::push! (mut v) (len v))
+    (set! (mut v) 1 (+ (get v 1) (get v 0) 10))
+    (println "{} {}" (get v 0) (get v 1)))
+  0)

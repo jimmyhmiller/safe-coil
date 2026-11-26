@@ -1,0 +1,61 @@
+;;; An owned trait object: a value of any type that implements a trait, kept on
+;;; the heap and used through the trait.
+;;;
+;;;   (let [(mut shapes) (Vec::new [(Own (dyn Shape))])]
+;;;     (Vec::push! (mut shapes) (own Shape (Square :side 3)))
+;;;     (Vec::push! (mut shapes) (own Shape (Circle :r 2)))
+;;;     (for (mut s) shapes (grow (Own::get-mut (mut s)) 1)))
+;;;
+;;; A `(dyn T)` is an exclusive reference: it lends, it does not own. An `Own`
+;;; owns the value and drops it, as the value's own type drops it. It keeps no
+;;; `(dyn T)` in it: `Own::get-mut` makes one each time, lent exclusively from the
+;;; `Own`, so the `Own` cannot be moved, dropped or used again while it is in use.
+(module safe.own)
+(export Own own box-raw free-as)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.cc" :as cc)
+(import "safe.core" :use [unsafe])
+
+;;; A value whose type implements the trait D is the object of, on the heap.
+(defstruct Own [D] [(at (ptr u8))
+                    (view (fnptr (cc/C) [(ptr u8)] D))
+                    (free (fnptr (cc/C) [(ptr u8)] void))])
+
+(impl [D] Drop (Own D)
+  (drop [(self (mut (Own D)))] (-> void)
+    (unsafe (let [free (.free self)] (free (.at self))))
+    0))
+
+(impl [D] (Own D)
+  ;;; The object, lent exclusively for as long as what this returns is used.
+  (get-mut [(o (mut (Own D)))] (-> D)
+    (unsafe (let [view (.view o)] (view (.at o))))))
+
+;;; VALUE on the heap. Only `own` calls it, inside `unsafe`.
+(defn box-raw [T] [(value T)] (-> (ptr T))
+  (unsafe (alloc/box! (alloc/malloc-allocator) T value)))
+
+;;; Drop the T at P and give back its memory.
+(defn free-as [T] [(p (ptr u8))] (-> void)
+  (unsafe
+    (let [at (primitive/cast (ptr T) p)
+          value (take! [T] at)]
+      (alloc/destroy (alloc/malloc-allocator) at)))
+  0)
+
+;;; `(own TRAIT VALUE)`: VALUE, of a type that implements TRAIT, made an
+;;; `(Own (dyn TRAIT))`. VALUE is moved in.
+(defn own [(trait Code) (value Code)] (-> Code)
+  (let [view (primitive/code-hoist `(own-view ~trait)
+                                   `(defn _ [(T ~trait)] [(p (ptr u8))] (-> (dyn ~trait))
+                                      (unsafe (primitive/make-dyn ~trait (primitive/cast (ptr T) p)))))
+        adopt (primitive/code-hoist `(own-adopt ~trait)
+                                    `(defn _ [(T ~trait)] [(p (ptr T))] (-> (Own (dyn ~trait)))
+                                       (unsafe
+                                         (Own :at (primitive/cast (ptr u8) p)
+                                              :view (primitive/fnptr-of ~view [T])
+                                              :free (primitive/fnptr-of free-as [T])))))
+        v (primitive/fresh-identifier "value")]
+    `(let [~v ~value]
+       (unsafe (~adopt (box-raw ~v))))))

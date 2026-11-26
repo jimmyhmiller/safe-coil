@@ -1,0 +1,6 @@
+;;; Coil's own get does not check the index unless asked to: safe code reads a
+;;; slice with nth.
+(module bad_slice_get)
+(import "coil.primitive" :as primitive)
+(defn main [] (-> i64)
+  (let [s "hello"] (primitive/cast i64 (get s 9))))

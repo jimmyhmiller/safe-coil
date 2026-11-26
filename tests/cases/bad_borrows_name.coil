@@ -1,0 +1,5 @@
+;;; A :safe/borrows names only parameters that take a reference.
+(module bad_borrows_name)
+(import "safe.core" :use [unsafe])
+(defn pick :safe/borrows "n" [(a (ref i64)) (n i64)] (-> (ref i64)) a)
+(defn main [] (-> i64) 0)

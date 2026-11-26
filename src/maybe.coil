@@ -1,0 +1,91 @@
+;;; A reference that may be missing: what a lookup finds, or nothing.
+;;;
+;;; Coil keeps references out of struct and sum fields, so `(Option (ref T))`
+;;; cannot be written. A `Maybe` is a view instead: made from a reference, it
+;;; keeps that reference's loan, so what it refers to stays lent for as long as
+;;; it lives, exactly as the reference would have kept it.
+;;;
+;;;   (defn find [(xs (ref (Vec Item))) (id i64)] (-> (Maybe Item)) …)
+;;;   (if-found [item (find items 3)] (use item) (println "none"))
+(module safe.maybe)
+(export Maybe MaybeMut if-found when-found if-found-mut)
+(import "coil.primitive" :as primitive)
+(import "safe.core" :use [unsafe lend lend-mut View])
+
+;;; A shared reference to a T, or nothing.
+(defstruct Maybe [T] [(at (ptr T))])
+
+(impl [T] View (Maybe T))
+
+;;; An exclusive reference to a T, or nothing. It is moved, never copied: two of
+;;; them would be two ways to change the same T.
+(defstruct MaybeMut [T] [(at (ptr T))])
+
+(impl [T] View (MaybeMut T))
+
+(impl [T] Drop (MaybeMut T)
+  (drop [(self (mut (MaybeMut T)))] (-> void) 0))
+
+(impl [T] (Maybe T)
+  ;;; R, found.
+  (found [(r (ref T))] (-> (Maybe T))
+    (unsafe (Maybe :at (primitive/cast (ptr T) r))))
+
+  ;;; Nothing found.
+  (nothing [] (-> (Maybe T))
+    (unsafe (Maybe :at (primitive/cast (ptr T) 0))))
+
+  (found? [(m (ref (Maybe T)))] (-> bool)
+    (unsafe (!= (primitive/cast i64 (.at m)) 0)))
+
+  ;;; What was found. Asking a Maybe that found nothing stops the program.
+  (get [(m (ref (Maybe T)))] (-> (ref T))
+    (unsafe
+      (when (= (primitive/cast i64 (.at m)) 0)
+        (panic "safe: a Maybe that found nothing was asked what it found"))
+      (lend (primitive/cast (ptr T) (.at m))))))
+
+(impl [T] (MaybeMut T)
+  (found [(r (mut T))] (-> (MaybeMut T))
+    (unsafe (MaybeMut :at (primitive/cast (ptr T) (mut r)))))
+
+  (nothing [] (-> (MaybeMut T))
+    (unsafe (MaybeMut :at (primitive/cast (ptr T) 0))))
+
+  (found? [(m (ref (MaybeMut T)))] (-> bool)
+    (unsafe (!= (primitive/cast i64 (.at m)) 0)))
+
+  (get-mut [(m (mut (MaybeMut T)))] (-> (mut T))
+    (unsafe
+      (when (= (primitive/cast i64 (.at m)) 0)
+        (panic "safe: a MaybeMut that found nothing was asked what it found"))
+      (lend-mut (primitive/cast (ptr T) (.at m))))))
+
+;;; `(if-found [x M] THEN ELSE)`: THEN with X the reference M found, or ELSE.
+(defn if-found [(binding Code) (then Code) (else Code)] (-> Code)
+  (unless (and (primitive/code-vector? binding) (= (len binding) 2))
+    (panic "if-found: write (if-found [name maybe] then else)"))
+  (let [m (primitive/fresh-identifier "maybe")]
+    `(let [~m ~(get binding 1)]
+       (if (Maybe::found? ~m)
+           (let [~(get binding 0) (Maybe::get ~m)] ~then)
+           ~else))))
+
+;;; `(when-found [x M] BODY…)`: BODY with X the reference M found, if it found one.
+(defn when-found [(binding Code) & (body Code)] (-> Code)
+  (unless (and (primitive/code-vector? binding) (= (len binding) 2))
+    (panic "when-found: write (when-found [name maybe] body…)"))
+  (let [m (primitive/fresh-identifier "maybe")]
+    `(let [~m ~(get binding 1)]
+       (when (Maybe::found? ~m)
+         (let [~(get binding 0) (Maybe::get ~m)] ~@body)))))
+
+;;; `(if-found-mut [x M] THEN ELSE)`: THEN with X the exclusive reference M found.
+(defn if-found-mut [(binding Code) (then Code) (else Code)] (-> Code)
+  (unless (and (primitive/code-vector? binding) (= (len binding) 2))
+    (panic "if-found-mut: write (if-found-mut [name maybe] then else)"))
+  (let [m (primitive/fresh-identifier "maybe")]
+    `(let [(mut ~m) ~(get binding 1)]
+       (if (MaybeMut::found? ~m)
+           (let [~(get binding 0) (MaybeMut::get-mut (mut ~m))] ~then)
+           ~else))))

@@ -1,0 +1,242 @@
+;;; A small Lisp: numbers, symbols, lists, define, lambda (closures), if, let,
+;;; quote, and a few builtins. Written as a first try at a nontrivial program in
+;;; safe Coil; nothing here is `unsafe`.
+(module example.lisp)
+(import "coil.primitive" :as primitive)
+(import "safe.box" :use [Box])
+(import "safe.vec" :use [Vec])
+(import "safe.str" :use [Str])
+(import "safe.map" :use [Map])
+(import "safe.sync" :use [Arc Mutex with-lock])
+
+;; ---- values -----------------------------------------------------------------
+
+(defsum Value
+  (Nil)
+  (Num [(n i64)])
+  (Sym [(name Str)])
+  (List [(items (Vec Value))])
+  (Fn [(f (Arc Lambda))])
+  (Builtin [(op i64)]))
+
+(defstruct Lambda [(params (Vec Str)) (body (Arc Value)) (env (Arc Env))])
+
+(defstruct Env [(vars (Mutex (Map Str Value))) (parent (Option (Arc Env)))])
+
+(defn copy-value [(v (ref Value))] (-> Value)
+  (match v
+    (Nil [] (Nil))
+    (Num [n] (Num n))
+    (Sym [name] (Sym (Str::copy name)))
+    (List [items]
+          (let [(mut out) (Vec::new [Value])]
+            (for (ref x) items (Vec::push! (mut out) (copy-value x)))
+            (List out)))
+    (Fn [f] (Fn (Arc::clone f)))
+    (Builtin [op] (Builtin op))))
+
+(defn show [(v (ref Value)) (out (mut Str))] (-> void)
+  (match v
+    (Nil [] (Str::push-text! (mut out) "nil"))
+    (Num [n] (Str::push-int! (mut out) n))
+    (Sym [name] (Str::append! (mut out) name))
+    (List [items]
+          (Str::push-text! (mut out) "(")
+          (let [(mut first) true]
+            (for (ref x) items
+              (unless first (Str::push-text! (mut out) " "))
+              (set! first false)
+              (show x (mut out))))
+          (Str::push-text! (mut out) ")"))
+    (Fn [_] (Str::push-text! (mut out) "<fn>"))
+    (Builtin [_] (Str::push-text! (mut out) "<builtin>"))))
+
+;; ---- reading ----------------------------------------------------------------
+
+(defstruct Reader [(src Str) (pos i64)])
+
+(defn peek-byte [(r (ref Reader))] (-> i64)
+  (if (< (.pos r) (Str::len (field r src)))
+      (primitive/cast i64 (Str::byte (field r src) (.pos r)))
+      -1))
+
+(defn skip-space! [(r (mut Reader))] (-> void)
+  (while (or (= (peek-byte r) 32) (= (peek-byte r) 10))
+    (set! (.pos r) (+ (.pos r) 1))))
+
+(defn delimiter? [(c i64)] (-> bool)
+  (or (= c -1) (= c 32) (= c 10) (= c 40) (= c 41)))
+
+(defn read-form [(r (mut Reader))] (-> (Result Value Str))
+  (try
+  (skip-space! (mut r))
+  (let [c (peek-byte r)]
+    (cond (= c -1) (Err (Str::from "unexpected end of input"))
+          (= c 40)
+            (do (set! (.pos r) (+ (.pos r) 1))
+                (let [(mut items) (Vec::new [Value])]
+                  (skip-space! (mut r))
+                  (while (and (!= (peek-byte r) 41) (!= (peek-byte r) -1))
+                    (Vec::push! (mut items) (try! (read-form (mut r))))
+                    (skip-space! (mut r)))
+                  (if (= (peek-byte r) -1)
+                      (Err (Str::from "missing )"))
+                      (do (set! (.pos r) (+ (.pos r) 1))
+                          (Ok (List items))))))
+          (= c 41) (Err (Str::from "unexpected )"))
+          :else
+            (let [start (.pos r)]
+              (while (not (delimiter? (peek-byte r)))
+                (set! (.pos r) (+ (.pos r) 1)))
+              (let [text (Str::from-slice (Str::slice (field r src) start (.pos r)))]
+                (match (parse-int text)
+                  (Some [n] (Ok (Num n)))
+                  (None [] (Ok (Sym text))))))))))
+
+(defn parse-int [(s (ref Str))] (-> (Option i64))
+  (let [(mut n) 0
+        (mut i) 0
+        neg (and (> (Str::len s) 1) (= (Str::byte s 0) #\-))]
+    (when neg (set! i 1))
+    (if (= i (Str::len s))
+        (None)
+        (block :out
+          (while (< i (Str::len s))
+            (let [d (primitive/cast i64 (Str::byte s i))]
+              (unless (and (>= d 48) (<= d 57)) (return-from :out (None)))
+              (set! n (+ (* n 10) (- d 48)))
+              (set! i (+ i 1))))
+          (Some (if neg (- 0 n) n))))))
+
+;; ---- environments -----------------------------------------------------------
+
+(defn env-new [(parent (Option (Arc Env)))] (-> (Arc Env))
+  (Arc::new (Env :vars (Mutex::new (Map::new [Str Value])) :parent parent)))
+
+(defn env-define! [(env (ref Env)) (name Str) (v Value)] (-> void)
+  (with-lock (field env vars) vars
+    (Map::insert! (mut vars) name v)))
+
+(defn env-lookup [(env (ref Env)) (name (ref Str))] (-> (Option Value))
+  (let [found (with-lock (field env vars) vars
+                (if (Map::has? vars name)
+                    (Some (copy-value (Map::at vars name)))
+                    (None)))]
+    (match found
+      (Some [_] found)
+      (None []
+            (match (field env parent)
+              (Some [p] (env-lookup (Arc::get p) name))
+              (None [] (None)))))))
+
+;; ---- evaluation -------------------------------------------------------------
+
+(defn sym? [(v (ref Value)) (text (slice u8))] (-> bool)
+  (match v
+    (Sym [name] (Str::eq? name (Str::from text)))
+    (_ false)))
+
+(defn eval [(v (ref Value)) (env (ref (Arc Env)))] (-> (Result Value Str))
+  (try
+  (match v
+    (Sym [name]
+         (match (env-lookup (Arc::get env) name)
+           (Some [x] (Ok x))
+           (None [] (let [(mut msg) (Str::from "unbound: ")]
+                      (Str::append! (mut msg) name)
+                      (Err msg)))))
+    (List [items]
+          (if (= (Vec::len items) 0)
+              (Ok (Nil))
+              (let [head (Vec::at items 0)]
+                (cond (sym? head "quote") (Ok (copy-value (Vec::at items 1)))
+                      (sym? head "if")
+                        (match (try! (eval (Vec::at items 1) env))
+                          (Nil [] (eval (Vec::at items 3) env))
+                          (_ (eval (Vec::at items 2) env)))
+                      (sym? head "define")
+                        (match (Vec::at items 1)
+                          (Sym [name]
+                               (let [value (try! (eval (Vec::at items 2) env))]
+                                 (env-define! (Arc::get env) (Str::copy name) value)
+                                 (Ok (Nil))))
+                          (_ (Err (Str::from "define needs a name"))))
+                      (sym? head "lambda")
+                        (let [(mut params) (Vec::new [Str])]
+                          (match (Vec::at items 1)
+                            (List [ps]
+                                  (for (ref p) ps
+                                    (match p
+                                      (Sym [name] (Vec::push! (mut params) (Str::copy name)))
+                                      (_ 0))))
+                            (_ 0))
+                          (Ok (Fn (Arc::new (Lambda :params params
+                                                    :body (Arc::new (copy-value (Vec::at items 2)))
+                                                    :env (Arc::clone env))))))
+                      :else
+                        (let [f (try! (eval head env))
+                              (mut args) (Vec::new [Value])]
+                          (for i (range 1 (Vec::len items))
+                            (Vec::push! (mut args) (try! (eval (Vec::at items i) env))))
+                          (apply f args))))))
+    (_ (Ok (copy-value v))))))
+
+(defn num-of [(v (ref Value))] (-> (Result i64 Str))
+  (match v
+    (Num [n] (Ok n))
+    (_ (Err (Str::from "not a number")))))
+
+(defn apply [(f (ref Value)) (args (ref (Vec Value)))] (-> (Result Value Str))
+  (try
+  (match f
+    (Builtin [op]
+             (cond (= op 0) (Ok (Num (+ (try! (num-of (Vec::at args 0))) (try! (num-of (Vec::at args 1))))))
+                   (= op 1) (Ok (Num (- (try! (num-of (Vec::at args 0))) (try! (num-of (Vec::at args 1))))))
+                   (= op 2) (Ok (Num (* (try! (num-of (Vec::at args 0))) (try! (num-of (Vec::at args 1))))))
+                   (= op 3) (Ok (if (< (try! (num-of (Vec::at args 0))) (try! (num-of (Vec::at args 1))))
+                                    (Num 1) (Nil)))
+                   (= op 4) (let [(mut out) (Vec::new [Value])]
+                              (for (ref a) args (Vec::push! (mut out) (copy-value a)))
+                              (Ok (List out)))
+                   :else (Err (Str::from "unknown builtin"))))
+    (Fn [lam]
+        (let [l (Arc::get lam)
+              env (env-new (Some (Arc::clone (field l env))))]
+          (for i (range 0 (Vec::len (field l params)))
+            (env-define! (Arc::get env)
+                         (Str::copy (Vec::at (field l params) i))
+                         (copy-value (Vec::at args i))))
+          (eval (Arc::get (field l body)) env)))
+    (_ (Err (Str::from "not a function"))))))
+
+;; ---- driver -----------------------------------------------------------------
+
+(defn run [(src (slice u8))] (-> void)
+  (let [global (env-new (None))
+        (mut r) (Reader :src (Str::from src) :pos 0)]
+    (env-define! (Arc::get global) (Str::from "+") (Builtin 0))
+    (env-define! (Arc::get global) (Str::from "-") (Builtin 1))
+    (env-define! (Arc::get global) (Str::from "*") (Builtin 2))
+    (env-define! (Arc::get global) (Str::from "<") (Builtin 3))
+    (env-define! (Arc::get global) (Str::from "list") (Builtin 4))
+    (skip-space! (mut r))
+    (while (!= (peek-byte r) -1)
+      (let [(mut out) (Str::new)]
+        (match (read-form (mut r))
+          (Ok [form]
+              (match (eval form global)
+                (Ok [v] (show v (mut out)))
+                (Err [msg] (Str::push-text! (mut out) "error: ") (Str::append! (mut out) msg))))
+          (Err [msg] (Str::push-text! (mut out) "read error: ") (Str::append! (mut out) msg)))
+        (println "{}" out))
+      (skip-space! (mut r)))))
+
+(defn main [] (-> i64)
+  (run "(define fib (lambda (n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2))))))
+(fib 20)
+(define make-adder (lambda (k) (lambda (x) (+ x k))))
+(define add5 (make-adder 5))
+(add5 10)
+(list 1 (add5 1) (quote (a b c)))
+(undefined-thing)")
+  0)

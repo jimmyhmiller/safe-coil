@@ -1,0 +1,12 @@
+;;; What a Maybe was found in stays lent while the Maybe lives.
+(module bad_maybe_kept)
+(import "safe.vec" :use [Vec])
+(import "safe.maybe" :use [Maybe if-found])
+(defn first :safe/borrows "xs" [(xs (ref (Vec i64)))] (-> (Maybe i64))
+  (if (> (len xs) 0) (Maybe::found (Vec::at xs 0)) (Maybe::nothing)))
+(defn main [] (-> i64)
+  (let [(mut v) (Vec::new [i64])]
+    (Vec::push! (mut v) 5)
+    (let [m (first v)]
+      (Vec::clear! (mut v))
+      (if-found [x m] 1 0))))

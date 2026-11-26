@@ -1,0 +1,20 @@
+;;; An owner moved on one way and not another is dropped on the other at its
+;;; scope's end; a match arm can move what it matched.
+(module ok_moved_on_one_way)
+(import "safe.box" :use [Box])
+(defn eat [(b (Box i64))] (-> i64) (Box::into b))
+(defn keep-or-eat [(c bool)] (-> i64)
+  (let [b (Box::new 4)]
+    (when c (eat b))
+    0))
+(defn pass-on [(o (Option (Box i64)))] (-> (Option (Box i64)))
+  (match o
+    (Some [_] o)
+    (None [] (None))))
+(defn main [] (-> i64)
+  (keep-or-eat true)
+  (keep-or-eat false)
+  (match (pass-on (Some (Box::new 3)))
+    (Some [b] (println "{}" (eat b)))
+    (None [] 0))
+  0)

@@ -1,0 +1,11 @@
+;;; When the call begins, no other argument may hold what one lends exclusively.
+(module bad_two_phase_alias)
+(import "safe.vec" :use [Vec])
+(import "safe.box" :use [Box])
+(defn clear-then-read [(v (mut (Vec (Box i64)))) (b (ref (Box i64)))] (-> i64)
+  (Vec::clear! (mut v))
+  (Box::into (Box::new 0)))
+(defn main [] (-> i64)
+  (let [(mut v) (Vec::new [(Box i64)])]
+    (Vec::push! (mut v) (Box::new 1))
+    (clear-then-read (mut v) (Vec::at v 0))))

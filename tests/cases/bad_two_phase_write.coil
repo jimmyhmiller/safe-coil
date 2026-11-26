@@ -1,0 +1,8 @@
+;;; A later argument may not change what an earlier one lends exclusively.
+(module bad_two_phase_write)
+(import "safe.vec" :use [Vec])
+(defn main [] (-> i64)
+  (let [(mut v) (Vec::new [i64])]
+    (Vec::push! (mut v) 1)
+    (set! (mut v) 0 (do (Vec::push! (mut v) 2) 3))
+    0))

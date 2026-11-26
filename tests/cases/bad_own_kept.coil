@@ -1,0 +1,12 @@
+;;; The trait object Own::get-mut makes keeps the Own lent exclusively.
+(module bad_own_kept)
+(import "safe.own" :use [Own own])
+(deftrait Counter [Self] (bump [(self (ptr Self))] (-> i64)))
+(defstruct Clicks [(n i64)])
+(impl Counter Clicks (bump [(self (ptr Clicks))] (-> i64) (set! (.n self) (+ (.n self) 1)) (.n self)))
+(defn eat [(o (Own (dyn Counter)))] (-> i64) 0)
+(defn main [] (-> i64)
+  (let [(mut o) (own Counter (Clicks :n 0))
+        d (Own::get-mut (mut o))]
+    (eat o)
+    (bump d)))

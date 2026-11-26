@@ -1,0 +1,18 @@
+;;; A Maybe is a reference that may be missing; it keeps what it was found in lent.
+(module ok_maybe)
+(import "coil.primitive" :as primitive)
+(import "safe.vec" :use [Vec])
+(import "safe.maybe" :use [Maybe if-found when-found])
+(defn find :safe/borrows "xs" [(xs (ref (Vec i64))) (want i64)] (-> (Maybe i64))
+  (block :out
+    (for i (range 0 (len xs))
+      (when (= (get xs i) want) (return-from :out (Maybe::found (Vec::at xs i)))))
+    (Maybe::nothing)))
+(defn main [] (-> i64)
+  (let [(mut v) (Vec::new [i64])]
+    (Vec::push! (mut v) 5)
+    (Vec::push! (mut v) 7)
+    (if-found [x (find v 7)] (println "found {}" (primitive/load x)) (println "none"))
+    (when-found [x (find v 9)] (println "found {}" (primitive/load x)))
+    (Vec::push! (mut v) 9))
+  0)
