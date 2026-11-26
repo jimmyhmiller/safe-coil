@@ -80,7 +80,13 @@
    (path (ArrayList Code))
    ;;; the locals that hold their loans until their scope ends: views that are
    ;;; dropped, whose drop may use what they borrowed
-   (pinned (ArrayList i64))])
+   (pinned (ArrayList i64))
+   ;;; the `(ptr Self)` parameter of a trait's method, which is an exclusive
+   ;;; reference: every call gives it one (see `check-function!`)
+   (trusted (ArrayList i64))
+   ;;; the locals that hold a trait object: a parameter declared `(dyn T)`, or a
+   ;;; `let` bound to one or to a call declared to return one
+   (dyns (ArrayList i64))])
 
 ;;; ---- small things ------------------------------------------------------------
 
@@ -179,6 +185,13 @@
 (defn ref-type? [(t Code)] (-> bool)
   (or (head-is? t `ref) (head-is? t `mut)))
 
+;;; A trait object: a pointer and its methods. Made from `(mut place)` (or, in
+;;; `unsafe`, a raw pointer), it is an exclusive reference to what it points at.
+;;; Written `(dyn Trait)`; the compiler types one as a reference to a struct it
+;;; makes for it, which `code-dyn-trait` recognizes.
+(defn dyn-type? [(t Code)] (-> bool)
+  (or (head-is? t `dyn) (primitive/code-sym? (primitive/code-dyn-trait t))))
+
 (defn raw-type? [(t Code)] (-> bool)
   (or (head-is? t `ptr) (head-is? t `slice) (head-is? t `fnptr) (head-is? t `dyn)))
 
@@ -215,6 +228,14 @@
        (not (primitive/code-eq t `unknown-type))
        (match (primitive/code-type-traits t)
          (primitive/TraitsAre [names] (name-in? `safe.core.View names))
+         (primitive/TraitsUnknown [] false))))
+
+;;; Is T a view whose drop uses nothing it borrowed, marked `safe.core.QuietDrop`
+;;; by the module that defines it (see `check-quiet-drop!`)?
+(defn quiet-drop? [(t Code)] (-> bool)
+  (and (view-type? t)
+       (match (primitive/code-type-traits t)
+         (primitive/TraitsAre [names] (name-in? `safe.core.QuietDrop names))
          (primitive/TraitsUnknown [] false))))
 
 ;;; Does every part of T satisfy PART? T is a struct or a sum; anything else is
@@ -525,6 +546,31 @@
               :else 0)))
     found))
 
+;;; Does the symbol E name a local holding a trait object?
+(defn dyn-local? [(cx (mut Cx)) (e Code)] (-> bool)
+  (and (primitive/code-sym? e) (> (primitive/binding-of e) 0) (dyn-type? (type-of e))))
+
+;;; Is E a trait object that exists already: a local holding one, or a call
+;;; declared to return one? (Anything else typed as one is being made into one,
+;;; as an argument is for a `(dyn T)` parameter.)
+(defn dyn-value? [(cx (mut Cx)) (e Code)] (-> bool)
+  (or (dyn-local? (mut cx) e)
+      (and (primitive/code-list? e)
+           (match (primitive/code-decl e)
+             (primitive/Declared [_ kind name signature] (dyn-type? (callee-result kind name signature)))
+             (_ false)))))
+
+;;; Does the symbol E name a trait method's `(ptr Self)` parameter?
+(defn trusted-base? [(cx (mut Cx)) (e Code)] (-> bool)
+  (and (primitive/code-sym? e)
+       (> (primitive/binding-of e) 0)
+       (let [i (find-local (mut cx) e)]
+         (and (>= i 0)
+              (block :found
+                (for [k 0 (len (.trusted cx))]
+                  (when (= (get (.trusted cx) k) (.serial (get (.locals cx) i))) (return-from :found true)))
+                false)))))
+
 (defn local-place [(l Local)] (-> Code)
   (if (.reference l) `(deref (loc ~(.serial l))) `(loc ~(.serial l))))
 
@@ -602,7 +648,8 @@
               `())
         (field-form? e)
           (let [base (place-of (mut cx) (field-base e))]
-            (if (and (= (len base) 1) (not (raw-held? (type-of (field-base e)))))
+            (if (and (= (len base) 1)
+                     (or (not (raw-held? (type-of (field-base e)))) (trusted-base? (mut cx) (field-base e))))
                 `((fld ~(get base 0) ~(field-name e)))
                 `()))
         :else `()))
@@ -630,6 +677,9 @@
 (defn use-place [(cx (mut Cx)) (node Code) (q Code) (want Want)] (-> Res)
   (let [t (type-of node)
         content (pointee t)]
+    (if (and (dyn-local? (mut cx) node) (match want (WDiscard [] false) (WExcl [] false) (_ true)))
+        ; a trait object is an exclusive reference: naming one lends it again
+        (use-place (mut cx) node q (WExcl))
     (match want
       (WDiscard [] (fresh))
       (WValue []
@@ -653,7 +703,7 @@
               (owner-type? cx content) (use-place (mut cx) node q (WValue))
               mutable (use-place (mut cx) node q (WValue))
               (word-type? content) (use-place (mut cx) node q (WValue))
-              :else (use-place (mut cx) node q (WShared)))))))
+              :else (use-place (mut cx) node q (WShared))))))))
 
 ;;; A value that is no place is used by a consumer that wants WANT: a fresh
 ;;; aggregate taken by reference is a temporary of this frame.
@@ -695,14 +745,17 @@
             name (if mutable (get binder 1) binder)]
         (if (primitive/code-sym? name)
             (do (guard-raw-flow! cx e init)
-                (let [r (eval (mut cx) init (WBind mutable))
-                      serial (push-local! (mut cx) name (not (.fresh r)))]
-                  ; a value of its own that is dropped: a view, when it holds loans
-                  (when (and (.fresh r)
-                             (owner-type? cx (pointee (if (primitive/code-eq (type-of init) `unknown-type)
-                                                          (type-of name)
-                                                          (type-of init)))))
-                    (push! (mut (.pinned cx)) serial))
+                (let [holds-dyn (dyn-value? (mut cx) init)
+                      r (eval (mut cx) init (if holds-dyn (WExcl) (WBind mutable)))
+                      serial (push-local! (mut cx) name (or holds-dyn (not (.fresh r))))]
+                  (when holds-dyn (push! (mut (.dyns cx)) serial))
+                  ; a value of its own that is dropped: a view, when it holds loans,
+                  ; unless its drop uses nothing it borrowed
+                  (let [t (pointee (if (primitive/code-eq (type-of init) `unknown-type)
+                                       (type-of name)
+                                       (type-of init)))]
+                    (when (and (.fresh r) (owner-type? cx t) (not (quiet-drop? t)))
+                      (push! (mut (.pinned cx)) serial)))
                   ; a `let` bound to a reference keeps the temporaries of its
                   ; initializer; one bound to a view does not
                   (unless (ref-type? (type-of init))
@@ -849,7 +902,7 @@
 
 (defn eval-field [(cx (mut Cx)) (e Code) (want Want)] (-> Res)
   (let [base (field-base e)]
-    (if (raw-held? (type-of base))
+    (if (and (raw-held? (type-of base)) (not (trusted-base? (mut cx) base)))
         (do (need-unsafe! cx e "a field behind a raw pointer")
             (eval (mut cx) base (WValue))
             (fresh))
@@ -884,18 +937,25 @@
           (raw-type? (pointee t)) (not (primitive/code-eq (pointee value) (pointee t)))
           :else false)))
 
+;;; Is E a field (of a field…) of a trait method's `self`: a place, not raw memory?
+(defn trusted-field? [(cx (mut Cx)) (e Code)] (-> bool)
+  (and (field-form? e)
+       (or (trusted-base? (mut cx) (field-base e)) (trusted-field? (mut cx) (field-base e)))))
+
 ;;; `(set! PLACE VALUE)` and `(store! PLACE VALUE)`: the value is computed first.
 (defn eval-store [(cx (mut Cx)) (e Code)] (-> Res)
   (let [target (get e 1)]
     (guard-raw-flow! cx e (get e 2))
     (refuse-stored-view! (get e 2))
+    (refuse-stored-dyn! (mut cx) (get e 2))
     (eval (mut cx) (get e 2) (WValue))
-    (if (through-raw? target (type-of (get e 2)))
+    (if (and (through-raw? target (type-of (get e 2))) (not (trusted-field? (mut cx) target)))
         (do (need-unsafe! cx e "a store through a raw pointer")
             (eval (mut cx) target (WValue))
             0)
         (let [q (place-of (mut cx) target)]
-          (when (and (field-form? target) (raw-field? (pointee (type-of target))))
+          (when (and (field-form? target) (raw-field? (pointee (type-of target)))
+                     (not (trusted-field? (mut cx) target)))
             (need-unsafe! cx e "a store to a field that is raw memory"))
           (if (= (len q) 1)
               (check-write! cx e (get q 0) "written")
@@ -904,14 +964,19 @@
 
 (defn eval-load [(cx (mut Cx)) (e Code) (want Want)] (-> Res)
   (let [source (get e 1)]
-    (if (through-raw? source (type-of e))
+    (if (and (through-raw? source (type-of e)) (not (trusted-field? (mut cx) source)))
         (do (need-unsafe! cx e "a load through a raw pointer")
             (eval (mut cx) source (WValue))
             (fresh))
-        (let [q (place-of (mut cx) source)]
-          (if (= (len q) 1)
-              (use-place (mut cx) e (get q 0) (WValue))
-              (do (eval (mut cx) source (WShared)) (fresh)))))))
+        (do
+          ; a load copies what it reads, which for an owner is a second owner of
+          ; the same thing: the compiler does not see it as a move
+          (when (and (owner-type? cx (pointee (type-of e))) (not (raw-ok? cx e)))
+            (fail! e "safe: this load copies an owner, which then has two owners; name a variable to move it, or take it out of a place with replace!"))
+          (let [q (place-of (mut cx) source)]
+            (if (= (len q) 1)
+                (use-place (mut cx) e (get q 0) (WValue))
+                (do (eval (mut cx) source (WShared)) (fresh))))))))
 
 (defn eval-cast [(cx (mut Cx)) (e Code)] (-> Res)
   (when (ref-type? (type-of e))
@@ -1021,6 +1086,16 @@
         content (pointee t)
         q (place-of (mut cx) arg)]
     (cond (head-is? arg `mut) (eval (mut cx) arg (WExcl))
+          ; a trait object, or a trait method's `self`, is lent exclusively again
+          ; a trait method's `self` is lent exclusively again, and so is a trait
+          ; object (`use-place` makes any use of one exclusive)
+          (trusted-base? (mut cx) arg) (eval (mut cx) arg (WExcl))
+          (dyn-value? (mut cx) arg) (eval (mut cx) arg (WShared))
+          ; a trait object is made from `(mut place)`; from anything else (a raw
+          ; pointer, which may point anywhere) only inside `unsafe`
+          (dyn-type? param)
+            (do (need-unsafe! cx arg "a trait object made from anything but (mut PLACE) or another trait object")
+                (eval (mut cx) arg (WValue)))
           ; a raw pointer passed for a reference parameter becomes a reference
           (raw-type? content)
             (cond (not (ref-type? param)) (eval (mut cx) arg (WValue))
@@ -1089,6 +1164,7 @@
                   r (eval-arg (mut cx) arg param (callee-result kind name signature) e)
                   carried (.loans (use-value cx arg r (WShared)))]
               (check-view-argument! arg param)
+              (check-dyn-argument! (mut cx) arg param)
               (when (view-type? (pointee (type-of arg)))
                 (set! all (union all (view-argument-loans (mut cx) arg param r))))
               (hold! (mut cx) -1 carried)
@@ -1104,7 +1180,8 @@
         (when (loan-excl? l)
           (fail! e "safe: a view that can be copied is made from an exclusive reference; a view over one is moved, so its type needs a Drop"))))
     ; a reference that is thrown away still may not outlive what it refers to
-    (cond (ref-type? (type-of e))
+    (cond (dyn-type? (callee-result kind name signature)) (carrying all)
+          (ref-type? (type-of e))
             (match want
               (WValue [] (fresh))
               (_ (carrying all)))
@@ -1128,6 +1205,47 @@
 
 ;;; Is an argument of the call E a trait object? A method called on one is
 ;;; reached through the raw pointers it holds.
+;;; A trait's method whose first parameter is `(ptr Self)` is checked as though
+;;; that were an exclusive reference (see `check-function!`). So it is given one:
+;;; `(mut place)`, a trait object, or the `self` of another such method. A raw
+;;; pointer, which may point anywhere, is given only inside `unsafe`.
+(defn check-trait-self! [(cx (mut Cx)) (e Code) (signature Code)] (-> i64)
+  (if (and (primitive/code-list? signature) (> (len signature) 3)
+           (primitive/code-list? (get signature 0)) (> (len (get signature 0)) 0)
+           (head-is? (get (get signature 0) 0) `ptr)
+           (> (len e) 1))
+      (let [(mut at) 1]
+        (while (and (< at (len e)) (type-arguments? (get e at))) (set! at (+ at 1)))
+        (if (< at (len e))
+            (let [arg (get e at)]
+              (if (or (head-is? arg `mut) (dyn-value? (mut cx) arg) (trusted-base? (mut cx) arg))
+                  0
+                  (need-unsafe! cx arg "a raw pointer given to a trait's method as what it works on")))
+            0))
+      0))
+
+;;; A call of a trait's method through a trait object. The trait object is lent
+;;; exclusively, as any is; the other arguments as to a function whose
+;;; declaration is not known. What it returns may borrow from any of them.
+(defn eval-dyn-call [(cx (mut Cx)) (e Code) (want Want)] (-> Res)
+  (let [loans (len (.loans cx))
+        (mut borrowed) (no-loans)]
+    (for [i 1 (len e)]
+      (let [arg (get e i)]
+        (unless (or (primitive/code-keyword? arg) (type-arguments? arg))
+          (guard-raw-flow! cx e arg)
+          (let [r (eval-arg (mut cx) arg `unknown `unknown e)
+                lent-now (.loans (use-value cx arg r (WShared)))]
+            (check-view-argument! arg `unknown)
+            (hold! (mut cx) -1 lent-now)
+            (set! borrowed (union borrowed lent-now))))))
+    (drop-loans-to! (mut cx) loans)
+    (if (or (ref-type? (type-of e)) (view-type? (type-of e)))
+        (match want
+          (WValue [] (if (view-type? (type-of e)) (Res :loans borrowed :fresh true) (fresh)))
+          (_ (carrying borrowed)))
+        (fresh))))
+
 (defn any-trait-object? [(e Code)] (-> bool)
   (block :any
     (for [i 1 (len e)]
@@ -1140,8 +1258,24 @@
       (fail! value "safe: a view is stored; it can only be a local, an argument or a result")
       0))
 
+;;; A trait object is never stored, nor passed for a type parameter (which could
+;;; store it): it is an exclusive reference.
+(defn refuse-stored-dyn! [(cx (mut Cx)) (value Code)] (-> i64)
+  (if (dyn-value? (mut cx) value)
+      (fail! value "safe: a trait object is stored; it is an exclusive reference: a local, an argument or a result")
+      0))
+
+(defn check-dyn-argument! [(cx (mut Cx)) (arg Code) (param Code)] (-> i64)
+  (if (and (dyn-value? (mut cx) arg) (not (dyn-type? param)) (not (primitive/code-eq param `unknown)))
+      (fail! arg "safe: a trait object is passed where it could be stored; it can only be a local, an argument declared (dyn …), or a result")
+      0))
+
 ;;; A form headed by a name the compiler resolves to something.
 (defn eval-resolved [(cx (mut Cx)) (e Code) (want Want)] (-> Res)
+  (if (or (any-trait-object? e)
+          (and (> (len e) 1) (dyn-local? (mut cx) (get e 1))
+               (match (primitive/code-decl e) (primitive/Declared [_ _ _ _] false) (_ true))))
+      (eval-dyn-call (mut cx) e want)
   (match (primitive/code-decl e)
     (primitive/Declared [module kind name signature]
       (match kind
@@ -1151,7 +1285,10 @@
               (for [i 1 (len e)]
                 (unless (primitive/code-keyword? (get e i))
                   (guard-raw-flow! cx e (get e i))
-                  (refuse-stored-view! (get e i))
+                  (refuse-stored-dyn! (mut cx) (get e i))
+                  ; a view may hold a view: it stands for what both were made from
+                  (unless (view-type? (pointee (type-of e)))
+                    (refuse-stored-view! (get e i)))
                   (eval (mut cx) (get e i) (WValue))))
               (fresh)))
         (primitive/VariantDecl []
@@ -1161,12 +1298,12 @@
                 (unless (primitive/code-keyword? (get e i))
                   (guard-raw-flow! cx e (get e i))
                   (refuse-stored-view! (get e i))
+                  (refuse-stored-dyn! (mut cx) (get e i))
                   (eval (mut cx) (get e i) (WValue))))
               (fresh)))
         (primitive/FunctionDecl [] (eval-call (mut cx) e want module kind name signature))
         (primitive/MethodDecl []
-          (do (when (any-trait-object? e)
-                (need-unsafe! cx e "a call through a trait object"))
+          (do (check-trait-self! (mut cx) e signature)
               (eval-call (mut cx) e want module kind name signature)))
         (primitive/ExternDecl []
           (do (need-unsafe! cx e "a call of an extern function")
@@ -1175,7 +1312,8 @@
                (eval-parts (mut cx) e 1)))))
     (_
       (let [head (get e 0)]
-        (cond (arithmetic? head) (eval-parts (mut cx) e 1)
+        (cond (any-trait-object? e) (eval-dyn-call (mut cx) e want)
+              (arithmetic? head) (eval-parts (mut cx) e 1)
               (primitive-named? head `(sizeof alignof offsetof)) (fresh)
               (primitive-named? head `(zeroed))
                 (do (unless (and (copy-type? cx (pointee (type-of e)) 0)
@@ -1184,7 +1322,7 @@
                     (fresh))
               :else
                 (do (need-unsafe! cx e (text3 "`" (meta/source head) "`, which the rules do not cover,"))
-                    (eval-parts (mut cx) e 1)))))))
+                    (eval-parts (mut cx) e 1))))))))
 
 (defn eval-list [(cx (mut Cx)) (e Code) (want Want)] (-> Res)
   (let [head (get e 0)]
@@ -1215,11 +1353,31 @@
           ; and its value is a function pointer, which only `unsafe` code can call
           (or (head-is? e `fn*) (head-is? e `fn))
             (let [arrow (arrow-index e)]
-              (if (and (> arrow 0) (primitive/code-vector? (get e (- arrow 1))))
-                  (check-function! (.user cx) e arrow (.tparams cx))
-                  (fail! e "safe: this function form is not covered by the rules"))
+              (cond (and (> arrow 0) (primitive/code-vector? (get e (- arrow 1))))
+                      (check-function! (.user cx) e arrow (.tparams cx) `())
+                    ; parameters whose types the compiler inferred: the literal's
+                    ; function-pointer type says what they are
+                    (and (> (len e) 1) (primitive/code-vector? (get e 1)))
+                      (let [typed (typed-literal e)]
+                        (if (> (len typed) 0)
+                            (check-function! (.user cx) typed 2 (.tparams cx) `())
+                            (fail! e "safe: the types of this function's parameters are not known")))
+                    :else (fail! e "safe: this function form is not covered by the rules"))
               (fresh))
           :else (eval-resolved (mut cx) e want))))
+
+;;; `(fn* [x…] BODY…)` with the types its function-pointer type gives it:
+;;; `(fn* [(x T)…] (-> R) BODY…)`, or `()` when that type is not known.
+(defn typed-literal [(e Code)] (-> Code)
+  (let [t (type-of e)
+        names (get e 1)]
+    (if (and (head-is? t `fnptr) (= (len t) 4) (primitive/code-vector? (get t 2))
+             (= (len (get t 2)) (len names)))
+        (let [(mut params) (primitive/code-list-new)]
+          (for i (range 0 (len names))
+            (push! (mut params) `(~(get names i) ~(get (get t 2) i))))
+          `(fn* [~@params] (-> ~(get t 3)) ~@(primitive/code-slice e 2 (len e))))
+        `())))
 
 ;;; Check E, whose consumer wants WANT.
 (defn eval [(cx (mut Cx)) (e Code) (want Want)] (-> Res)
@@ -1280,7 +1438,7 @@
 
 ;;; Check one function or method: FORM holds `[PARAMS] (-> RESULT) BODY…` with
 ;;; the arrow at ARROW. OUTER is the type parameters of an enclosing `impl`.
-(defn check-function! [(user Code) (form Code) (arrow i64) (outer Code)] (-> i64)
+(defn check-function! [(user Code) (form Code) (arrow i64) (outer Code) (self-type Code)] (-> i64)
   (let [params (get form (- arrow 1))
         result (get (get form arrow) 1)
         own (if (and (>= (- arrow 2) 0) (primitive/code-vector? (get form (- arrow 2))))
@@ -1295,19 +1453,28 @@
                      :tparams (union outer own)
                      :user user
                      :path (ArrayList::new [Code] a)
-                     :pinned (ArrayList::new [i64] a))]
+                     :pinned (ArrayList::new [i64] a)
+                     :trusted (ArrayList::new [i64] a)
+                     :dyns (ArrayList::new [i64] a))]
     (if (or (mentions-code? params) (mentions-code? result))
         ; compile-time code: it runs in the compiler, not in the program
         0
         (do
-          (for p (iter params)
-            (if (and (primitive/code-list? p) (= (len p) 2) (primitive/code-sym? (get p 0)))
-                (let [t (get p 1)
-                      serial (push-local! (mut cx) (get p 0) (ref-type? t))]
-                  (when (or (ref-type? t) (view-type? t))
-                    (hold! (mut cx) serial
-                           (if (head-is? t `mut) `(((ext ~serial) mut)) `(((ext ~serial) shr))))))
-                (fail! p "safe: this parameter form is not covered by the rules")))
+          (for [k 0 (len params)]
+            (let [p (get params k)]
+              (if (and (primitive/code-list? p) (= (len p) 2) (primitive/code-sym? (get p 0)))
+                  (let [t (get p 1)
+                        ; a trait method's `(ptr Self)`: an exclusive reference
+                        self (and (= k 0) (head-is? t `ptr) (primitive/code-list? self-type)
+                                  (> (len self-type) 0) (primitive/code-eq (get t 1) (get self-type 0)))
+                        excl (or (head-is? t `mut) (dyn-type? t) self)
+                        serial (push-local! (mut cx) (get p 0) (or (ref-type? t) (dyn-type? t) self))]
+                    (when self (push! (mut (.trusted cx)) serial))
+                    (when (dyn-type? t) (push! (mut (.dyns cx)) serial))
+                    (when (or (ref-type? t) (view-type? t) (dyn-type? t) self)
+                      (hold! (mut cx) serial
+                             (if excl `(((ext ~serial) mut)) `(((ext ~serial) shr))))))
+                  (fail! p "safe: this parameter form is not covered by the rules"))))
           (let [want (cond (head-is? result `mut) (WExcl)
                            (head-is? result `ref) (WShared)
                            (primitive/code-eq result `void) (WDiscard)
@@ -1324,25 +1491,59 @@
 ;;; Check the methods of an `impl` or a `deftrait` (a trait's method may have a
 ;;; body). A vector written directly in the form lists type parameters.
 (defn check-impl! [(user Code) (form Code)] (-> i64)
-  (let [(mut outer) `()]
+  (let [(mut outer) `()
+        (mut names) (primitive/code-list-new)]
     (for part (iter form)
       (when (primitive/code-vector? part)
         (set! outer (union outer (type-parameter-names part)))))
-    (for part (iter form)
-      (when (and (primitive/code-list? part) (> (len part) 0) (primitive/code-sym? (get part 0)))
-        (let [arrow (arrow-index part)]
-          (when (and (> arrow 0) (primitive/code-vector? (get part (- arrow 1))))
-            (check-function! user part arrow outer)))))
+    ; `(impl TRAIT TYPE methods…)`: TYPE, as the methods spell it; `()` for an
+    ; inherent impl or a trait's own default methods
+    (for [i 1 (len form)]
+      (let [part (get form i)]
+        (unless (primitive/code-vector? part) (push! (mut names) part))))
+    (let [heads `(~@names)
+          self-type (if (and (head-is? form `impl) (>= (len heads) 2)
+                             (match (primitive/code-decl (get heads 0))
+                               (primitive/Declared [_ kind _ _] (match kind (primitive/TraitDecl [] true) (_ false)))
+                               (_ false)))
+                        `(~(get heads 1))
+                        `())]
+      (for part (iter form)
+        (when (and (primitive/code-list? part) (> (len part) 0) (primitive/code-sym? (get part 0)))
+          (let [arrow (arrow-index part)]
+            (when (and (> arrow 0) (primitive/code-vector? (get part (- arrow 1))))
+              (check-function! user part arrow outer self-type))))))
     0))
 
-(defn check-top! [(user Code) (form Code)] (-> i64)
+(defn check-top! [(user Code) (module Code) (form Code)] (-> i64)
+  (check-quiet-drop! module form)
   (cond (or (head-is? form `defn*) (head-is? form `defn))
           (let [arrow (arrow-index form)]
             (if (and (> arrow 1) (primitive/code-vector? (get form (- arrow 1))))
-                (check-function! user form arrow `())
+                (check-function! user form arrow `() `())
                 (fail! form "safe: this function form is not covered by the rules")))
         (or (head-is? form `impl) (head-is? form `deftrait)) (check-impl! user form)
         :else 0))
+
+;;; `(impl QuietDrop TYPE)` lets a view's loans end before its drop runs, so only
+;;; the module that declares TYPE, and so its drop, may say it.
+(defn check-quiet-drop! [(module Code) (form Code)] (-> i64)
+  (if (and (head-is? form `impl)
+           (block :found
+             (for part (iter form)
+               (when (match (primitive/code-decl part)
+                       (primitive/Declared [_ _ name _] (primitive/code-eq name `safe.core.QuietDrop))
+                       (_ false))
+                 (return-from :found true)))
+             false))
+      (let [t (get form (- (len form) 1))]
+        (match (primitive/code-decl (if (primitive/code-list? t) (get t 0) t))
+          (primitive/Declared [declared _ _ _]
+            (if (primitive/code-eq declared module)
+                0
+                (fail! form "safe: only the module that declares a view may say its drop is quiet")))
+          (_ (fail! form "safe: only the module that declares a view may say its drop is quiet"))))
+      0))
 
 ;;; Is the module record M one of the program's own, to be checked? This module
 ;;; is the compiler's code: it runs while the program is compiled, never in it.
@@ -1359,7 +1560,7 @@
         (when (checked? m)
           (for form (iter (primitive/code-rest m))
             (when (primitive/code-from-user? form)
-              (check-top! names form)))))))
+              (check-top! names (get m 0) form)))))))
   `0)
 
 (checker safe-check)

@@ -1,0 +1,9 @@
+;;; A trait's method takes what it works on as `(ptr Self)` and reaches it with no
+;;; `unsafe`, so a raw pointer is given to it only inside `unsafe`.
+(module bad_trait_self_raw)
+(import "coil.primitive" :as primitive)
+(deftrait Counter [Self] (bump [(self (ptr Self))] (-> i64)))
+(defstruct Clicks [(n i64)])
+(impl Counter Clicks (bump [(self (ptr Clicks))] (-> i64) (.n self)))
+(defn main [] (-> i64)
+  (bump (primitive/cast (ptr Clicks) 64)))

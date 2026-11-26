@@ -1,0 +1,9 @@
+;;; A closure cannot leave the scope of what it borrows.
+(module bad_closure_outlives)
+(import "safe.fn" :use [deffn lambda])
+(deffn Get [] i64)
+(defn make [] (-> Get)
+  (let [n 4]
+    (lambda Get [(ref n)] [] n)))
+(defn main [] (-> i64)
+  (let [(mut f) (make)] (Get::run (mut f))))

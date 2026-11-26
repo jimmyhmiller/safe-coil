@@ -1,0 +1,7 @@
+;;; Only the module that declares a view may say its drop is quiet: a lock's drop
+;;; unlocks, so its loan must last until then.
+(module bad_quiet_drop_foreign)
+(import "safe.core" :use [QuietDrop])
+(import "safe.sync" :use [Mutex Guard])
+(impl [T] QuietDrop (Guard T))
+(defn main [] (-> i64) 0)

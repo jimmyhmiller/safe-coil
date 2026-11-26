@@ -1,0 +1,11 @@
+;;; A view that holds a view keeps the inner one's loans.
+(module bad_defview_inner_view_lent)
+(import "safe.view" :use [defview])
+(import "safe.vec" :use [Vec Slice])
+(defview Window [T] [(items (Slice T))])
+(defn main [] (-> i64)
+  (let [(mut xs) (Vec::new [i64])]
+    (Vec::push! (mut xs) 1)
+    (let [w (Window::new (Vec::slice xs 0 1))]
+      (Vec::push! (mut xs) 2)
+      (Slice::len (Window::items w)))))

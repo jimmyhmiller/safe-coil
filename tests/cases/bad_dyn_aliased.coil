@@ -1,0 +1,9 @@
+;;; A trait object is an exclusive reference: it is not given twice to one call.
+(module bad_dyn_aliased)
+(deftrait Counter [Self] (bump [(self (ptr Self))] (-> i64)))
+(defstruct Clicks [(n i64)])
+(impl Counter Clicks (bump [(self (ptr Clicks))] (-> i64) (.n self)))
+(defn both [(a (dyn Counter)) (b (dyn Counter))] (-> i64) (+ (bump a) (bump b)))
+(defn twice [(c (dyn Counter))] (-> i64) (both c c))
+(defn main [] (-> i64)
+  (let [(mut c) (Clicks :n 0)] (twice (mut c))))

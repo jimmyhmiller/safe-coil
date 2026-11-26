@@ -1,0 +1,10 @@
+;;; What a view the program declares holds exclusively is not read around it.
+(module bad_defview_excl_field_read)
+(import "safe.view" :use [defview])
+(defview Cell [(r (mut i64))])
+(defn main [] (-> i64)
+  (let [(mut n) 1
+        (mut c) (Cell::new (mut n))]
+    (println "{}" n)
+    (set! (Cell::r-mut (mut c)) 2)
+    0))

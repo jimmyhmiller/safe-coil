@@ -1,0 +1,12 @@
+;;; A closure that owns what it captured cannot capture a reference: it would
+;;; carry it where the checker cannot see.
+(module no_closure_own_reference)
+(import "safe.fn" :use [deffn lambda-own])
+(import "safe.core" :use [borrow])
+(import "safe.box" :use [Box])
+(deffn Get [] i64)
+(defn main [] (-> i64)
+  (let [b (Box::new 4)
+        r (borrow b)
+        (mut f) (lambda-own Get [r] [] 0)]
+    (Get-own::run (mut f))))

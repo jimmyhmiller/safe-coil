@@ -1,0 +1,11 @@
+;;; A closure that borrows is a view: it never reaches another thread.
+(module bad_closure_sent_to_thread)
+(import "safe.fn" :use [deffn lambda])
+(import "safe.thread" :use [spawn Task])
+(deffn Get [] i64)
+(defn run-it [(f Get)] (-> i64) (let [(mut g) f] (Get::run (mut g))))
+(defn main [] (-> i64)
+  (let [n 4
+        f (lambda Get [(ref n)] [] n)
+        task (spawn (run-it f))]
+    (Task::join task)))

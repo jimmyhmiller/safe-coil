@@ -26,12 +26,13 @@
 
 (extern pthread_detach :cc (cc/C) [(ptr i8)] (-> i32))
 
-;;; What a thread and its task share. `slots` holds the address of each argument,
-;;; which the thread takes. `result` is where the thread leaves what the call
-;;; returned. `state` says who frees this: 0 while the thread runs, 1 once the
-;;; result is there, 2 if the task was detached first.
+;;; What a thread and its task share. `callee` is the function the thread calls,
+;;; and `slots` holds the address of each argument, which the thread takes.
+;;; `result` is where the thread leaves what the call returned. `state` says who
+;;; frees this: 0 while the thread runs, 1 once the result is there, 2 if the task
+;;; was detached first.
 (defstruct Packet
-  [(slots (slice (ptr i8))) (result (ptr i8)) (state i64) (thread Thread)])
+  [(callee (ptr i8)) (slots (slice (ptr i8))) (result (ptr i8)) (state i64) (thread Thread)])
 
 ;;; What a task returns when the call it runs returns nothing.
 (defstruct Done [])
@@ -76,11 +77,16 @@
     (alloc/free (alloc/malloc-allocator) (slice::new [Packet] packet 1))
     0))
 
-;;; Start BODY on a new thread with the argument addresses in SLOTS.
-(defn begin [R] [(body (fnptr (cc/C) [(ptr i8)] (ptr i8))) (slots (slice (ptr i8)))] (-> (Task R))
+;;; The function the thread whose packet RAW is calls.
+(defn callee-of [(raw (ptr i8))] (-> (ptr i8))
+  (unsafe (load (field (primitive/cast (ptr Packet) raw) callee))))
+
+;;; Start BODY on a new thread, to call CALLEE with the argument addresses in SLOTS.
+(defn begin [R] [(body (fnptr (cc/C) [(ptr i8)] (ptr i8))) (callee (ptr i8)) (slots (slice (ptr i8)))] (-> (Task R))
   (unsafe
     (let [result (mem/room [R] 1)
           packet (data (must (alloc/alloc [Packet] (alloc/malloc-allocator) 1)))]
+      (store! (field packet callee) callee)
       (store! (field packet slots) slots)
       (store! (field packet result) (primitive/cast (ptr i8) (data result)))
       (store! (field packet state) 0)
@@ -138,7 +144,10 @@
 ;;; ---- the macro ---------------------------------------------------------------
 
 ;;; `(spawn-as :value (f a b))` or `(spawn-as :done (f a b))`: what `spawn` and
-;;; `spawn-do` expand to.
+;;; `spawn-do` expand to. The thread calls `f` through the pointer the task was
+;;; started with, so `f` may be any function a pointer can be taken to, a method
+;;; `Type::m` too, and the thread's own function is generic over the arguments'
+;;; types.
 (defn spawn-as [(mode Code) (call Code)] (-> Code)
   (unless (and (primitive/code-list? call) (> (len call) 0))
     (primitive/error "spawn: expected a call, (spawn (f …))"))
@@ -149,6 +158,7 @@
         raw (primitive/fresh-identifier "raw")
         slots (primitive/fresh-identifier "slots")
         result-type (primitive/fresh-identifier "R")
+        code (primitive/fresh-identifier "code")
         (mut types) (primitive/code-list-new)
         (mut parameters) (primitive/code-list-new)
         (mut kept-values) (primitive/code-list-new)
@@ -160,27 +170,31 @@
         (push! (mut types) type)
         (push! (mut parameters) `(~parameter ~type))
         (push! (mut kept-values) `(slot! ~slots ~i ~parameter))
-        (push! (mut taken) `(kept ~raw ~i))
+        (push! (mut taken) `(kept [~type] ~raw ~i))
         (push! (mut arguments) (get call (+ from i)))))
     (let [site (primitive/code-call-site)
           task-type (if quiet `Done result-type)
           worker (primitive/code-hoist `(spawn-worker ~site)
                                        (if quiet
-                                           `(defn _ :cc (cc/C) [(~raw (ptr i8))] (-> (ptr i8))
-                                              (~@callee ~@taken)
-                                              (deliver ~raw (Done)))
-                                           `(defn _ :cc (cc/C) [(~raw (ptr i8))] (-> (ptr i8))
-                                              (deliver ~raw (~@callee ~@taken)))))
+                                           `(defn _ [~@types ~result-type] [(~raw (ptr i8))] (-> (ptr i8))
+                                              (let [~code (primitive/cast (fnptr (cc/C) [~@types] ~result-type) (callee-of ~raw))]
+                                                (~code ~@taken)
+                                                (deliver ~raw (Done))))
+                                           `(defn _ [~@types ~result-type] [(~raw (ptr i8))] (-> (ptr i8))
+                                              (let [~code (primitive/cast (fnptr (cc/C) [~@types] ~result-type) (callee-of ~raw))]
+                                                (deliver ~raw (~code ~@taken))))))
           launch (primitive/code-hoist `(spawn-launch ~site)
                                        `(defn _ [~@types ~result-type]
                                           [(callee (fnptr (cc/C) [~@types] ~result-type))
-                                           (body (fnptr (cc/C) [(ptr i8)] (ptr i8)))
                                            ~@parameters] (-> (Task ~task-type))
                                           (unsafe
                                             (let [~slots (slots-for ~count)]
                                               ~@kept-values
-                                              (begin [~task-type] body ~slots)))))]
-      `(~launch (primitive/fnptr-of ~@callee) (primitive/fnptr-of ~worker) ~@arguments))))
+                                              (begin [~task-type]
+                                                     (primitive/fnptr-of ~worker [~@types ~result-type])
+                                                     (primitive/cast (ptr i8) callee)
+                                                     ~slots)))))]
+      `(~launch (primitive/fnptr-of ~@callee) ~@arguments))))
 
 ;;; `(spawn (f a b))`: start the call on a new thread. A `(Task R)`, where R is
 ;;; what `f` returns.

@@ -1,0 +1,9 @@
+;;; A collection is lent for the whole of each turn of a `for` over it.
+(module bad_for_push_while_looping)
+(import "safe.loop" :use [for])
+(import "safe.vec" :use [Vec])
+(defn main [] (-> i64)
+  (let [(mut xs) (Vec::new [i64])]
+    (Vec::push! (mut xs) 3)
+    (for (ref x) xs (Vec::push! (mut xs) x))
+    0))

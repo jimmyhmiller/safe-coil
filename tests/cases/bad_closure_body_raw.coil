@@ -1,0 +1,8 @@
+;;; A closure's body is checked as any function is: raw memory needs `unsafe`.
+(module bad_closure_body_raw)
+(import "safe.fn" :use [deffn lambda])
+(deffn Peek [(ptr i64)] i64)
+(defn main [] (-> i64)
+  (let [(mut n) 3
+        (mut f) (lambda Peek [] [p] (load p))]
+    (Peek::run (mut f) (mut n))))

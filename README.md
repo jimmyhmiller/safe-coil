@@ -71,6 +71,28 @@ adds the rest of the model:
   no other thread. A view made from an exclusive reference gives exclusive
   access, so its type must be one that is moved (one with a `Drop`), never
   copied.
+- **Closures.** A closure that borrows (`safe.fn`'s `lambda`) is a view over
+  what it captured: it keeps each capture lent, shared or exclusively, until
+  its last use, and is moved, never copied. Its body is a function of its own
+  whose captures are reference parameters, checked as any function is. A
+  closure that owns what it captured (`lambda-own`) holds no reference, so it can
+  be stored, returned and sent to another thread.
+- **Views the program declares.** `defview` and `defsubscript` make views with
+  no `unsafe` in the program: the generated code follows the raw pointers, and
+  the code the program writes (a subscript's code before and after its yield)
+  is checked as functions of its own. A view may hold a view. A view's drop that
+  uses nothing it borrowed is marked `QuietDrop` by the module that declares the
+  view (and only that module), so its loans end at its last use; any other
+  view keeps them until its scope ends.
+- **Trait objects.** A `(dyn Trait)` is an exclusive reference to what it was
+  made from: made from `(mut place)` (from a raw pointer only inside `unsafe`),
+  lent exclusively wherever it is used, never stored or passed for a type
+  parameter. A trait's method that takes what it works on as `(ptr Self)` is
+  checked as though that were an exclusive reference, with no `unsafe`, so a raw
+  pointer is given to one only inside `unsafe`.
+- **Loads.** `(primitive/load …)` of an owner makes a second owner of the same
+  thing, so safe code does not load one: it names a variable to move it, or
+  takes it out of a place with `replace!`.
 - **Raw fields.** A struct or variant with a field that is itself raw memory is
   built only inside `unsafe`, and such a field is changed only there. So a type
   like `Box` holds the pointer its own code put in it, never one safe code made up.
@@ -93,7 +115,10 @@ operations are allowed.
 
 | Module | What it gives |
 |---|---|
-| `safe.core` | `unsafe`; `borrow` and `borrow-mut`, a reference as a value; `replace!`, which swaps an owner out of a place; `move`; `each` and `each-mut`, a loop over a list, a slice or a string |
+| `safe.core` | `unsafe`; `borrow` and `borrow-mut`, a reference as a value; `replace!`, which swaps an owner out of a place; `move`; `each` and `each-mut`, a loop over a list, a slice or a string; the traits `View` and `QuietDrop` |
+| `safe.loop` | `(for (ref x) xs …)` and `(for (mut x) xs …)` over a safe collection, each element by reference; any other `for` is Coil's |
+| `safe.fn` | `(deffn NAME [T…] [PARAM-TYPE…] RESULT)` declares a closure type; `(lambda NAME [(ref x) (mut y) (z (ref PLACE))…] [params…] body…)` makes one that borrows what it captures, `(lambda-own NAME [x (y VALUE)…] [params…] body…)` one of `NAME-own` that owns them; `(NAME::run (mut f) args…)` calls either; `(NAME-own::call-once f args…)` calls one and frees it, so `(spawn (NAME-own::call-once f))` runs it on a thread |
+| `safe.view` | `(defview NAME [T…] [(field TYPE)…])`, a view whose fields may be references or views: `NAME::new`, `NAME::field`, `NAME::field-mut`. `(defsubscript NAME [T…] [params…] (-> (ref R) or (mut R)) before… (yield PLACE) after…)`: `NAME::open` runs `before` and gives a view of `PLACE`, read with `NAME::get` and `NAME::get-mut`; `after` runs when the view is dropped |
 | `safe.box` | `(Box T)`, an owner of one heap value: `Box::new`, `get`, `get-mut`, `into` |
 | `safe.pool` | `(Pool T)`, a collection that owns its elements, and `(Handle T)`, plain data checked when it is used: `insert!`, `remove!`, `at`, `at-mut` |
 | `safe.global` | `defglobal`, `with-ref`, `with-mut`: a global lent for a scope, with exclusivity checked when the scope is entered |
@@ -126,7 +151,56 @@ address nothing is read from.
 
 `each` works on a `Vec`, a `Slice`, a `SliceMut` and a `Str` (its bytes);
 `each-mut` on a `Vec` and a `SliceMut`. The collection is lent for the whole of
-each turn, so the body cannot add to it or take from it.
+each turn, so the body cannot add to it or take from it. With `safe.loop`,
+`(for (ref x) v …)` and `(for (mut x) v …)` are the same loops written as Coil's
+`for`.
+
+### Closures
+
+```coil
+(deffn Bump [(mut i64)] void)           ; a closure type: takes (mut i64), gives nothing
+
+(defn twice [(x (mut i64)) (f (mut Bump))] (-> void)
+  (Bump::run (mut f) (mut x))
+  (Bump::run (mut f) (mut x)))
+
+(let [(mut total) 0
+      step 10
+      (mut x) 1
+      (mut f) (lambda Bump [(mut total) (ref step)] [v]
+                (set! total (+ total v))
+                (set! v (+ v step)))]
+  (twice (mut x) (mut f))
+  (println "{} {}" total x))            ; 12 21: total and step are free again once f is done
+```
+
+Inside the body, `total` is an exclusive reference and `step` a shared one; the
+closure keeps `total` lent exclusively and `step` shared until its last use.
+`lambda-own` captures by moving: `(lambda-own Count [n] [] (set! n (+ n 1)) n)`
+is a counter that can be returned, stored, or given to `spawn` through
+`Count-own::call-once`. A closure gives back a value, never a reference into
+what it captured.
+
+### Views and subscripts
+
+```coil
+(defsubscript Clamped [(x (mut i64)) (hi i64)] (-> (mut i64))
+  (yield x)
+  (when (> x hi) (set! x hi)))           ; runs when the view is dropped
+
+(let [(mut v) 3]
+  (let [(mut c) (Clamped::open (mut v) 10)]
+    (set! (Clamped::get-mut (mut c)) 50))
+  v)                                     ; 10
+```
+
+### Moving parts out
+
+Coil lets a field be moved out of a struct, and what a `(mut T)` parameter
+refers to be moved out until the function gives it back; `(out T)` parameters
+fill a place that holds nothing, such as a variable made with `(uninit [T])`.
+The compiler tracks which parts are gone (see the Coil language guide); the
+checker's loans work on the same places.
 
 `examples/calc.coil` is Coil's calculator example (a lexer, a recursive-descent
 parser into a boxed tree, an evaluator) in safe Coil, with no `unsafe` in it.
@@ -160,7 +234,8 @@ exclusively to one call can reach the other. A global's borrow count is atomic.
 
 `(spawn (f a b))` runs `(f a b)` on a new thread. The thread owns what it is
 given: `f` takes every argument by value, so each is moved or copied to the
-thread and no reference crosses. Coil itself refuses a reference where a value
+thread and no reference crosses. The thread calls `f` through a pointer, so `f`
+may be a method, `Type::method`, such as a closure's `call-once`. Coil itself refuses a reference where a value
 is asked for, and the checker refuses a view. `Task::join` waits for what `f`
 returns and hands it back. A function that returns nothing is started with
 `spawn-do`. A task that is dropped waits for its thread; `Task::detach` lets the
@@ -267,11 +342,16 @@ A small language with everything the rules are about:
 |---|---|
 | `(box σ)` | an owner: a heap allocation freed when its owner leaves scope |
 | `(ref σ)`, `(mut σ)` | shared and exclusive references: a local, an argument or a result, never stored |
-| `(view V)` | a struct with reference fields (a slice, an iterator): treated as a reference |
+| `(view V)` | a struct with reference fields (a slice, an iterator): treated as a reference. A view may hold a view, and may name a function its drop runs (a lock, a subscript's code after its yield), which keeps its loans until its scope ends |
+| `(lam ([x τ e] …) params τ body)`, `(fnb k (τ…) τ)` | a closure that borrows what it captures: a view of those loans, exclusive when it captured something exclusively; `(apply f args…)` calls it |
+| `(lamo ([x σ e] …) params τ body)`, `(fno (τ…) τ)` | a closure that owns what it captured: storable; `(spawn-fn f)` runs one on a thread |
+| `(: x a)` moved, `(set! (: x a) v)` | parts moved out of a variable, or out of what an exclusive parameter refers to, and given back |
+| `(out σ)`, `(out p)`, `(uninit σ)` | a parameter that fills a place holding nothing; a variable made with nothing in it |
+| `(return e τ)` | leaving a function early |
 | `struct`, `sum`, `match`, `match-ref`, `match-mut` | structs with separately lent fields; sums whose payload reference keeps the variant in place |
 | `(pool σ)`, `(handle σ)`, `(at p h)` | a collection that owns its elements, and plain-data handles checked when used |
 | type parameters | generics: a parameter may be an owner and can never be a reference |
-| `while`, `break` | loops |
+| `while`, `break` | loops; what is moved before a break is moved after the loop |
 | `(with ref g x …)`, `(with mut g x …)` | a global, lent for a scope, with exclusivity checked on entry |
 | `(par (call …) (call …))` | two calls running at once |
 | `(spawn (call …))`, `(join e)`, `(task σ)` | a call on a thread that runs on; the task is an owner, and no argument is a reference |
@@ -316,9 +396,12 @@ These are sound and simple. The model should be relaxed first, then the checker.
 
 - A returned reference borrows from every argument the call took by reference.
 - Every element of a pool is one place: two elements cannot be lent exclusively at once.
-- Only a whole variable can be moved. `replace!` swaps an owner out of a field, a
-  box or a pool element.
-- A loop body cannot move a variable from outside the loop, even just before a `break`.
+- An owner is moved out of a field or out of what an exclusive *parameter* refers
+  to, never through any other reference (a `with` of a global, a `let` bound to
+  one): only a function's exits check that what was moved out is given back.
+  `replace!` swaps an owner out of anywhere.
+- A closure that captured only shared references is still moved, never copied,
+  in Coil (the model copies one).
 - A reference that is thrown away still may not outlive what it refers to.
 
 ## What is left out
@@ -331,7 +414,9 @@ These are sound and simple. The model should be relaxed first, then the checker.
   `each-mut` and `each-entry` are the loops.
 - A thread that holds a read lock and asks to write the same `RwLock` waits for
   ever. That is a hang, not a memory error.
-- `return` from the middle of a function, trait objects and
-  function pointers: outside the model, and refused or `unsafe`-only in the checker.
+- Function pointers: `fnptr-of` and a call through one stay `unsafe`-only. A
+  closure with no captures (`lambda-own` with an empty capture list) is the
+  safe function value.
+- A closure that returns a reference: as in Hylo, a closure gives back a value.
 - What is inside `unsafe`: the rules say which operations need it and that the
   other rules still hold there, and make no claim about a program that uses it.

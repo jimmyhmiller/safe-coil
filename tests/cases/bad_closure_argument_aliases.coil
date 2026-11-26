@@ -1,0 +1,9 @@
+;;; A closure's argument cannot reach what it captured exclusively.
+(module bad_closure_argument_aliases)
+(import "safe.fn" :use [deffn lambda])
+(import "safe.box" :use [Box])
+(deffn Replace [(ref i64)] i64)
+(defn main [] (-> i64)
+  (let [(mut b) (Box::new 1)
+        (mut f) (lambda Replace [(mut b)] [r] (set! b (Box::new 2)) r)]
+    (Replace::run (mut f) (Box::get b))))

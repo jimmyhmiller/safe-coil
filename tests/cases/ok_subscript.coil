@@ -1,0 +1,23 @@
+;;; A subscript: code before its yield, the part it yields, and code that runs
+;;; when the caller is done with it.
+(module ok_subscript)
+(import "safe.view" :use [defsubscript])
+(import "safe.vec" :use [Vec])
+(defsubscript Clamped [(x (mut i64)) (hi i64)] (-> (mut i64))
+  (yield x)
+  (when (> x hi) (set! x hi)))
+;;; element I of a list, which is never left below zero
+(defsubscript NonNegative [(xs (mut (Vec i64))) (i i64)] (-> (mut i64))
+  (yield (Vec::at-mut (mut xs) i))
+  (when (< (Vec::at xs i) 0) (set! (Vec::at-mut (mut xs) i) 0)))
+(defn main [] (-> i64)
+  (let [(mut v) 3]
+    (let [(mut c) (Clamped::open (mut v) 10)]
+      (set! (Clamped::get-mut (mut c)) 50))
+    (println "clamped {}" v))
+  (let [(mut xs) (Vec::new [i64])]
+    (Vec::push! (mut xs) 4)
+    (let [(mut e) (NonNegative::open (mut xs) 0)]
+      (set! (NonNegative::get-mut (mut e)) (- 0 9)))
+    (println "first {}" (Vec::at xs 0)))
+  0)

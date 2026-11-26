@@ -8,7 +8,15 @@
 ;;   - an exclusive reference read out of a view's field as a value: the model
 ;;     has no rule for it, and Coil would lend through it again instead;
 ;;   - `match-mut` on a sum with a plain-data payload: Coil copies such a
-;;     payload into the arm and lends only the parts that own something.
+;;     payload into the arm and lends only the parts that own something;
+;;   - an out parameter, or a variable made with nothing in it: Coil has neither;
+;;   - a closure capture that is not a borrow of a place or a variable holding a
+;;     reference.
+;;
+;; A closure type `(fnb k (τ…) τ)` or `(fno (τ…) τ)` is a `deffn` type of safe.fn,
+;; one per parameter and result types (`F<n>`, and `F<n>-own` for one that owns
+;; what it captured). A function with a `return` in it has its body in a block
+;; `:ret` that the return leaves.
 
 (require "rules.rkt")
 (provide program->coil)
@@ -25,6 +33,10 @@
 ;; that lends what it points at: `W<V>-<field>`, and `W<V>-<field>-mut` for an
 ;; exclusive one.
 (define (view-name V) (format "W~a" V))
+;; the closure types of the program being written: (τs τr) -> its deffn name
+(define closure-names (make-parameter (make-hash)))
+(define (closure-name τs τr)
+  (hash-ref! (closure-names) (list τs τr) (λ () (format "F~a" (hash-count (closure-names))))))
 
 ;; ---------------------------------------------------------------- types
 
@@ -40,6 +52,11 @@
     [`(ref ,σ) (format "(ref ~a)" (coil-type σ))]
     [`(mut ,σ) (format "(mut ~a)" (coil-type σ))]
     [`(view ,V) (view-name V)]
+    [`(fnb ,_ ,τs ,τr) (when (second-class? τr) (bail "a closure that returns a reference"))
+                      (closure-name τs τr)]
+    [`(fno ,τs ,τr) (when (second-class? τr) (bail "a closure that returns a reference"))
+                    (format "~a-own" (closure-name τs τr))]
+    [`(out ,σ) (format "(out ~a)" (coil-type σ))]
     [(? symbol? T) (symbol->string T)]
     [(list S) (type-name S)]
     [(cons S args) (format "(~a ~a)" (type-name S) (string-join (map coil-type args)))]))
@@ -47,6 +64,10 @@
 (define (ref? τ) (match τ [`(,(or 'ref 'mut) ,_) #t] [_ #f]))
 (define (mut? τ) (match τ [`(mut ,_) #t] [_ #f]))
 (define (view? τ) (match τ [`(view ,_) #t] [_ #f]))
+(define (closure? τ) (match τ [`(fnb . ,_) #t] [_ #f]))
+;; a view Coil moves rather than copies: one with an exclusive reference in it,
+;; or a drop of its own
+(define (moved-view? Σ τ) (and (view? τ) (or (exclusive? Σ τ) (and (view-drop Σ τ) #t))))
 
 ;; ---------------------------------------------------------------- the model's types, without its loans
 
@@ -99,6 +120,18 @@
     [`(+ ,_ ,_) 'int]
     [`(while ,_ ,_) 'unit]
     [`(break) 'unit]
+    [`(return ,_ ,τ) τ]
+    [`(uninit ,σ) σ]
+    [`(out ,p) `(out ,(place-type Σ Γ p))]
+    [`(lam ([,_ ,τcs ,_] ...) ((,_ ,τs) ...) ,τr ,_)
+     `(fnb ,(if (ormap (λ (t) (exclusive? Σ t)) τcs) 'mut 'shr) ,τs ,τr)]
+    [`(lamo ,_ ((,_ ,τs) ...) ,τr ,_) `(fno ,τs ,τr)]
+    [`(apply ,p ,_ ...)
+     (match (place-type Σ Γ p)
+       [`(fnb ,_ ,_ ,τr) τr]
+       [`(fno ,_ ,τr) τr]
+       [_ (bail "an ill-typed program")])]
+    [`(spawn-fn ,e1) (match (type-of Σ Γ e1) [`(fno () ,σ) `(task ,σ)] [_ (bail "an ill-typed program")])]
     [`(box ,e1) `(box ,(type-of Σ Γ e1))]
     [`(unbox ,e1) (match (type-of Σ Γ e1) [`(box ,σ) σ] [_ (bail "an ill-typed program")])]
     [`(ref ,p) `(ref ,(place-type Σ Γ p))]
@@ -215,9 +248,11 @@
         [(ref? τ) (value Σ Γ e)]
         ;; a view is never passed for a type parameter; one that is moved has a
         ;; function of its own to take it
-        [(view? τ) (if (exclusive? Σ τ)
+        [(view? τ) (if (moved-view? Σ τ)
                        (format "(drop-~a ~a)" (view-name (cadr τ)) (value Σ Γ e))
                        (value Σ Γ e))]
+        ;; a closure that borrows is a view of its own, moved: it has a function to take it
+        [(closure? τ) (format "(drop-~a ~a)" (coil-type τ) (value Σ Γ e))]
         [else (format "(move ~a)" (value Σ Γ e))]))
 
 ;; e, whose type is a shared reference
@@ -263,6 +298,36 @@
     [`(while ,ec ,eb)
      (unit-after (format "(while (!= ~a 0) ~a)" (plain Σ Γ ec) (discarded Σ Γ eb)))]
     [`(break) "(do (break) 0)"]
+    [`(uninit ,σ) (format "(uninit [~a])" (coil-type σ))]
+    [`(out ,p) (place-type Σ Γ p) (format "(mut ~a)" (written-place Σ Γ p))]
+    [`(return ,e1 ,_)
+     (format "(return-from :ret ~a)" (value Σ Γ e1))]
+    [`(lam ([,xs ,τcs ,es] ...) ((,ps ,τps) ...) ,τr ,body)
+     #:when (and (second-class? τr) (bail "a closure that returns a reference"))
+     ""]
+    [`(lamo ([,xs ,τcs ,es] ...) ((,ps ,τps) ...) ,τr ,body)
+     #:when (and (second-class? τr) (bail "a closure that returns a reference"))
+     ""]
+    [`(lam ([,xs ,τcs ,es] ...) ((,ps ,τps) ...) ,τr ,body)
+     (format "(lambda ~a [~a] ~a)" (closure-name τps τr)
+             (string-join (for/list ([x xs] [τc τcs] [e1 es]) (capture Σ Γ x τc e1)))
+             (closure-body Σ (append (map cons xs τcs) (map cons ps τps)) ps τps body))]
+    [`(lamo ([,xs ,τcs ,es] ...) ((,ps ,τps) ...) ,τr ,body)
+     (format "(lambda-own ~a [~a] ~a)" (closure-name τps τr)
+             (string-join (for/list ([x xs] [e1 es]) (format "(~a ~a)" (var-name x) (plain Σ Γ e1))))
+             (closure-body Σ (append (map cons xs τcs) (map cons ps τps)) ps τps body))]
+    [`(apply ,p ,es ...)
+     (define-values (name τas place)
+       (match (place-type Σ Γ p)
+         [`(fnb ,_ ,τas ,τr) (values (closure-name τas τr) τas (written-place Σ Γ p))]
+         [`(fno ,τas ,τr) (values (format "~a-own" (closure-name τas τr)) τas (written-place Σ Γ p))]
+         [_ (bail "an ill-typed program")]))
+     (format "(~a::run (mut ~a)~a)" name place
+             (string-append* (for/list ([τa τas] [e1 es]) (format " ~a" (argument Σ Γ τa e1)))))]
+    [`(spawn-fn ,e1)
+     (match (type-of Σ Γ e1)
+       [`(fno () ,σ) (format "(spawn (~a-own::call-once ~a))" (closure-name '() σ) (plain Σ Γ e1))]
+       [_ (bail "an ill-typed program")])]
     [`(box ,e1) (format "(Box::new ~a)" (plain Σ Γ e1))]
     [`(unbox ,e1) (format "(Box::into ~a)" (plain Σ Γ e1))]
     [`(set! ,p ,e1)
@@ -271,6 +336,9 @@
           (format "(set! ~a ~a)" (var-name p) (plain Σ Γ e1))
           (match p
             [`(: ,_ ,_) (format "(set! ~a ~a)" (written-place Σ Γ p) (plain Σ Γ e1))]
+            ;; an out parameter's place holds nothing yet: it is assigned, not lent
+            [`(* ,(? symbol? x)) #:when (match (lookup Γ x) [`(out ,_) #t] [_ #f])
+             (format "(set! ~a ~a)" (var-name x) (plain Σ Γ e1))]
             [_ (format "(set! (mut ~a) ~a)" (written-place Σ Γ p) (plain Σ Γ e1))])))]
     ;; the model computes the new value before it looks at the place
     [`(take ,p ,e1)
@@ -367,8 +435,47 @@
     [`(free ,e1) (unit-after (format "(alloc/destroy (alloc/malloc-allocator) ~a)" (plain Σ Γ e1)))]
     [_ (bail "an ill-typed program")]))
 
+;; e passed for a parameter of type τ
+(define (argument Σ Γ τ e)
+  (cond [(match e [`(out ,_) #t] [_ #f]) (compound Σ Γ e)]
+        [(mut? τ) (format "(mut ~a)" (exclusive Σ Γ e))]
+        [(ref? τ) (shared Σ Γ e)]
+        [else (plain Σ Γ e)]))
+
+;; A borrowing closure's capture x of type τ, made by e: a borrow of a place, or
+;; a variable that holds a reference, lent again.
+(define (capture Σ Γ x τ e)
+  (match* (τ e)
+    [(`(ref ,_) `(ref ,p)) (format "(~a (ref ~a))" (var-name x) (shared-place Σ Γ p))]
+    [(`(mut ,_) `(mut ,p)) (format "(~a (mut ~a))" (var-name x) (written-place Σ Γ p))]
+    [(`(ref ,_) (? symbol? y)) #:when (ref? (lookup Γ y)) (format "(~a (ref ~a))" (var-name x) (var-name y))]
+    [(`(mut ,_) (? symbol? y)) #:when (mut? (lookup Γ y)) (format "(~a (mut ~a))" (var-name x) (var-name y))]
+    [(_ _) (bail "a closure capture that is not a borrow")]))
+
+;; `[PARAM…] BODY` of a closure over Γb: parameters taken by value are rebound so
+;; that the body can change them, and a `return` leaves the block `:ret`.
+(define (closure-body Σ Γb ps τps body)
+  (define rebound
+    (string-append* (for/list ([p ps] [t τps] #:unless (or (ref? t) (closure? t)))
+                      (format "(mut ~a) ~a " (var-name p) (var-name p)))))
+  (format "[~a] ~a" (string-join (map var-name ps))
+          (returning body (format "(let [~a] ~a)" rebound (value Σ Γb body)))))
+
+(define (mentions-return? e)
+  (match e
+    [`(return . ,_) #t]
+    [`(,(or 'lam 'lamo) . ,_) #f]
+    [(? pair?) (ormap mentions-return? e)]
+    [_ #f]))
+(define (returning body text)
+  (if (mentions-return? body) (format "(block :ret ~a)" text) text))
+
 (define (par-call Σ Γ c)
   (match c
+    [`(call ,f ,σs ,es ...)
+     #:when (and (ormap (λ (e) (match e [`(out ,_) #t] [_ #f])) es)
+                 (bail "an out parameter given to a call on another thread"))
+     ""]
     [`(call ,f ,σs ,es ...)
      (match (decl Σ 'defn f)
        [`(defn ,_ ,Ts ,params ,_ ,_)
@@ -402,9 +509,9 @@
     [`(sum ,S ,Ts ((,Ks ,ts) ...))
      (format "(defsum ~a~a ~a)" (type-name S) (type-params Ts)
              (string-join (for/list ([K Ks] [t ts]) (format "(~a [(payload ~a)])" (variant-name K) (coil-type t)))))]
-    [`(view ,V ((,flds ,ts) ...))
+    [`(view ,V ((,flds ,ts) ...) . ,drop)
      (define W (view-name V))
-     (define moved? (ormap mut? ts))
+     (define moved? (moved-view? (make-Σ ds) `(view ,V)))
      (string-join
       (append
        (list (format "(defstruct ~a [~a])" W
@@ -412,8 +519,11 @@
                                     (format "(~a ~a)" f (if (ref? t) (format "(ptr ~a)" (coil-type (cadr t))) (coil-type t))))))
              (format "(impl View ~a)" W))
        ;; a view that gives exclusive access is moved, never copied
+       ;; a drop of its own runs the function the model names, given the view
        (if moved?
-           (list (format "(impl Drop ~a (drop [(self (mut ~a))] (-> void) 0))" W W)
+           (list (match drop
+                   [(list f) (format "(impl Drop ~a (drop [(self (mut ~a))] (-> void) (~a self) 0))" W W (fn-name f))]
+                   [_ (format "(impl Drop ~a (drop [(self (mut ~a))] (-> void) 0))" W W)])
                  (format "(defn drop-~a [(v ~a)] (-> i64) 0)" W W))
            '())
        (list (format "(defn new-~a [~a] (-> ~a)\n  (unsafe (~a~a)))" W
@@ -436,16 +546,21 @@
      (format "(defglobal g-~a ~a ~a)" g (coil-type σ) (plain (make-Σ ds) '() e))]
     [`(defn ,f ,Ts ,params ,τr ,body)
      (define Σ (make-Σ ds Ts))
+     ;; the function a view's drop runs is given the view as Coil's drop has it
+     (define dropping (for/or ([d ds]) (match d [`(view ,V ,_ ,(== f)) V] [_ #f])))
      (define Γ (for/list ([p params]) (cons (car p) (cadr p))))
      ;; a parameter taken by value is rebound so that the body can change it
      (define rebound
        (string-append*
-        (for/list ([p params] #:unless (ref? (cadr p)))
+        (for/list ([p params] #:unless (or (ref? (cadr p)) (match (cadr p) [`(out ,_) #t] [_ #f])))
           (format "(mut ~a) ~a " (var-name (car p)) (var-name (car p))))))
-     (format "(defn ~a~a [~a] (-> ~a)\n  (let [~a] ~a))"
+     (format "(defn ~a~a [~a] (-> ~a)\n  ~a)"
              (fn-name f) (type-params Ts)
-             (string-join (for/list ([p params]) (format "(~a ~a)" (var-name (car p)) (coil-type (cadr p)))))
-             (coil-type τr) rebound (value Σ Γ body))]))
+             (string-join (for/list ([p params])
+                            (format "(~a ~a)" (var-name (car p))
+                                    (if dropping (format "(ref ~a)" (view-name dropping)) (coil-type (cadr p))))))
+             (coil-type τr)
+             (returning body (format "(let [~a] ~a)" (if dropping "" rebound) (value Σ Γ body))))]))
 
 ;; The functions of DS that cannot be written, with why: one that uses what Coil
 ;; lacks, and then any that calls one of those.
@@ -465,9 +580,20 @@
     (match prog
       [`(program ,ds ,main)
        (define Σ (make-Σ ds))
-       (parameterize ([current-decls ds])
+       (parameterize ([current-decls ds] [closure-names (make-hash)])
          (parameterize ([unwritten (find-unwritten ds)])
            (type-of Σ '() main)
+           (define decl-text
+             (string-append*
+              (for/list ([d ds] #:unless (and (eq? (car d) 'defn) (memq (cadr d) (unwritten))))
+                (define text (declaration ds d))
+                (if text (string-append text "\n") ""))))
+           (define main-text (format "(defn main [] (-> i64)\n  (let [result ~a] 0))\n" (value Σ '() main)))
+           (define closure-text
+             (string-append*
+              (for/list ([(sig n) (closure-names)])
+                (format "(deffn ~a [~a] ~a)\n(defn drop-~a [(f ~a)] (-> i64) 0)\n" n
+                        (string-join (map coil-type (car sig))) (coil-type (cadr sig)) n n))))
            (values
             (string-append
              (format "(module ~a)\n" name)
@@ -479,9 +605,8 @@
              "(import \"safe.global\" :use [defglobal with-ref with-mut Global])\n"
              "(import \"safe.par\" :use [par])\n"
              "(import \"safe.thread\" :use [spawn Task])\n"
-             (string-append*
-              (for/list ([d ds] #:unless (and (eq? (car d) 'defn) (memq (cadr d) (unwritten))))
-                (define text (declaration ds d))
-                (if text (string-append text "\n") "")))
-             (format "(defn main [] (-> i64)\n  (let [result ~a] 0))\n" (value Σ '() main)))
+             "(import \"safe.fn\" :use [deffn lambda lambda-own])\n"
+             closure-text
+             decl-text
+             main-text)
             #f)))])))

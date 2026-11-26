@@ -1,0 +1,11 @@
+;;; What a closure captured exclusively is not read while the closure is still used.
+(module bad_closure_capture_read)
+(import "safe.fn" :use [deffn lambda])
+(deffn Tick [] void)
+(defn main [] (-> i64)
+  (let [(mut n) 0
+        (mut f) (lambda Tick [(mut n)] [] (set! n (+ n 1)))]
+    (Tick::run (mut f))
+    (println "{}" n)
+    (Tick::run (mut f))
+    0))

@@ -1,0 +1,15 @@
+;;; A closure that owns what it captured runs on a thread of its own.
+(module ok_closure_thread)
+(import "safe.fn" :use [deffn lambda-own])
+(import "safe.thread" :use [spawn Task])
+(import "safe.vec" :use [Vec])
+(deffn Sum [] i64)
+(defn main [] (-> i64)
+  (let [(mut xs) (Vec::new [i64])]
+    (Vec::push! (mut xs) 3)
+    (Vec::push! (mut xs) 4)
+    (let [job (lambda-own Sum [xs] []
+                (+ (Vec::at xs 0) (Vec::at xs 1)))
+          task (spawn (Sum-own::call-once job))]
+      (println "{}" (Task::join task))
+      0)))

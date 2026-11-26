@@ -1,0 +1,169 @@
+;;; Views and subscripts the program declares.
+;;;
+;;; `(defview NAME [T…] [(FIELD TYPE)…])` declares a view: a struct whose fields
+;;; may be references, `(ref T)` or `(mut T)`, plain data, or views. `(NAME::new
+;;; FIELD…)` makes one, and it keeps what it was made from lent for as long as it
+;;; lives. `(NAME::FIELD (ref v))` lends a reference field (or a view field) as a
+;;; shared reference; `(NAME::FIELD-mut (mut v))` lends an exclusive one
+;;; exclusively. A plain field is read as `(.FIELD v)`. A view with an exclusive
+;;; reference in it is moved, never copied.
+;;;
+;;; `(defsubscript NAME [T…] [(PARAM TYPE)…] (-> (ref R) or (mut R)) BEFORE… (yield
+;;; PLACE) AFTER…)` declares a subscript: `(NAME::open ARG…)` runs BEFORE and gives
+;;; a view of PLACE, read with `(NAME::get (ref s))` and, for `(mut R)`,
+;;; `(NAME::get-mut (mut s))`. AFTER runs when the view is dropped, at the end of
+;;; its scope, with the same parameters. A parameter taken by value must be plain
+;;; data: BEFORE and AFTER each get a copy.
+;;;
+;;; The code a program writes in these (BEFORE, PLACE, AFTER) is checked as any
+;;; function is. What is generated around it follows the raw pointers the view
+;;; holds, which only it can make.
+(module safe.view)
+(export defview defsubscript)
+(import "coil.primitive" :as primitive)
+(import "safe.core" :use [unsafe lend lend-mut borrow borrow-mut View QuietDrop])
+(import "safe.fn" :use [place-of place-of-mut at at-mut])
+
+(defn name+ [(name Code) (suffix (slice u8))] (-> Code)
+  (primitive/datum->syntax name (primitive/code-symbol name suffix)))
+
+;;; A type parameter list to splice in: nothing when there are none.
+(defn tparams [(names Code)] (-> Code)
+  (if (= (len names) 0) `() `([~@names])))
+
+(defn ref-kind [(t Code)] (-> i64)
+  (cond (not (primitive/code-list? t)) 0
+        (primitive/code-eq (get t 0) `ref) 1
+        (primitive/code-eq (get t 0) `mut) 2
+        :else 0))
+
+;;; `(defview NAME [T…] [(FIELD TYPE)…])`, or without `[T…]`.
+(defn defview [(name Code) (a Code) & (rest Code)] (-> Code)
+  (let [generic (> (len rest) 0)
+        tps (if generic a `[])
+        fields (if generic (get rest 0) a)
+        self (if generic `(~name ~@tps) name)
+        (mut stored) (primitive/code-list-new)
+        (mut params) (primitive/code-list-new)
+        (mut inits) (primitive/code-list-new)
+        (mut readers) (primitive/code-list-new)
+        (mut exclusive) false
+        (mut defs) (primitive/code-list-new)]
+    (for f (iter fields)
+      (let [fname (get f 0)
+            t (get f 1)
+            kind (ref-kind t)
+            key (primitive/code-symbol ":" fname)]
+        (push! (mut params) `(~fname ~t))
+        (push! (mut inits) key)
+        (cond (= kind 0)
+                ;; plain data or a view, held in the view itself
+                (do (push! (mut stored) `(~fname ~t))
+                    (push! (mut inits) fname)
+                    (push! (mut readers)
+                           `(~fname [(v (ref ~self))] (-> (ref ~t)) (field v ~fname)))
+                    (push! (mut readers)
+                           `(~(name+ fname "-mut") [(v (mut ~self))] (-> (mut ~t)) (mut (field v ~fname)))))
+              :else
+                (let [pointee (get t 1)]
+                  (when (= kind 2) (set! exclusive true))
+                  (push! (mut stored) `(~fname (ptr ~pointee)))
+                  (push! (mut inits) (if (= kind 2) `(place-of-mut (mut ~fname)) `(place-of ~fname)))
+                  (push! (mut readers)
+                         `(~fname [(v (ref ~self))] (-> (ref ~pointee))
+                            (unsafe (at (load (field v ~fname))))))
+                  (when (= kind 2)
+                    (push! (mut readers)
+                           `(~(name+ fname "-mut") [(v (mut ~self))] (-> (mut ~pointee))
+                              (unsafe (at-mut (load (field v ~fname)))))))))))
+    (push! (mut defs)
+           (if generic `(defstruct ~name [~@tps] [~@stored]) `(defstruct ~name [~@stored])))
+    (push! (mut defs) (if generic `(impl [~@tps] View ~self) `(impl View ~self)))
+    ;; one with an exclusive reference in it is moved, and its drop uses nothing
+    (when exclusive
+      (push! (mut defs)
+             (if generic
+                 `(impl [~@tps] Drop ~self (drop [(self (mut ~self))] (-> void) 0))
+                 `(impl Drop ~self (drop [(self (mut ~self))] (-> void) 0))))
+      (push! (mut defs) (if generic `(impl [~@tps] QuietDrop ~self) `(impl QuietDrop ~self))))
+    (let [maker `(new [~@params] (-> ~self)
+                   (unsafe (~name ~@(if generic `([~@tps]) `()) ~@inits)))]
+      (push! (mut defs)
+             (if generic
+                 `(impl [~@tps] ~self ~maker ~@readers)
+                 `(impl ~self ~maker ~@readers))))
+    `(do ~@defs)))
+
+;;; `(defsubscript NAME [T…] [(PARAM TYPE)…] (-> RESULT) BEFORE… (yield PLACE) AFTER…)`,
+;;; or without `[T…]`.
+(defn defsubscript [(name Code) (a Code) (b Code) & (rest Code)] (-> Code)
+  (let [generic (primitive/code-vector? b)
+        tps (if generic a `[])
+        params (if generic b a)
+        arrow (if generic (get rest 0) b)
+        body (if generic (primitive/code-slice rest 1 (len rest)) rest)
+        result (get arrow 1)
+        kind (ref-kind result)
+        pointee (get result 1)
+        self (if generic `(~name ~@tps) name)
+        open-fn (name+ name "--open")
+        close-fn (name+ name "--close")
+        sid (primitive/fresh-identifier "self")
+        (mut at-yield) -1
+        (mut stored) (primitive/code-list-new)
+        (mut args) (primitive/code-list-new)
+        (mut inits) (primitive/code-list-new)
+        (mut close-args) (primitive/code-list-new)]
+    (unless (> kind 0)
+      (primitive/error "defsubscript: the result is (ref R) or (mut R)"))
+    (for i (range 0 (len body))
+      (let [form (get body i)]
+        (when (and (primitive/code-list? form) (> (len form) 1) (primitive/code-eq (get form 0) `yield))
+          (when (>= at-yield 0) (primitive/error "defsubscript: one (yield PLACE)"))
+          (set! at-yield i))))
+    (when (< at-yield 0) (primitive/error "defsubscript: expected a (yield PLACE)"))
+    (for p (iter params)
+      (let [pname (get p 0)
+            t (get p 1)
+            k (ref-kind t)]
+        (push! (mut inits) (primitive/code-symbol ":" pname))
+        (cond (= k 0)
+                (do (push! (mut stored) `(~pname ~t))
+                    (push! (mut args) pname)
+                    (push! (mut inits) pname)
+                    (push! (mut close-args) `(load (field ~sid ~pname))))
+              (= k 1)
+                (do (push! (mut stored) `(~pname (ptr ~(get t 1))))
+                    (push! (mut args) pname)
+                    (push! (mut inits) `(place-of ~pname))
+                    (push! (mut close-args) `(at (load (field ~sid ~pname)))))
+              :else
+                (do (push! (mut stored) `(~pname (ptr ~(get t 1))))
+                    (push! (mut args) `(mut ~pname))
+                    (push! (mut inits) `(place-of-mut (mut ~pname)))
+                    (push! (mut close-args) `(mut (at-mut (load (field ~sid ~pname)))))))))
+    (let [before (primitive/code-slice body 0 at-yield)
+          place (get (get body at-yield) 1)
+          after (primitive/code-slice body (+ at-yield 1) (len body))
+          projected (if (= kind 2)
+                        `(place-of-mut (mut (~open-fn ~@args)))
+                        `(place-of (~open-fn ~@args)))
+          readers (if (= kind 2)
+                      `((get [(s (ref ~self))] (-> (ref ~pointee)) (unsafe (at (load (field s out)))))
+                        (get-mut [(s (mut ~self))] (-> (mut ~pointee)) (unsafe (at-mut (load (field s out))))))
+                      `((get [(s (ref ~self))] (-> (ref ~pointee)) (unsafe (at (load (field s out)))))))
+          opener `(open [~@params] (-> ~self)
+                    (unsafe (~name ~@(if generic `([~@tps]) `()) ~@inits :out ~projected)))
+          dropper `(drop [(~sid (mut ~self))] (-> void)
+                     (unsafe (~close-fn ~@close-args))
+                     0)]
+      `(do
+         ;; the code the program wrote, as functions of their own
+         (defn ~open-fn ~@(tparams `(~@tps)) [~@params] ~arrow ~@before ~place)
+         (defn ~close-fn ~@(tparams `(~@tps)) [~@params] (-> void) ~@after 0)
+         ~(if generic
+              `(defstruct ~name [~@tps] [~@stored (out (ptr ~pointee))])
+              `(defstruct ~name [~@stored (out (ptr ~pointee))]))
+         ~(if generic `(impl [~@tps] View ~self) `(impl View ~self))
+         ~(if generic `(impl [~@tps] Drop ~self ~dropper) `(impl Drop ~self ~dropper))
+         ~(if generic `(impl [~@tps] ~self ~opener ~@readers) `(impl ~self ~opener ~@readers))))))

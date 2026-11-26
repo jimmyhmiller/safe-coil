@@ -1,0 +1,14 @@
+;;; `for` over a safe collection: each element by reference, or exclusively.
+(module ok_for)
+(import "safe.loop" :use [for])
+(import "safe.vec" :use [Vec])
+(defn main [] (-> i64)
+  (let [(mut xs) (Vec::new [i64])
+        (mut sum) 0]
+    (Vec::push! (mut xs) 3)
+    (Vec::push! (mut xs) 4)
+    (for (ref x) xs (set! sum (+ sum x)))
+    (for (mut x) xs (set! x (* x 10)))
+    (for i (range 0 2) (set! sum (+ sum i)))
+    (println "{} {}" sum (Vec::at xs 1))
+    0))

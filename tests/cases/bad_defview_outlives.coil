@@ -1,0 +1,7 @@
+;;; A view the program declares cannot leave the scope of what it borrows.
+(module bad_defview_outlives)
+(import "safe.view" :use [defview])
+(defview Holder [(r (ref i64))])
+(defn make [] (-> Holder)
+  (let [n 3] (Holder::new n)))
+(defn main [] (-> i64) (let [h (make)] 0))

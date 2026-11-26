@@ -1,0 +1,13 @@
+;;; What a subscript was given stays lent until the code after its yield has
+;;; run, at the end of the view's scope.
+(module bad_subscript_place_used_while_open)
+(import "safe.view" :use [defsubscript])
+(defsubscript Clamped [(x (mut i64)) (hi i64)] (-> (mut i64))
+  (yield x)
+  (when (> x hi) (set! x hi)))
+(defn main [] (-> i64)
+  (let [(mut v) 3]
+    (let [(mut c) (Clamped::open (mut v) 10)]
+      (set! (Clamped::get-mut (mut c)) 50)
+      (println "{}" v))
+    0))

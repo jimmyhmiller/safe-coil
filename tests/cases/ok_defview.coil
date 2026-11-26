@@ -1,0 +1,22 @@
+;;; A view the program declares: references, plain data and another view in it.
+(module ok_defview)
+(import "coil.primitive" :as primitive)
+(import "safe.view" :use [defview])
+(import "safe.vec" :use [Vec Slice])
+(defview Pair2 [(a (ref i64)) (b (mut i64)) (n i64)])
+(defview Window [T] [(items (Slice T)) (limit (ref i64))])
+(defn main [] (-> i64)
+  (let [one 1
+        (mut two) 2]
+    (let [(mut p) (Pair2::new one (mut two) 5)]
+      (set! (Pair2::b-mut (mut p)) (+ (Pair2::a p) (.n p)))
+      (println "{}" (Pair2::b p)))
+    (println "{}" two))
+  (let [(mut xs) (Vec::new [i64])
+        cap 2]
+    (Vec::push! (mut xs) 7)
+    (Vec::push! (mut xs) 8)
+    (let [w (Window::new (Vec::slice xs 0 2) cap)
+          s (Window::items w)]
+      (println "{} {}" (primitive/load (Slice::at s 1)) (primitive/load (Window::limit w)))))
+  0)

@@ -1,0 +1,19 @@
+;;; `for` for safe collections.
+;;;
+;;; `(for (ref NAME) XS BODY…)` and `(for (mut NAME) XS BODY…)` loop over a
+;;; collection that hands out references to its elements (`Each`, `EachMut` of
+;;; `safe.core`), as `each` and `each-mut` do: Coil's own `for` hands each element
+;;; out as a value of a type parameter, which can never be a reference. Any other
+;;; `for` is Coil's own.
+(module safe.loop)
+(import "coil.primitive" :as primitive)
+(export for)
+(import "coil.core" :as core :use *)
+(import "safe.core" :use [each each-mut])
+
+(defn for [(binding Code) (xs Code) & (body Code)] (-> Code)
+  (cond (and (primitive/code-list? binding) (= (len binding) 2) (primitive/code-eq (get binding 0) `ref))
+          `(each [~(get binding 1) ~xs] ~@body)
+        (and (primitive/code-list? binding) (= (len binding) 2) (primitive/code-eq (get binding 0) `mut))
+          `(each-mut [~(get binding 1) ~xs] ~@body)
+        :else `(core/for ~binding ~xs ~@body)))

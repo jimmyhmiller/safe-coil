@@ -1,0 +1,9 @@
+;;; A trait object cannot leave the scope of what it was made from.
+(module bad_dyn_outlives)
+(deftrait Counter [Self] (bump [(self (ptr Self))] (-> i64)))
+(defstruct Clicks [(n i64)])
+(impl Counter Clicks (bump [(self (ptr Clicks))] (-> i64) (.n self)))
+(defn pass [(c (dyn Counter))] (-> (dyn Counter)) c)
+(defn main [] (-> i64)
+  (let [d (let [(mut x) (Clicks :n 1)] (pass (mut x)))]
+    (bump d)))

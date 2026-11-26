@@ -1,0 +1,8 @@
+;;; A trait object is not stored: it would outlive what it was made from.
+(module bad_dyn_stored)
+(deftrait Counter [Self] (bump [(self (ptr Self))] (-> i64)))
+(defstruct Clicks [(n i64)])
+(impl Counter Clicks (bump [(self (ptr Clicks))] (-> i64) (.n self)))
+(defstruct Holder [(c (dyn Counter))])
+(defn keep [(c (dyn Counter))] (-> Holder) (Holder :c c))
+(defn main [] (-> i64) 0)

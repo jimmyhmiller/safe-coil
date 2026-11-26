@@ -41,6 +41,12 @@
 ;;; memory its own module follows.
 (deftrait View [Self])
 
+;;; A view whose drop does nothing with what it borrowed: it has a `Drop` only so
+;;; that naming it moves it. `(impl QuietDrop TYPE)` lets its loans end at its
+;;; last use, as a reference's do; a view without it keeps them until its scope
+;;; ends, since its drop may still use them.
+(deftrait QuietDrop [Self])
+
 ;;; A collection whose elements are reached by position: `count` of them, and
 ;;; `item` lends the one at I. An index out of range stops the program.
 (deftrait Each [Self Item]

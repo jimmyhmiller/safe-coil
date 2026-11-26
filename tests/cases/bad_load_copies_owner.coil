@@ -1,0 +1,12 @@
+;;; A load copies what it reads: for an owner, a second owner of the same thing.
+;;; Safe code moves an owner by naming a variable, and takes one out of a place
+;;; with replace!.
+(module bad_load_copies_owner)
+(import "coil.primitive" :as primitive)
+(import "safe.box" :use [Box])
+(import "safe.core" :use [borrow-mut])
+(defn main [] (-> i64)
+  (let [(mut b) (Box::new 1)
+        r (borrow-mut (mut b))]
+    (primitive/load r)
+    0))

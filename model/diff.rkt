@@ -8,7 +8,7 @@
 ;; N random programs, and OUT-DIR/verdicts.txt: one line per program,
 ;;   NAME accept|reject|reborrow   a program written out (see `verdict`)
 ;;   NAME skipped REASON       a program Coil has no way to write
-(require "rules.rkt" "cases.rkt" "search.rkt" "to-coil.rkt")
+(require "rules.rkt" "cases.rkt" "search.rkt" "to-coil.rkt" racket/pretty)
 
 ;; `reborrow`: refused only because an exclusive reference is used after it was
 ;; moved. Coil never moves one: naming it lends what it refers to again, and the
@@ -20,6 +20,9 @@
 
 (define (emit out-dir verdicts name prog)
   (define-values (text why) (program->coil prog (format "diff.~a" name)))
+  ;; the model program too, to see why the model decided as it did
+  (call-with-output-file (build-path out-dir (format "~a.model" name)) #:exists 'replace
+    (λ (out) (pretty-write prog out)))
   (cond [text
          (call-with-output-file (build-path out-dir (format "~a.coil" name)) #:exists 'replace
            (λ (out) (write-string text out)))

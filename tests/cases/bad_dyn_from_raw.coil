@@ -1,0 +1,9 @@
+;;; A trait object made from a raw pointer, which may point anywhere, needs `unsafe`.
+(module bad_dyn_from_raw)
+(import "coil.primitive" :as primitive)
+(deftrait Counter [Self] (bump [(self (ptr Self))] (-> i64)))
+(defstruct Clicks [(n i64)])
+(impl Counter Clicks (bump [(self (ptr Clicks))] (-> i64) (.n self)))
+(defn use-it [(c (dyn Counter))] (-> i64) (bump c))
+(defn main [] (-> i64)
+  (use-it (primitive/cast (ptr Clicks) 64)))

@@ -1,0 +1,24 @@
+;;; A closure that borrows: it changes what it captured exclusively and reads
+;;; what it captured shared; once it is no longer used, both are free again. A
+;;; closure that owns what it captured keeps it from one call to the next.
+(module ok_closure)
+(import "safe.fn" :use [deffn lambda lambda-own])
+(deffn Bump [(mut i64)] void)
+(deffn Count [] i64)
+(defn twice [(x (mut i64)) (f (mut Bump))] (-> void)
+  (Bump::run (mut f) (mut x))
+  (Bump::run (mut f) (mut x)))
+(defn counter [(start i64)] (-> Count-own)
+  (let [n start]
+    (lambda-own Count [n] [] (set! n (+ n 1)) n)))
+(defn main [] (-> i64)
+  (let [(mut total) 0
+        step 10
+        (mut x) 1
+        (mut f) (lambda Bump [(mut total) (ref step)] [v]
+                  (set! total (+ total v))
+                  (set! v (+ v step)))]
+    (twice (mut x) (mut f))
+    (let [(mut c) (counter 10)]
+      (println "{} {} {} {}" total x (Count-own::run (mut c)) (Count-own::run (mut c))))
+    0))

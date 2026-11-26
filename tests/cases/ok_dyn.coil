@@ -1,0 +1,23 @@
+;;; A trait object made from an exclusive borrow, and a trait whose methods
+;;; reach what they work on through `(ptr Self)` with no `unsafe`: every call
+;;; gives it an exclusive reference.
+(module ok_dyn)
+(deftrait Counter [Self]
+  (bump [(self (ptr Self))] (-> i64))
+  (twice [(self (ptr Self))] (-> i64)))
+(defstruct Clicks [(n i64)])
+(impl Counter Clicks
+  (bump [(self (ptr Clicks))] (-> i64)
+    (set! (.n self) (+ (.n self) 1))
+    (.n self))
+  (twice [(self (ptr Clicks))] (-> i64)
+    (bump self)
+    (bump self)))
+(defn use-it [(c (dyn Counter))] (-> i64)
+  (bump c)
+  (twice c))
+(defn main [] (-> i64)
+  (let [(mut c) (Clicks :n 0)]
+    (println "{}" (use-it (mut c)))
+    (println "{}" (bump (mut c)))
+    0))
