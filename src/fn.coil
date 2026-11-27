@@ -97,10 +97,10 @@
            (if generic
                `(defstruct ~name [~@tps]
                   [(c0 (ptr u8)) (c1 (ptr u8)) (c2 (ptr u8)) (c3 (ptr u8)) (user (ptr u8))
-                   (tramp (fnptr (cc/C) [(ptr ~self) ~@params] ~result))])
+                   (tramp (fnptr (cc/C) [(ptr u8) (ptr u8) (ptr u8) (ptr u8) (ptr u8) ~@params] ~result))])
                `(defstruct ~name
                   [(c0 (ptr u8)) (c1 (ptr u8)) (c2 (ptr u8)) (c3 (ptr u8)) (user (ptr u8))
-                   (tramp (fnptr (cc/C) [(ptr ~self) ~@params] ~result))])))
+                   (tramp (fnptr (cc/C) [(ptr u8) (ptr u8) (ptr u8) (ptr u8) (ptr u8) ~@params] ~result))])))
     (push! (mut defs) (if generic `(impl [~@tps] View ~self) `(impl View ~self)))
     ;; its drop does nothing, so what it borrowed is free after its last use
     (push! (mut defs) (if generic `(impl [~@tps] QuietDrop ~self) `(impl QuietDrop ~self)))
@@ -113,10 +113,10 @@
            (if generic
                `(defstruct ~own-name [~@tps]
                   [(env (ptr u8)) (user (ptr u8)) (free (fnptr (cc/C) [(ptr u8)] void))
-                   (tramp (fnptr (cc/C) [(ptr ~own-self) ~@params] ~result))])
+                   (tramp (fnptr (cc/C) [(ptr u8) (ptr u8) ~@params] ~result))])
                `(defstruct ~own-name
                   [(env (ptr u8)) (user (ptr u8)) (free (fnptr (cc/C) [(ptr u8)] void))
-                   (tramp (fnptr (cc/C) [(ptr ~own-self) ~@params] ~result))])))
+                   (tramp (fnptr (cc/C) [(ptr u8) (ptr u8) ~@params] ~result))])))
     (push! (mut defs)
            (if generic
                `(impl [~@tps] Drop ~own-self
@@ -125,10 +125,15 @@
                `(impl Drop ~own-self
                   (drop [(self (mut ~own-self))] (-> void)
                     (unsafe (let [free (load (field self free))] (free (load (field self env)))) 0)))))
+;; the trampoline is given the closure's fields, not the closure: what calls
+    ;; it then keeps no pointer to the closure, so a closure made where it is
+    ;; called stays in registers and the call is resolved and inlined
     (let [run-borrow `(run :inline (Always) [(f (mut ~self)) ~@xparams] (-> ~result)
-                        (unsafe (let [t (load (field f tramp))] (t (primitive/cast (ptr ~self) (mut f)) ~@xargs))))
+                        (unsafe (let [t (load (field f tramp))]
+                                  (t (load (field f c0)) (load (field f c1)) (load (field f c2)) (load (field f c3))
+                                     (load (field f user)) ~@xargs))))
           run-own `(run :inline (Always) [(f (mut ~own-self)) ~@xparams] (-> ~result)
-                     (unsafe (let [t (load (field f tramp))] (t (primitive/cast (ptr ~own-self) (mut f)) ~@xargs))))
+                     (unsafe (let [t (load (field f tramp))] (t (load (field f env)) (load (field f user)) ~@xargs))))
           ;; called once and freed: what `spawn` can be given
           call-once `(call-once [(f ~own-self) ~@xparams] (-> ~result)
                        (let [(mut g) f] (~(name+ own-name "::run") (mut g) ~@xargs)))]
@@ -137,6 +142,13 @@
     ;; lending a capture to a closure: the closure, and the loan the checker sees
     (push! (mut defs) `(defn ~(name+ name "--lend") :inline (Always) [~@tps C] [(f ~self) (r (ref C))] (-> ~self) f))
     (push! (mut defs) `(defn ~(name+ name "--lend-mut") :inline (Always) [~@tps C] [(f ~self) (r (mut C))] (-> ~self) f))
+;; the trampoline's parameters for the capture slots and the body, one set
+    ;; shared by every trampoline below
+    (let [cp (let [(mut out) (primitive/code-list-new)]
+               (for k (range 0 4) (push! (mut out) (primitive/fresh-identifier "capture")))
+               `(~@out))
+          up (primitive/fresh-identifier "body")
+          ep (primitive/fresh-identifier "environment")]
     ;; for each count of captures, a maker and a trampoline of each kind
     (for n (range 0 (+ (most-captures) 1))
       (let [(mut cap-types) (primitive/code-list-new)
@@ -167,7 +179,7 @@
                   (push! (mut own-params) `(~p ~t))
                   (push! (mut slot-inits) (primitive/code-symbol ":" slot))
                   (push! (mut slot-inits) `(primitive/cast (ptr u8) ~p))
-                  (push! (mut from-slots) `(primitive/cast (ptr ~t) (load (field ~sid ~slot))))
+                  (push! (mut from-slots) `(primitive/cast (ptr ~t) ~(get cp k)))
                   (push! (mut env-fields) `(~fld ~t))
                   (push! (mut env-inits) (primitive/code-symbol ":" fld))
                   (push! (mut env-inits) p)
@@ -189,9 +201,11 @@
                 (push! (mut cap-refs) (if (exclusive-at? mask k) `(mut ~t) `(ref ~t)))
                 (push! (mut cap-args) (if (exclusive-at? mask k) `(mut (at-mut ~from)) `(at ~from)))))
             (push! (mut defs)
-                   `(defn ~tramp :inline (Always) ~@(tparams `(~@tps ~@cap-types)) [(~sid (ptr ~self)) ~@xparams] (-> ~result)
+                   `(defn ~tramp :inline (Always) ~@(tparams `(~@tps ~@cap-types))
+                      [(~(get cp 0) (ptr u8)) (~(get cp 1) (ptr u8)) (~(get cp 2) (ptr u8)) (~(get cp 3) (ptr u8))
+                       (~up (ptr u8)) ~@xparams] (-> ~result)
                       (unsafe
-                        (let [code (primitive/cast (fnptr (cc/C) [~@cap-refs ~@params] ~result) (load (field ~sid user)))]
+                        (let [code (primitive/cast (fnptr (cc/C) [~@cap-refs ~@params] ~result) ~up)]
                           (code ~@cap-args ~@xargs)))))
             (push! (mut defs)
                    `(defn ~make :inline (Always) ~@(tparams `(~@tps ~@cap-types))
@@ -216,10 +230,11 @@
                         (mem/release (slice::new [~env-of] ~eid 1))
                         0))))
           (push! (mut defs)
-                 `(defn ~tramp-own :inline (Always) ~@(tparams `(~@tps ~@cap-types)) [(self (ptr ~own-self)) ~@xparams] (-> ~result)
+                 `(defn ~tramp-own :inline (Always) ~@(tparams `(~@tps ~@cap-types))
+                    [(~ep (ptr u8)) (~up (ptr u8)) ~@xparams] (-> ~result)
                     (unsafe
-                      (let [code (primitive/cast (fnptr (cc/C) [~@cap-muts ~@params] ~result) (load (field self user)))
-                            ~eid (primitive/cast (ptr ~env-of) (load (field self env)))]
+                      (let [code (primitive/cast (fnptr (cc/C) [~@cap-muts ~@params] ~result) ~up)
+                            ~eid (primitive/cast (ptr ~env-of) ~ep)]
                         (code ~@from-env ~@xargs)))))
           (push! (mut defs)
                  `(defn ~make-own :inline (Always) ~@(tparams `(~@tps ~@cap-types))
@@ -231,7 +246,7 @@
                         (~own-name ~@(if generic `([~@tps]) `()) :env (primitive/cast (ptr u8) env)
                                    :user (primitive/cast (ptr u8) code)
                                    :free ~(if (> n 0) `(primitive/fnptr-of ~free-own [~@cap-types]) `(primitive/fnptr-of ~free-own))
-                                   :tramp (primitive/fnptr-of ~tramp-own ~@(tparams `(~@tps ~@cap-types)))))))))))
+                                   :tramp (primitive/fnptr-of ~tramp-own ~@(tparams `(~@tps ~@cap-types))))))))))))
     `(do ~@defs)))
 
 ;;; A type parameter list to splice in: nothing when there are none.

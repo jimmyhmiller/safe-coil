@@ -269,15 +269,19 @@ common operations over a million elements, 200 times, built with `--release`
 | `(get v i)` | 19 ms | 18 ms |
 | `(for (ref x) v …)` | 19 ms | 397 ms (Coil's own slice `for`) |
 | element through a `Box` | 78 ms | 76 ms |
-| element through a `Pool` handle | 190 ms | 18 ms (an array index) |
-| a closure called per element | 241 ms | 19 ms (a direct call) |
+| element through a `Pool` handle | 182 ms | 19 ms (an array index) |
+| a closure called per element | 18 ms | 19 ms (a direct call) |
+| a closure given to a `fold` | 19 ms | 20 ms (a function pointer) |
 
 A bounds check is a compare and a branch: the failure is a function of its own
 that is never inlined, and the accessors are `:inline (Always)`, so the check is
 hoisted and the loop vectorized as the raw one is. A `Pool` access checks the
 handle's generation as well, and reads a slot three words wide. A closure is
-called through the function pointer its erased type holds, which the optimizer
-cannot see through: every closure of one `deffn` type is one type.
+called through function pointers, and its trampoline is given the closure's
+fields rather than the closure, so a closure made where it is called, or in a
+function inlined there, stays in registers and the call is resolved and inlined.
+One given to a higher-order function that is not inlined is an indirect call, as
+a C function pointer is.
 
 ## Programs
 

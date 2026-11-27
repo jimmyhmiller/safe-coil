@@ -10,6 +10,12 @@
 
 (deffn Step [i64 (ref i64)] i64)
 
+;;; A higher-order function the closure is given to.
+(defn fold [(xs (ref (Vec i64))) (start i64) (f (mut Step))] (-> i64)
+  (let [(mut acc) start]
+    (for i (range 0 (len xs)) (set! acc (Step::run (mut f) acc (Vec::at xs i))))
+    acc))
+
 (defn now [] (-> i64) (match (time/monotonic-now-ms) (Ok [ms] ms) (Err [_] 0)))
 
 (defn report [(name (slice u8)) (start i64) (result i64)] (-> void)
@@ -38,6 +44,10 @@
           (mut add) (lambda Step [] [acc x] (+ acc (primitive/load x)))]
       (for r (range 0 reps) (for i (range 0 n) (set! sum (Step::run (mut add) sum (Vec::at v i)))))
       (report "closure" start sum))
+    (let [start (now) (mut sum) 0
+          (mut add) (lambda Step [] [acc x] (+ acc (primitive/load x)))]
+      (for r (range 0 reps) (set! sum (fold v sum (mut add))))
+      (report "fold" start sum))
     (let [start (now) (mut sum) 0]
       (for r (range 0 reps) (for i (range 0 n) (set! sum (+ sum (primitive/load (Pool::at pool (get handles i)))))))
       (report "pool" start sum))
