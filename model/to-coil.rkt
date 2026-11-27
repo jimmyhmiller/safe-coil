@@ -33,6 +33,9 @@
 ;; that lends what it points at: `W<V>-<field>`, and `W<V>-<field>-mut` for an
 ;; exclusive one.
 (define (view-name V) (format "W~a" V))
+;; is the closure being written the value a `let` binds? Only one that a name
+;; holds can be erased, which is the type the model gives it
+(define lambda-bound (make-parameter #f))
 ;; the closure types of the program being written: (τs τr) -> its deffn name
 (define closure-names (make-parameter (make-hash)))
 (define (closure-name τs τr)
@@ -54,8 +57,9 @@
     [`(ref ,σ) (format "(ref ~a)" (coil-type σ))]
     [`(mut ,σ) (format "(mut ~a)" (coil-type σ))]
     [`(view ,V) (view-name V)]
+    ;; a closure is erased: one that borrows is a `-view`, one that owns an `-own`
     [`(fnb ,_ ,τs ,τr) (when (second-class? τr) (bail "a closure that returns a reference"))
-                      (closure-name τs τr)]
+                      (format "~a-view" (closure-name τs τr))]
     [`(fno ,τs ,τr) (when (second-class? τr) (bail "a closure that returns a reference"))
                     (format "~a-own" (closure-name τs τr))]
     [`(out ,σ) (format "(out ~a)" (coil-type σ))]
@@ -299,6 +303,13 @@
 
 (define (compound Σ Γ e)
   (match e
+    ;; a closure that borrows is a lambda of its own type, held by a name of its
+    ;; own; X is that lambda erased, so that it has the one type the model gives it
+    [`(let ([,x ,(and e1 `(lam . ,_))]) ,e2)
+     (define τ1 (type-of Σ Γ e1))
+     (format "(let [(mut ~a--lambda) ~a (mut ~a) (~a-of (mut ~a--lambda))] ~a)"
+             (var-name x) (parameterize ([lambda-bound #t]) (plain Σ Γ e1)) (var-name x) (coil-type τ1) (var-name x)
+             (value Σ (cons (cons x τ1) Γ) e2))]
     [`(let ([,x ,e1]) ,e2)
      (define τ1 (type-of Σ Γ e1))
      (format "(let [~a ~a] ~a)"
@@ -323,24 +334,26 @@
      #:when (and (second-class? τr) (bail "a closure that returns a reference"))
      ""]
     [`(lam ([,xs ,τcs ,es] ...) ((,ps ,τps) ...) ,τr ,body)
-     (format "(lambda ~a [~a] ~a)" (closure-name τps τr)
-             (string-join (for/list ([x xs] [τc τcs] [e1 es]) (capture Σ Γ x τc e1)))
-             (closure-body Σ (append (map cons xs τcs) (map cons ps τps)) ps τps body))]
+     (unless (lambda-bound) (bail "a closure that borrows, made where no name holds it"))
+     (parameterize ([lambda-bound #f])
+       (format "(lambda ~a [~a] ~a)" (closure-name τps τr)
+               (string-join (for/list ([x xs] [τc τcs] [e1 es]) (capture Σ Γ x τc e1)))
+               (closure-body Σ (append (map cons xs τcs) (map cons ps τps)) ps τps body)))]
     [`(lamo ([,xs ,τcs ,es] ...) ((,ps ,τps) ...) ,τr ,body)
-     (format "(lambda-own ~a [~a] ~a)" (closure-name τps τr)
+     (format "(~a-own-of (lambda-own ~a [~a] ~a))" (closure-name τps τr) (closure-name τps τr)
              (string-join (for/list ([x xs] [e1 es]) (format "(~a ~a)" (var-name x) (plain Σ Γ e1))))
              (closure-body Σ (append (map cons xs τcs) (map cons ps τps)) ps τps body))]
     [`(apply ,p ,es ...)
      (define-values (name τas place)
        (match (place-type Σ Γ p)
          [`(fnb ,_ ,τas ,τr) (values (closure-name τas τr) τas (written-place Σ Γ p))]
-         [`(fno ,τas ,τr) (values (format "~a-own" (closure-name τas τr)) τas (written-place Σ Γ p))]
+         [`(fno ,τas ,τr) (values (closure-name τas τr) τas (written-place Σ Γ p))]
          [_ (bail "an ill-typed program")]))
      (format "(~a::run (mut ~a)~a)" name place
              (string-append* (for/list ([τa τas] [e1 es]) (format " ~a" (argument Σ Γ τa e1)))))]
     [`(spawn-fn ,e1)
      (match (type-of Σ Γ e1)
-       [`(fno () ,σ) (format "(spawn (~a-own::call-once ~a))" (closure-name '() σ) (plain Σ Γ e1))]
+       [`(fno () ,σ) (format "(spawn (~a-call-once ~a))" (closure-name '() σ) (plain Σ Γ e1))]
        [_ (bail "an ill-typed program")])]
     [`(box ,e1) (format "(Box::new ~a)" (plain Σ Γ e1))]
     [`(unbox ,e1) (match (type-of Σ Γ e1)
@@ -624,7 +637,7 @@
            (define closure-text
              (string-append*
               (for/list ([(sig n) (closure-names)])
-                (format "(deffn ~a [~a] ~a)\n(defn drop-~a [(f ~a)] (-> i64) 0)\n" n
+                (format "(deffn ~a [~a] ~a)\n(defn drop-~a-view [(f ~a-view)] (-> i64) 0)\n" n
                         (string-join (map coil-type (car sig))) (coil-type (cadr sig)) n n))))
            (values
             (string-append

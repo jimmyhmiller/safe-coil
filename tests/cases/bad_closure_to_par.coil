@@ -1,0 +1,16 @@
+(module case.bad-closure-to-par)
+(import "coil.primitive" :as primitive)
+(import "safe.fn" :use [deffn lambda lambda-own])
+(import "safe.vec" :use [Vec])
+(import "safe.par" :use [par])
+(import "safe.core" :use [borrow])
+(deffn Get [] i64)
+;;; A closure that borrows is a view that does not cross threads, erased or not.
+(defn call-it [(f (mut Get-view))] (-> i64) (Get::run (mut f)))
+(defn nothing [] (-> i64) 0)
+(defn main [] (-> i64)
+  (let [n 4
+        (mut f) (lambda Get [(ref n)] [] n)
+        (mut e) (Get-view-of (mut f))]
+    (par (call-it (mut e)) (nothing))
+    0))

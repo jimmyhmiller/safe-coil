@@ -1,43 +1,43 @@
 ;;; Closures.
 ;;;
-;;; `(deffn NAME [T…] [PARAM-TYPE…] RESULT)` declares a closure type: a function
-;;; from the parameter types to RESULT with an environment of its own. A
-;;; parameter may be a reference, `(ref T)` or `(mut T)`; RESULT is what a
-;;; function may return.
+;;; `(deffn NAME [T…] [PARAM-TYPE…] RESULT)` declares a closure trait: what a
+;;; closure from the parameter types to RESULT can do. A parameter may be a
+;;; reference, `(ref T)` or `(mut T)`; RESULT is what a function may return.
 ;;;
-;;; `(lambda TYPE [CAPTURE…] [PARAM…] BODY…)` is a closure of TYPE that borrows
-;;; what it captures. A capture is `(ref x)` or `(mut x)`: inside BODY, `x` is
-;;; that reference. `(NAME (ref PLACE))` or `(NAME (mut PLACE))` captures any
-;;; place as NAME. The closure is a view: it keeps what it captured lent, shared
-;;; or exclusively, for as long as it lives, so it is a local, an argument or a
-;;; result and is never stored. It is moved, never copied.
+;;; `(lambda TYPE [CAPTURE…] [PARAM…] BODY…)` is a closure of the trait TYPE that
+;;; borrows what it captures. A capture is `(ref x)` or `(mut x)`: inside BODY,
+;;; `x` is that reference. `(NAME (ref PLACE))` or `(NAME (mut PLACE))` captures
+;;; any place as NAME. The closure is a view: it keeps what it captured lent,
+;;; shared or exclusively, for as long as it lives, so it is a local, an argument
+;;; or a result and is never stored. It is moved, never copied.
 ;;;
-;;; `(lambda-own TYPE [CAPTURE…] [PARAM…] BODY…)` is a closure of `(Own TYPE)`
-;;; that owns what it captures: each capture is a name, moved (or copied, for
-;;; plain data) into the closure, and inside BODY it is an exclusive reference to
-;;; the closure's own copy, which stays from one call to the next. It holds no
-;;; reference, so it can be stored, returned, and sent to another thread.
+;;; `(lambda-own TYPE [CAPTURE…] [PARAM…] BODY…)` is a closure that owns what it
+;;; captures: each capture is a name, moved (or copied, for plain data) into the
+;;; closure, and inside BODY it is an exclusive reference to the closure's own
+;;; copy, which stays from one call to the next. It holds no reference, so it can
+;;; be stored, returned, and sent to another thread.
 ;;;
-;;; `(TYPE::run (mut f) ARG…)` calls either kind; `(TYPE-own::call-once f ARG…)`
-;;; calls an owning one and frees it, so `(spawn (TYPE-own::call-once f))` runs
-;;; it on a thread of its own. PARAM names the arguments; their
-;;; types are TYPE's.
+;;; Each lambda is a type of its own, which implements TYPE: a struct of what it
+;;; captured, whose `run` is BODY. So a function generic over the closure it is
+;;; given, `[(F Step)] [(f (mut F))]`, calls `(Step::run (mut f) ARG…)` directly,
+;;; and the call is inlined as a call of a named function is. A lambda's type has
+;;; no name the program can write. Where one is kept or chosen among, it is
+;;; erased: `(Step-view-of (mut f))` is a `Step-view` that borrows `f`, and
+;;; `(Step-own-of f)` a `Step-own` that owns an owning closure on the heap. Both
+;;; implement `Step`. `(Step::call-once f ARG…)` calls a closure and drops it;
+;;; `(spawn (Step-call-once f))` runs an owning one on a thread.
 ;;;
-;;; A closure is made of a function that takes the captures' addresses, its own
-;;; address list and a trampoline that hands them over. The body is a `(fn …)` of
-;;; its own, which the checker checks as a function; the captures become
-;;; references at its start.
+;;; The `lambda` macro leaves a marker, and the transform `closures` makes the
+;;; lambda's type once the compiler knows the types of what it captures.
 (module safe.fn)
-(export deffn lambda lambda-own place-of place-of-mut at at-mut)
+(export deffn lambda lambda-own place-of place-of-mut at at-mut Cap CapMut)
 (import "coil.primitive" :as primitive)
+(import "coil.phase" :as phase)
 (import "coil.meta" :as meta)
 (import "coil.str" :use *)
 (import "coil.cc" :as cc)
-(import "safe.core" :use [unsafe lend lend-mut View QuietDrop])
+(import "safe.core" :use [unsafe lend lend-mut View QuietDrop SharedView])
 (import "safe.mem" :as mem)
-
-;;; The most a closure can capture.
-(defn most-captures [] (-> i64) 4)
 
 ;;; The address of what R refers to, as a raw pointer: a capture's place.
 (defn place-of :inline (Always) [T] [(r (ref T))] (-> (ptr T))
@@ -54,11 +54,52 @@
 (defn at-mut :inline (Always) [T] [(p (ptr T))] (-> (mut T))
   (unsafe (lend-mut (primitive/cast (ptr T) p))))
 
-;;; ---- what a closure type is made of -------------------------------------------
+;;; What a closure that owns its captures holds: VALUE, moved in. Its type is
+;;; the value's, so the compiler says what the closure holds.
+(defn owned :inline (Always) [T] [(value T)] (-> T) value)
+
+;;; What a closure borrowed shared: a view of it, lent from where it lies, so a
+;;; closure made of these is a view made of views and keeps them lent.
+(defstruct Cap [T] [(at (ptr T))])
+
+(impl [T] View (Cap T))
+
+(impl [T] SharedView (Cap T))
+
+(defn cap :inline (Always) [T] [(r (ref T))] (-> (Cap T))
+  (unsafe (Cap :at (primitive/cast (ptr T) r))))
+
+(impl [T] (Cap T)
+  ;;; What was captured, lent for as long as the capture is.
+  (get :inline (Always) [(c (ref (Cap T)))] (-> (ref T))
+    (unsafe (lend (load (field c at))))))
+
+;;; What a closure borrowed exclusively. It is moved, never copied.
+(defstruct CapMut [T] [(at (ptr T))])
+
+(impl [T] View (CapMut T))
+
+(impl [T] QuietDrop (CapMut T))
+
+(impl [T] Drop (CapMut T) (drop [(self (mut (CapMut T)))] (-> void) 0))
+
+(defn cap-mut :inline (Always) [T] [(r (mut T))] (-> (CapMut T))
+  (unsafe (CapMut :at (primitive/cast (ptr T) (mut r)))))
+
+(impl [T] (CapMut T)
+  ;;; What was captured, lent to be changed for as long as the capture is.
+  (get-mut :inline (Always) [(c (mut (CapMut T)))] (-> (mut T))
+    (unsafe (lend-mut (load (field c at))))))
+
+;;; ---- the closure trait and its erased forms -------------------------------------
 
 ;;; NAME with SUFFIX added, bound where NAME is: the user's module.
 (defn name+ [(name Code) (suffix (slice u8))] (-> Code)
   (primitive/datum->syntax name (primitive/code-symbol name suffix)))
+
+;;; A type parameter list to splice in: nothing when there are none.
+(defn tparams [(names Code)] (-> Code)
+  (if (= (len names) 0) `() `([~@names])))
 
 ;;; `(deffn NAME [T…] [PARAM-TYPE…] RESULT)`, or `(deffn NAME [PARAM-TYPE…] RESULT)`.
 (defn deffn [(name Code) (a Code) (b Code) & (rest Code)] (-> Code)
@@ -70,16 +111,17 @@
         tps (if generic a `[])
         params (if generic b a)
         result (if generic (get rest 0) b)
-        self (if generic `(~name ~@tps) name)
+        view-name (name+ name "-view")
         own-name (name+ name "-own")
+        view-self (if generic `(~view-name ~@tps) view-name)
         own-self (if generic `(~own-name ~@tps) own-name)
-        (mut defs) (primitive/code-list-new)
-        ; one name for the closure and one for its environment, shared by the pieces below
-        sid (primitive/fresh-identifier "self")
-        eid (primitive/fresh-identifier "env")
-        (mut xs) (primitive/code-list-new)
+        trait-of (if generic `(~name ~@tps) name)
         (mut xparams) (primitive/code-list-new)
-        (mut xargs) (primitive/code-list-new)]
+        (mut xargs) (primitive/code-list-new)
+        tramp (name+ name "-view--tramp")
+        own-tramp (name+ name "-own--tramp")
+        own-free (name+ name "-own--free")
+        f-type (primitive/fresh-identifier "F")]
     (unless (primitive/code-vector? params)
       (primitive/error "deffn: expected (deffn NAME [T…] [PARAM-TYPE…] RESULT)"))
     ;; as in Hylo, a closure gives back a value, never a reference into what it captured
@@ -89,256 +131,348 @@
     (for i (range 0 (len params))
       (let [x (primitive/fresh-identifier "x")
             t (get params i)]
-        (push! (mut xs) x)
         (push! (mut xparams) `(~x ~t))
         (push! (mut xargs) (if (and (primitive/code-list? t) (primitive/code-eq (get t 0) `mut)) `(mut ~x) x))))
-    ;; the borrowing closure: a view over its captures
-    (push! (mut defs)
-           (if generic
-               `(defstruct ~name [~@tps]
-                  [(c0 (ptr u8)) (c1 (ptr u8)) (c2 (ptr u8)) (c3 (ptr u8)) (user (ptr u8))
-                   (tramp (fnptr (cc/C) [(ptr u8) (ptr u8) (ptr u8) (ptr u8) (ptr u8) ~@params] ~result))])
-               `(defstruct ~name
-                  [(c0 (ptr u8)) (c1 (ptr u8)) (c2 (ptr u8)) (c3 (ptr u8)) (user (ptr u8))
-                   (tramp (fnptr (cc/C) [(ptr u8) (ptr u8) (ptr u8) (ptr u8) (ptr u8) ~@params] ~result))])))
-    (push! (mut defs) (if generic `(impl [~@tps] View ~self) `(impl View ~self)))
-    ;; its drop does nothing, so what it borrowed is free after its last use
-    (push! (mut defs) (if generic `(impl [~@tps] QuietDrop ~self) `(impl QuietDrop ~self)))
-    (push! (mut defs)
-           (if generic
-               `(impl [~@tps] Drop ~self (drop [(self (mut ~self))] (-> void) 0))
-               `(impl Drop ~self (drop [(self (mut ~self))] (-> void) 0))))
-    ;; the owning closure: its captures live on the heap, freed with it
-    (push! (mut defs)
-           (if generic
-               `(defstruct ~own-name [~@tps]
-                  [(env (ptr u8)) (user (ptr u8)) (free (fnptr (cc/C) [(ptr u8)] void))
-                   (tramp (fnptr (cc/C) [(ptr u8) (ptr u8) ~@params] ~result))])
-               `(defstruct ~own-name
-                  [(env (ptr u8)) (user (ptr u8)) (free (fnptr (cc/C) [(ptr u8)] void))
-                   (tramp (fnptr (cc/C) [(ptr u8) (ptr u8) ~@params] ~result))])))
-    (push! (mut defs)
-           (if generic
-               `(impl [~@tps] Drop ~own-self
-                  (drop [(self (mut ~own-self))] (-> void)
-                    (unsafe (let [free (load (field self free))] (free (load (field self env)))) 0)))
-               `(impl Drop ~own-self
-                  (drop [(self (mut ~own-self))] (-> void)
-                    (unsafe (let [free (load (field self free))] (free (load (field self env)))) 0)))))
-;; the trampoline is given the closure's fields, not the closure: what calls
-    ;; it then keeps no pointer to the closure, so a closure made where it is
-    ;; called stays in registers and the call is resolved and inlined
-    (let [run-borrow `(run :inline (Always) [(f (mut ~self)) ~@xparams] (-> ~result)
-                        (unsafe (let [t (load (field f tramp))]
-                                  (t (load (field f c0)) (load (field f c1)) (load (field f c2)) (load (field f c3))
-                                     (load (field f user)) ~@xargs))))
-          run-own `(run :inline (Always) [(f (mut ~own-self)) ~@xparams] (-> ~result)
-                     (unsafe (let [t (load (field f tramp))] (t (load (field f env)) (load (field f user)) ~@xargs))))
-          ;; called once and freed: what `spawn` can be given
-          call-once `(call-once [(f ~own-self) ~@xparams] (-> ~result)
-                       (let [(mut g) f] (~(name+ own-name "::run") (mut g) ~@xargs)))]
-      (push! (mut defs) (if generic `(impl [~@tps] ~self ~run-borrow) `(impl ~self ~run-borrow)))
-      (push! (mut defs) (if generic `(impl [~@tps] ~own-self ~run-own ~call-once) `(impl ~own-self ~run-own ~call-once))))
-    ;; lending a capture to a closure: the closure, and the loan the checker sees
-    (push! (mut defs) `(defn ~(name+ name "--lend") :inline (Always) [~@tps C] [(f ~self) (r (ref C))] (-> ~self) f))
-    (push! (mut defs) `(defn ~(name+ name "--lend-mut") :inline (Always) [~@tps C] [(f ~self) (r (mut C))] (-> ~self) f))
-;; the trampoline's parameters for the capture slots and the body, one set
-    ;; shared by every trampoline below
-    (let [cp (let [(mut out) (primitive/code-list-new)]
-               (for k (range 0 4) (push! (mut out) (primitive/fresh-identifier "capture")))
-               `(~@out))
-          up (primitive/fresh-identifier "body")
-          ep (primitive/fresh-identifier "environment")]
-    ;; for each count of captures, a maker and a trampoline of each kind
-    (for n (range 0 (+ (most-captures) 1))
-      (let [(mut cap-types) (primitive/code-list-new)
-            (mut cap-ptrs) (primitive/code-list-new)
-            (mut cap-muts) (primitive/code-list-new)
-            (mut cap-params) (primitive/code-list-new)
-            (mut own-params) (primitive/code-list-new)
-            (mut slot-inits) (primitive/code-list-new)
-            (mut from-slots) (primitive/code-list-new)
-            (mut env-fields) (primitive/code-list-new)
-            (mut env-inits) (primitive/code-list-new)
-            (mut from-env) (primitive/code-list-new)
-            (mut env-drops) (primitive/code-list-new)
-            env-type (name+n name "--env" n)
-            tramp-own (name+n name "--tramp-own" n)
-            make-own (name+n name "--make-own" n)
-            free-own (name+n name "--free-own" n)]
-        (for k (range 0 4)
-          (let [slot (primitive/code-symbol "c" (substr "0123" k (+ k 1)))]
-            (if (< k n)
-                (let [t (primitive/fresh-identifier "A")
-                      p (primitive/fresh-identifier "a")
-                      fld (primitive/code-symbol "e" (substr "0123" k (+ k 1)))]
-                  (push! (mut cap-types) t)
-                  (push! (mut cap-ptrs) `(ptr ~t))
-                  (push! (mut cap-muts) `(mut ~t))
-                  (push! (mut cap-params) `(~p (ptr ~t)))
-                  (push! (mut own-params) `(~p ~t))
-                  (push! (mut slot-inits) (primitive/code-symbol ":" slot))
-                  (push! (mut slot-inits) `(primitive/cast (ptr u8) ~p))
-                  (push! (mut from-slots) `(primitive/cast (ptr ~t) ~(get cp k)))
-                  (push! (mut env-fields) `(~fld ~t))
-                  (push! (mut env-inits) (primitive/code-symbol ":" fld))
-                  (push! (mut env-inits) p)
-                  (push! (mut from-env) `(mut (at-mut (field ~eid ~fld))))
-                  (push! (mut env-drops) `(let [gone (take! [~t] (field ~eid ~fld))] 0)))
-                (do (push! (mut slot-inits) (primitive/code-symbol ":" slot))
-                    (push! (mut slot-inits) `(primitive/cast (ptr u8) 0))))))
-        ;; a borrowing closure for each way of capturing: shared or exclusive,
-        ;; one capture after another. The body takes each capture as a
-        ;; reference of that kind.
-        (for mask (range 0 (shift-left 1 n))
-          (let [tramp (name+modes name "--tramp-" mask n)
-                make (name+modes name "--make-" mask n)
-                (mut cap-refs) (primitive/code-list-new)
-                (mut cap-args) (primitive/code-list-new)]
-            (for k (range 0 n)
-              (let [t (get `(~@cap-types) k)
-                    from (get `(~@from-slots) k)]
-                (push! (mut cap-refs) (if (exclusive-at? mask k) `(mut ~t) `(ref ~t)))
-                (push! (mut cap-args) (if (exclusive-at? mask k) `(mut (at-mut ~from)) `(at ~from)))))
-            (push! (mut defs)
-                   `(defn ~tramp :inline (Always) ~@(tparams `(~@tps ~@cap-types))
-                      [(~(get cp 0) (ptr u8)) (~(get cp 1) (ptr u8)) (~(get cp 2) (ptr u8)) (~(get cp 3) (ptr u8))
-                       (~up (ptr u8)) ~@xparams] (-> ~result)
-                      (unsafe
-                        (let [code (primitive/cast (fnptr (cc/C) [~@cap-refs ~@params] ~result) ~up)]
-                          (code ~@cap-args ~@xargs)))))
-            (push! (mut defs)
-                   `(defn ~make :inline (Always) ~@(tparams `(~@tps ~@cap-types))
-                      [(witness (ptr ~self)) ~@cap-params (code (fnptr (cc/C) [~@cap-refs ~@params] ~result))]
-                      (-> ~self)
-                      (unsafe
-                        (~name ~@(if generic `([~@tps]) `()) ~@slot-inits
-                               :user (primitive/cast (ptr u8) code)
-                               :tramp (primitive/fnptr-of ~tramp ~@(tparams `(~@tps ~@cap-types)))))))))
-        ;; the owning kind keeps its captures in a struct of its own on the heap
-        (push! (mut defs)
-               (if (> n 0)
-                   `(defstruct ~env-type [~@cap-types] [~@env-fields])
-                   `(defstruct ~env-type [(e0 i64)])))
-        (let [env-of (if (> n 0) `(~env-type ~@cap-types) env-type)
-              env-new (if (> n 0) `(~env-type [~@cap-types] ~@env-inits) `(~env-type :e0 0))]
-          (push! (mut defs)
-                 `(defn ~free-own ~@(tparams `(~@cap-types)) [(raw (ptr u8))] (-> void)
-                    (unsafe
-                      (let [~eid (primitive/cast (ptr ~env-of) raw)]
-                        ~@env-drops
-                        (mem/release (slice::new [~env-of] ~eid 1))
-                        0))))
-          (push! (mut defs)
-                 `(defn ~tramp-own :inline (Always) ~@(tparams `(~@tps ~@cap-types))
-                    [(~ep (ptr u8)) (~up (ptr u8)) ~@xparams] (-> ~result)
-                    (unsafe
-                      (let [code (primitive/cast (fnptr (cc/C) [~@cap-muts ~@params] ~result) ~up)
-                            ~eid (primitive/cast (ptr ~env-of) ~ep)]
-                        (code ~@from-env ~@xargs)))))
-          (push! (mut defs)
-                 `(defn ~make-own :inline (Always) ~@(tparams `(~@tps ~@cap-types))
-                    [(witness (ptr ~own-self)) ~@own-params (code (fnptr (cc/C) [~@cap-muts ~@params] ~result))]
-                    (-> ~own-self)
-                    (unsafe
-                      (let [env (data (mem/room [~env-of] 1))]
-                        (store! env ~env-new)
-                        (~own-name ~@(if generic `([~@tps]) `()) :env (primitive/cast (ptr u8) env)
-                                   :user (primitive/cast (ptr u8) code)
-                                   :free ~(if (> n 0) `(primitive/fnptr-of ~free-own [~@cap-types]) `(primitive/fnptr-of ~free-own))
-                                   :tramp (primitive/fnptr-of ~tramp-own ~@(tparams `(~@tps ~@cap-types))))))))))))
-    `(do ~@defs)))
-
-;;; A type parameter list to splice in: nothing when there are none.
-(defn tparams [(names Code)] (-> Code)
-  (if (= (len names) 0) `() `([~@names])))
-
-(defn shift-left [(x i64) (by i64)] (-> i64)
-  (let [(mut out) x]
-    (for i (range 0 by) (set! out (* out 2)))
-    out))
-
-;;; Is capture K of the way of capturing MASK exclusive?
-(defn exclusive-at? [(mask i64) (k i64)] (-> bool)
-  (= (% (/ mask (shift-left 1 k)) 2) 1))
-
-;;; NAME with PREFIX and the digit N added, bound where NAME is.
-(defn name+n [(name Code) (prefix (slice u8)) (n i64)] (-> Code)
-  (primitive/datum->syntax name (primitive/code-symbol name prefix (substr "0123456789" n (+ n 1)))))
-
-;;; NAME with PREFIX and MASK's N captures added, one letter each: `m`
-;;; exclusive, `r` shared.
-(defn name+modes [(name Code) (prefix (slice u8)) (mask i64) (n i64)] (-> Code)
-  (let [(mut sym) (primitive/code-symbol name prefix)]
-    (for k (range 0 n)
-      (set! sym (primitive/code-symbol sym (if (exclusive-at? mask k) "m" "r"))))
-    (primitive/datum->syntax name sym)))
+    `(do
+       ;; what every closure of this kind does
+       (deftrait ~name [Self ~@tps]
+         (run [(self (ptr Self)) ~@xparams] (-> ~result))
+         (call-once [(self Self) ~@xparams] (-> ~result)))
+       ;; a closure that borrows, erased: the address of the closure and the
+       ;; function that runs it. A view that keeps the closure lent exclusively.
+       (defstruct ~view-name ~@(tparams tps)
+         [(at (ptr u8)) (tramp (fnptr (cc/C) [(ptr u8) ~@params] ~result))])
+       (impl ~@(tparams tps) View ~view-self)
+       (impl ~@(tparams tps) QuietDrop ~view-self)
+       (impl ~@(tparams tps) Drop ~view-self (drop [(self (mut ~view-self))] (-> void) 0))
+       (defn ~tramp [~@tps (~f-type ~trait-of)] [(p (ptr u8)) ~@xparams] (-> ~result)
+         (unsafe (~(name+ name "::run") (primitive/cast (ptr ~f-type) p) ~@xargs)))
+       ;;; The closure F, erased: this keeps F lent exclusively while it lives.
+       (defn ~(name+ name "-view-of") [~@tps (~f-type ~trait-of)] [(f (mut ~f-type))] (-> ~view-self)
+         (unsafe (~view-name ~@(tparams tps)
+                   :at (primitive/cast (ptr u8) (mut f))
+                   :tramp (primitive/fnptr-of ~tramp [~@tps ~f-type]))))
+       (impl ~@(tparams tps) ~name ~view-self
+         (run :inline (Always) [(self (ptr ~view-self)) ~@xparams] (-> ~result)
+           (unsafe (let [t (load (field self tramp))] (t (load (field self at)) ~@xargs))))
+         (call-once [(self ~view-self) ~@xparams] (-> ~result)
+           (let [(mut g) self] (~(name+ name "::run") (mut g) ~@xargs))))
+       ;; a closure that owns, erased: the closure on the heap, the function that
+       ;; runs it and the one that drops it
+       (defstruct ~own-name ~@(tparams tps)
+         [(at (ptr u8)) (tramp (fnptr (cc/C) [(ptr u8) ~@params] ~result)) (free (fnptr (cc/C) [(ptr u8)] void))])
+       (impl ~@(tparams tps) Drop ~own-self
+         (drop [(self (mut ~own-self))] (-> void)
+           (unsafe (let [free (load (field self free))] (free (load (field self at)))) 0)))
+       (defn ~own-free [~@tps (~f-type ~trait-of)] [(p (ptr u8))] (-> void)
+         (unsafe
+           (let [at (primitive/cast (ptr ~f-type) p)
+                 gone (take! [~f-type] at)]
+             (mem/release (slice::new [~f-type] at 1))
+             0)))
+       ;;; Call the closure F once and drop it: an ordinary function, so that a
+       ;;; pointer can be taken to it, as `(spawn (NAME-call-once f))` does.
+       (defn ~(name+ name "-call-once") [~@tps (~f-type ~trait-of)] [(f ~f-type) ~@xparams] (-> ~result)
+         (~(name+ name "::call-once") f ~@xargs))
+       ;;; The owning closure F, erased, on the heap.
+       (defn ~(name+ name "-own-of") [~@tps (~f-type ~trait-of)] [(f ~f-type)] (-> ~own-self)
+         (unsafe
+           (let [at (data (mem/room [~f-type] 1))]
+             (store! at f)
+             (~own-name ~@(tparams tps)
+               :at (primitive/cast (ptr u8) at)
+               :tramp (primitive/fnptr-of ~tramp [~@tps ~f-type])
+               :free (primitive/fnptr-of ~own-free [~@tps ~f-type])))))
+       (impl ~@(tparams tps) ~name ~own-self
+         (run :inline (Always) [(self (ptr ~own-self)) ~@xparams] (-> ~result)
+           (unsafe (let [t (load (field self tramp))] (t (load (field self at)) ~@xargs))))
+         (call-once [(self ~own-self) ~@xparams] (-> ~result)
+           (let [(mut g) self] (~(name+ name "::run") (mut g) ~@xargs)))))))
 
 ;;; ---- making one -----------------------------------------------------------------
 
-;;; The closure type TYPE names, and its own name: `(Visit i64)` is `Visit`.
+;;; The closure trait TYPE names, and its own name: `(Visit i64)` is `Visit`.
 (defn type-head [(type Code)] (-> Code)
   (if (primitive/code-list? type) (get type 0) type))
 
 ;;; `(lambda TYPE [CAPTURE…] [PARAM…] BODY…)`
 (defn lambda [(type Code) (captures Code) (params Code) & (body Code)] (-> Code)
-  (make-closure type captures params body false))
+  (closure-marker type captures params body false))
 
 ;;; `(lambda-own TYPE [CAPTURE…] [PARAM…] BODY…)`
 (defn lambda-own [(type Code) (captures Code) (params Code) & (body Code)] (-> Code)
-  (make-closure type captures params body true))
+  (closure-marker type captures params body true))
 
-(defn make-closure [(type Code) (captures Code) (params Code) (body Code) (own bool)] (-> Code)
+;;; `(closure-site [TYPE-view] OWN CAPTURE… (fn [NAME… PARAM…] BODY…))`: what the
+;;; transform needs, in a form the compiler resolves and types as far as it can.
+;;; The erased view type stands for the trait, since a trait is no type. Each
+;;; capture is what the closure will hold: `(cap x)` or `(cap-mut (mut x))`, or
+;;; for an owning closure `(owned x)`, the value moved in. `closure-site` is defined nowhere:
+;;; the transform replaces every one.
+(defn closure-marker [(type Code) (captures Code) (params Code) (body Code) (own bool)] (-> Code)
   (unless (and (primitive/code-vector? captures) (primitive/code-vector? params))
     (primitive/error "lambda: expected (lambda TYPE [CAPTURE…] [PARAM…] BODY…)"))
-  (when (> (len captures) (most-captures))
-    (primitive/error "lambda: a closure captures at most four things"))
   (let [head (type-head type)
-        n (len captures)
-        self (if own
-                 (if (primitive/code-list? type)
-                     `(~(name+ head "-own") ~@(primitive/code-slice type 1 (len type)))
-                     (name+ head "-own"))
-                 type)
-        (mut mask) 0
-        (mut addresses) (primitive/code-list-new)
-        (mut names) (primitive/code-list-new)
-        (mut lends) (primitive/code-list-new)]
-    (for i (range 0 n)
-      (let [c (get captures i)]
-        (if own
-            ;; NAME, moved in; or (NAME VALUE)
-            (cond (primitive/code-sym? c)
-                    (do (push! (mut addresses) c)
-                        (push! (mut names) c))
-                  (and (primitive/code-list? c) (= (len c) 2) (primitive/code-sym? (get c 0)))
-                    (do (push! (mut addresses) (get c 1))
-                        (push! (mut names) (get c 0)))
-                  :else (primitive/error "lambda-own: a capture is NAME or (NAME VALUE), moved into the closure"))
-            ;; (ref NAME), (mut NAME), or (NAME (ref PLACE)), (NAME (mut PLACE))
-            (let [named (and (primitive/code-list? c) (= (len c) 2) (primitive/code-sym? (get c 0))
-                             (primitive/code-list? (get c 1)))
-                  borrow (if named (get c 1) c)]
-              (unless (and (primitive/code-list? borrow) (= (len borrow) 2)
-                           (or (primitive/code-eq (get borrow 0) `ref) (primitive/code-eq (get borrow 0) `mut))
-                           (or named (primitive/code-sym? (get borrow 1))))
-                (primitive/error "lambda: a capture is (ref NAME), (mut NAME), (NAME (ref PLACE)) or (NAME (mut PLACE))"))
-              (let [excl (primitive/code-eq (get borrow 0) `mut)
-                    place (get borrow 1)]
-                (when excl (set! mask (+ mask (shift-left 1 i))))
-                (push! (mut addresses) (if excl `(place-of-mut (mut ~place)) `(place-of ~place)))
-                (push! (mut names) (if named (get c 0) place))
-                (push! (mut lends) (if excl `(mut ~place) place)))))))
-    (let [make (if own (name+n head "--make-own" n) (name+modes head "--make-" mask n))
-          ; the body takes each capture as a parameter of the name it was captured by
-          code `(fn [~@names ~@params] ~@body)
-          witness `(primitive/cast (ptr ~self) 0)]
+        witness (if (primitive/code-list? type)
+                    `(~(name+ head "-view") ~@(primitive/code-slice type 1 (len type)))
+                    (name+ head "-view"))
+        (mut values) (primitive/code-list-new)
+        (mut names) (primitive/code-list-new)]
+    (for c (iter captures)
       (if own
-          ;; each capture is moved to the maker, which moves it on to the heap
-          `(~make ~witness ~@addresses ~code)
-          (let [(mut made) `(~make ~witness ~@addresses ~code)
-                lent `(~@lends)]
-            (for i (range 0 n)
-              (let [lend-fn (if (exclusive-at? mask i) (name+ head "--lend-mut") (name+ head "--lend"))]
-                (set! made `(~lend-fn ~made ~(get lent i)))))
-            made)))))
+          ;; NAME, moved in; or (NAME VALUE)
+          (cond (primitive/code-sym? c)
+                  (do (push! (mut values) `(owned ~c)) (push! (mut names) c))
+                (and (primitive/code-list? c) (= (len c) 2) (primitive/code-sym? (get c 0)))
+                  (do (push! (mut values) `(owned ~(get c 1))) (push! (mut names) (get c 0)))
+                :else (primitive/error "lambda-own: a capture is NAME or (NAME VALUE), moved into the closure"))
+          ;; (ref NAME), (mut NAME), or (NAME (ref PLACE)), (NAME (mut PLACE))
+          (let [named (and (primitive/code-list? c) (= (len c) 2) (primitive/code-sym? (get c 0))
+                           (primitive/code-list? (get c 1)))
+                borrow (if named (get c 1) c)]
+            (unless (and (primitive/code-list? borrow) (= (len borrow) 2)
+                         (or (primitive/code-eq (get borrow 0) `ref) (primitive/code-eq (get borrow 0) `mut))
+                         (or named (primitive/code-sym? (get borrow 1))))
+              (primitive/error "lambda: a capture is (ref NAME), (mut NAME), (NAME (ref PLACE)) or (NAME (mut PLACE))"))
+            (let [place (get borrow 1)]
+              (push! (mut values) (if (primitive/code-eq (get borrow 0) `mut)
+                                      `(cap-mut (mut ~place))
+                                      `(cap ~place)))
+              (push! (mut names) (if named (get c 0) place))))))
+    `(closure-site [~witness] ~(if own `true `false) ~@values (fn [~@names ~@params] ~@body))))
+
+;;; ---- the transform --------------------------------------------------------------
+
+(defn head-named? [(f Code) (text (slice u8))] (-> bool)
+  (and (primitive/code-list? f) (> (len f) 0) (primitive/code-sym? (get f 0))
+       (= (meta/source (get f 0)) text)))
+
+(defn marker? [(f Code)] (-> bool)
+  (and (head-named? f "closure-site") (>= (len f) 4) (primitive/code-vector? (get f 1))
+       (match (primitive/code-macro-of f)
+         (primitive/ExpandedBy [q] (or (primitive/code-eq q `safe.fn.lambda)
+                                       (primitive/code-eq q `safe.fn.lambda-own)))
+         (_ false))))
+
+;;; A template, which a macro or this transform fills in: nothing in it is code
+;;; yet, so no marker in it is one.
+(defn template? [(f Code)] (-> bool)
+  (head-named? f "quasiquote"))
+
+;;; The type parameters a definition form introduces: the names in a vector
+;;; written before its parameters, `[T (U Bound)]`.
+(defn introduced-tparams [(form Code)] (-> Code)
+  (let [(mut out) (primitive/code-list-new)]
+    (when (and (primitive/code-list? form) (> (len form) 0) (primitive/code-sym? (get form 0))
+               (or (head-named? form "defn") (head-named? form "defn*") (head-named? form "impl")))
+      (let [arrow (block :found
+                    (for [i 0 (len form)]
+                      (when (and (primitive/code-list? (get form i)) (head-named? (get form i) "->"))
+                        (return-from :found i)))
+                    (len form))]
+        ;; every vector before the parameter vector names type parameters
+        (for [i 1 (- arrow 1)]
+          (let [part (get form i)]
+            (when (primitive/code-vector? part)
+              (for p (iter part)
+                (cond (primitive/code-sym? p) (push! (mut out) p)
+                      (and (primitive/code-list? p) (> (len p) 0) (primitive/code-sym? (get p 0)))
+                        (push! (mut out) (get p 0))
+                      :else 0)))))))
+    `(~@out)))
+
+(defn mentions? [(tree Code) (sym Code)] (-> bool)
+  (cond (primitive/code-sym? tree) (primitive/code-eq tree sym)
+        (or (primitive/code-list? tree) (primitive/code-vector? tree))
+          (block :found
+            (for k (iter tree) (when (mentions? k sym) (return-from :found true)))
+            false)
+        :else false))
+
+(defn type-of-or-fail [(node Code) (what (slice u8))] (-> Code)
+  (match (primitive/type-of node)
+    (primitive/TypeIs [t] t)
+    (_ (do (primitive/report node (text3 "lambda: the type of " what " is not known; a closure captures a place whose type the compiler has settled"))
+           `unknown))))
+
+;; The transform's text: Coil's own string buffers, which take raw memory.
+(defn text3 [(a (slice u8)) (b (slice u8)) (c (slice u8))] (-> (slice u8))
+  (unsafe
+    (let [(mut sb) (StrBuf::new (meta/expansion-allocator))]
+      (push-str! (mut sb) a)
+      (push-str! (mut sb) b)
+      (push-str! (mut sb) c)
+      (str sb))))
+
+;;; What the transform carries through a module: the forms it adds, and how
+;;; many lambdas it has made.
+(defstruct Made [(defs Code) (count i64)])
+
+;;; The lambda at the marker F, inside definitions whose type parameters are
+;;; SCOPE, made a type of its own in MODULE. -> what replaces the marker.
+(defn make-lambda [(f Code) (scope Code) (module Code) (made (mut Made))] (-> Code)
+  (let [witness (get (get f 1) 0)
+        own (primitive/code-eq (get f 2) `true)
+        code (get f (- (len f) 1))
+        values (primitive/code-slice f 3 (- (len f) 1))
+        n (len values)
+        binders (get code 1)
+        names (primitive/code-slice binders 0 n)
+        params (primitive/code-slice binders n (len binders))
+        body (primitive/code-slice code 2 (len code))
+        view-head (if (primitive/code-list? witness) (get witness 0) witness)
+        view-text (meta/source view-head)
+        trait-head (primitive/datum->syntax view-head
+                                            (primitive/code-symbol (substr view-text 0 (- (len view-text) 5))))
+        ; the closure's parameter and result types, from its erased form's
+        ; function pointer: `(fnptr CC [(ptr u8) PARAM…] RESULT)`
+        tramp-type (primitive/code-field-type witness 1)
+        ptypes (primitive/code-slice (get tramp-type 2) 1 (len (get tramp-type 2)))
+        result (get tramp-type 3)
+        (mut ctypes) (primitive/code-list-new)]
+    (when (!= (len params) (len ptypes))
+      (primitive/report f "lambda: the closure takes as many parameters as its type says"))
+    (for v (iter values)
+      (let [t (type-of-or-fail v "a capture")]
+        ;; a borrowed capture is a `(Cap T)` or a `(CapMut T)`, an owned one the
+        ;; value `(owned x)` moves in
+        (push! (mut ctypes) t)))
+    (let [ctypes `(~@ctypes)
+          name (primitive/datum->syntax (get module 0)
+                                        (primitive/code-symbol trait-head "--lambda" (int-text (.count made))))
+          ; the type parameters of the enclosing definitions this lambda uses
+          tps (let [(mut out) (primitive/code-list-new)]
+                (for t (iter scope)
+                  (when (or (mentions? ctypes t) (mentions? ptypes t) (mentions? result t)
+                            (mentions? `(~@body) t) (mentions? witness t))
+                    (push! (mut out) t)))
+                `(~@out))
+          self (if (> (len tps) 0) `(~name ~@tps) name)
+          sid (primitive/fresh-identifier "self")
+          (mut fields) (primitive/code-list-new)
+          (mut inits) (primitive/code-list-new)
+          (mut binds) (primitive/code-list-new)
+          (mut run-params) (primitive/code-list-new)
+          (mut run-args) (primitive/code-list-new)]
+      ;; The language's own words in what is generated are spelled in the
+      ;; program's module, as the program would write them; what names this
+      ;; library (`Cap::get`, `View`) keeps the template's, which reaches it.
+      (let [k-mut (in-module module "mut") k-ptr (in-module module "ptr") k-field (in-module module "field") k-let (in-module module "let*") k-arrow (in-module module "->")
+            k-impl (in-module module "impl") k-defstruct (in-module module "defstruct") k-void (in-module module "void") k-drop-trait (in-module module "Drop")]
+      (for k (range 0 n)
+        (let [fld (primitive/code-symbol "c" (int-text k))
+              t (get ctypes k)
+              v (get values k)
+              excl (head-named? v "cap-mut")]
+          (push! (mut fields) `(~fld ~t))
+          (push! (mut inits) (primitive/code-symbol ":" fld))
+          (push! (mut inits) v)
+          ;; an owned capture's name aliases the closure's own copy
+          (push! (mut binds) (if own `(~k-mut ~(get names k)) (get names k)))
+          ;; inside BODY each capture is a reference: to the closure's own copy,
+          ;; or to what it borrowed
+          (push! (mut binds)
+                 (cond own `(~k-mut (~(in-module module (meta/source (primitive/code-symbol "." fld))) ~sid))
+                       excl `(CapMut::get-mut (~k-mut (~k-field ~sid ~fld)))
+                       :else `(Cap::get (~k-field ~sid ~fld))))))
+      (for k (range 0 (len params))
+        (let [p (get params k) t (get ptypes k)]
+          (push! (mut run-params) `(~p ~t))
+          (push! (mut run-args) (if (head-named? t "mut") `(~k-mut ~p) p))))
+      (let [gid (primitive/fresh-identifier "g")
+            impl-tps (tparams tps)
+            ;; what a transform gives back is never expanded again: core forms only
+            run `(run :inline (Always) [(~sid (~k-ptr ~self)) ~@run-params] (~k-arrow ~result)
+                   (~k-let [~@binds] ~@body))
+            once `(call-once [(~sid ~self) ~@run-params] (~k-arrow ~result)
+                    (~k-let [(~k-mut ~gid) ~sid] (~(primitive/datum->syntax trait-head (primitive/code-symbol trait-head "::run")) (~k-mut ~gid) ~@run-args)))
+            drop-self (primitive/fresh-identifier "self")
+            (mut defs) (primitive/code-list-new)]
+        (push! (mut defs) `(~k-defstruct ~name ~@impl-tps [~@fields]))
+        (unless own
+          (push! (mut defs) `(~k-impl ~@impl-tps View ~self))
+          (push! (mut defs) `(~k-impl ~@impl-tps QuietDrop ~self))
+          (push! (mut defs) `(~k-impl ~@impl-tps ~k-drop-trait ~self
+                               (~(in-module module "drop") [(~drop-self (~k-mut ~self))] (~k-arrow ~k-void) 0))))
+        (push! (mut defs) `(~k-impl ~@impl-tps ~trait-head ~self ~run ~once))
+        ;; each form is the lambda's: written where the lambda is, so it is the
+        ;; program's code to a checker, and a diagnostic about it points there
+        (let [(mut placed) (primitive/code-list-new)]
+          (for d (iter `(~@defs)) (push! (mut placed) (primitive/code-list-like f d)))
+          (set! (.defs made) `(~@(.defs made) ~@placed)))
+        (set! (.count made) (+ (.count made) 1))
+        ;; a borrowing closure is a view built from the views of its captures,
+        ;; so it keeps each of them lent, as a reference to it would
+        `(~name ~@impl-tps ~@inits))))))
+
+;;; The word TEXT as the module record MODULE's own code would spell it.
+(defn in-module [(module Code) (text (slice u8))] (-> Code)
+  (primitive/datum->syntax (get module 0) (primitive/code-symbol text)))
+
+;;; N, not negative, in decimal.
+(defn int-text [(n i64)] (-> (slice u8))
+  (unsafe
+    (let [(mut sb) (StrBuf::new (meta/expansion-allocator))]
+      (push-digits! (mut sb) n)
+      (str sb))))
+
+(defn push-digits! [(sb (mut StrBuf)) (n i64)] (-> void)
+  (unsafe
+    (when (>= n 10) (push-digits! (mut sb) (/ n 10)))
+    (let [d (% n 10)]
+      (push-str! (mut sb) (substr "0123456789" d (+ d 1))))
+    0))
+
+;;; F with every marker in it replaced, inside definitions whose type
+;;; parameters are SCOPE.
+(defn rewrite [(f Code) (scope Code) (module Code) (made (mut Made))] (-> Code)
+  (cond (marker? f) (make-lambda f scope module (mut made))
+        (template? f) f
+        (or (primitive/code-list? f) (primitive/code-vector? f))
+          (if (has-marker? f)
+              (let [inner `(~@scope ~@(introduced-tparams f))
+                    (mut kids) (primitive/code-list-new)]
+                (for k (iter f) (push! (mut kids) (rewrite k inner module (mut made))))
+                (primitive/code-list-like f `(~@kids)))
+              f)
+        :else f))
+
+(defn has-marker? [(f Code)] (-> bool)
+  (cond (marker? f) true
+        (template? f) false
+        (or (primitive/code-list? f) (primitive/code-vector? f))
+          (block :found
+            (for k (iter f) (when (has-marker? k) (return-from :found true)))
+            false)
+        :else false))
+
+;;; Give each lambda in the program a type of its own. A module's lambdas are
+;;; made in the order they are written; the names of their types count up from
+;;; how many that module already has.
+(defn closures [(modules Code)] (-> Code)
+  (let [(mut out) (primitive/code-list-new)]
+    (for m (iter modules)
+      (if (has-marker? m)
+          (let [(mut made) (Made :defs `() :count (lambdas-in m))
+                r (rewrite m `() m (mut made))]
+            (push! (mut out) `(~@r ~@(.defs made))))
+          (push! (mut out) m)))
+    `(~@out)))
+
+;;; How many lambda types the module already has: forms `(defstruct X--lambdaN …)`.
+(defn lambdas-in [(m Code)] (-> i64)
+  (let [(mut n) 0]
+    (for f (iter m)
+      (when (and (head-named? f "defstruct") (> (len f) 1) (primitive/code-sym? (get f 1))
+                 (contains? (meta/source (get f 1)) "--lambda"))
+        (set! n (+ n 1))))
+    n))
+
+(defn contains? [(text (slice u8)) (part (slice u8))] (-> bool)
+  (unsafe
+    (block :found
+      (for [i 0 (+ (- (len text) (len part)) 1)]
+        (when (= (substr text i (+ i (len part))) part) (return-from :found true)))
+      false)))
+
+(transform closures :modules (phase/OwnModules))

@@ -1,0 +1,16 @@
+;;; A view lent to a generic function that is not about closures stays out of it:
+;;; that function may move it out and store it, and the list it came from is no
+;;; longer lent while the copy lives.
+(module case.bad-view-generic-reference)
+(import "coil.primitive" :as primitive)
+(import "safe.vec" :use [Vec Slice])
+(defn stash [T] [(x (mut T)) (out (mut (Vec T)))] (-> void)
+  (Vec::push! (mut out) (take! (mut x)))
+  0)
+(defn main [] (-> i64)
+  (let [(mut v) (Vec::new [i64])]
+    (Vec::push! (mut v) 1)
+    (let [(mut s) (Vec::slice v 0 1)
+          (mut keep) (Vec::new [(Slice i64)])]
+      (stash (mut s) (mut keep))
+      0)))

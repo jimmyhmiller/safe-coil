@@ -1,0 +1,11 @@
+(module case.bad-closure-erased-outlives)
+(import "coil.primitive" :as primitive)
+(import "safe.fn" :use [deffn lambda lambda-own])
+(import "safe.vec" :use [Vec])
+(import "safe.par" :use [par])
+(import "safe.core" :use [borrow])
+(deffn Get [] i64)
+;;; An erased closure keeps the closure lent: it does not outlive it.
+(defn main [] (-> i64)
+  (let [(mut e) (let [n 4 (mut f) (lambda Get [(ref n)] [] n)] (Get-view-of (mut f)))]
+    (Get::run (mut e))))

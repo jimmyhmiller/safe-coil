@@ -5,12 +5,12 @@
 (import "safe.fn" :use [deffn lambda lambda-own])
 (deffn Bump [(mut i64)] void)
 (deffn Count [] i64)
-(defn twice [(x (mut i64)) (f (mut Bump))] (-> void)
+(defn twice [(F Bump)] [(x (mut i64)) (f (mut F))] (-> void)
   (Bump::run (mut f) (mut x))
   (Bump::run (mut f) (mut x)))
 (defn counter [(start i64)] (-> Count-own)
   (let [n start]
-    (lambda-own Count [n] [] (set! n (+ n 1)) n)))
+    (Count-own-of (lambda-own Count [n] [] (set! n (+ n 1)) n))))
 (defn main [] (-> i64)
   (let [(mut total) 0
         step 10
@@ -20,5 +20,5 @@
                   (set! v (+ v step)))]
     (twice (mut x) (mut f))
     (let [(mut c) (counter 10)]
-      (println "{} {} {} {}" total x (Count-own::run (mut c)) (Count-own::run (mut c))))
+      (println "{} {} {} {}" total x (Count::run (mut c)) (Count::run (mut c))))
     0))

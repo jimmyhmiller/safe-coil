@@ -112,12 +112,21 @@ adds the rest of the model:
   into the view it returns, which then holds `x`'s loans. The checker cannot see
   where `x` goes, so such a function's whole body is one `(unsafe …)`.
   `BoxIn::in-arena` is one: it is how a tree's nodes are put in an arena.
-- **Closures.** A closure that borrows (`safe.fn`'s `lambda`) is a view over
-  what it captured: it keeps each capture lent, shared or exclusively, until
-  its last use, and is moved, never copied. Its body is a function of its own
-  whose captures are reference parameters, checked as any function is. A
-  closure that owns what it captured (`lambda-own`) holds no reference, so it can
-  be stored, returned and sent to another thread.
+- **Closures.** Each lambda is a type of its own: a struct of what it
+  captured, implementing the closure trait `deffn` declared, whose `run` is the
+  lambda's body, checked as any method is. One that borrows (`lambda`) is a view
+  built from a view of each capture, so it keeps each lent, shared or
+  exclusively, until its last use, and is moved, never copied. One that owns
+  what it captured (`lambda-own`) holds no reference, so it can be stored,
+  returned and sent to another thread.
+- **Closures given to generic code.** A type parameter bounded by a closure
+  trait, `[(F Step)]`, stands for a closure that may borrow, so inside the
+  function it is used as a view is: called and passed on, never stored, assigned
+  or moved out of where it lies. A closure of that trait, a view, may then be
+  lent to the function's `(mut F)` or `(ref F)` parameter, as it may not be lent
+  to any other type parameter. Without the first rule a generic function could
+  swap two closures of one lambda, each then holding captures lent to the other's
+  name.
 - **What a view type says.** Only the module that declares a view may say of it:
   `QuietDrop`, its drop uses nothing it borrowed, so its loans end at its last
   use; `SharedView`, it gives only shared access, so it may be copied even when
@@ -177,7 +186,7 @@ operations are allowed.
 | `safe.core` | `unsafe`; `borrow` and `borrow-mut`, a reference as a value; `replace!`, which swaps an owner out of a place; `move`; `each` and `each-mut`, a loop over a list, a slice or a string; `size` and `nth`, a `(slice T)` read with every index checked; the traits `View`, `QuietDrop`, `SharedView`, `CrossThread` and `OneThread`; the annotations `:safe/borrows` and `:safe/keeps` |
 | `safe.alloc` | Where collections get memory. `Heap`, the heap, of no size; `Lease`, any Coil allocator by lease: `Lease::heap`, and `Lease::assume` of a raw `AllocatorLease` inside `unsafe`; `Arena`, an owner that hands out memory by bumping a pointer and gives it all back at once: `Arena::new`, `with-room`, `reset!`, `live`, `reserved`, and `lend`, an `ArenaRef`. The traits `Alloc`, and `InArena`, a collection in an arena, which drops nothing it holds |
 | `safe.loop` | `(for (ref x) xs …)` and `(for (mut x) xs …)` over a safe collection, each element by reference; any other `for` is Coil's |
-| `safe.fn` | `(deffn NAME [T…] [PARAM-TYPE…] RESULT)` declares a closure type; `(lambda NAME [(ref x) (mut y) (z (ref PLACE))…] [params…] body…)` makes one that borrows what it captures, `(lambda-own NAME [x (y VALUE)…] [params…] body…)` one of `NAME-own` that owns them; `(NAME::run (mut f) args…)` calls either; `(NAME-own::call-once f args…)` calls one and frees it, so `(spawn (NAME-own::call-once f))` runs it on a thread |
+| `safe.fn` | `(deffn NAME [T…] [PARAM-TYPE…] RESULT)` declares a closure trait; `(lambda NAME [(ref x) (mut y) (z (ref PLACE))…] [params…] body…)` makes a closure of its own type that borrows what it captures, `(lambda-own NAME [x (y VALUE)…] [params…] body…)` one that owns them; `(NAME::run (mut f) args…)` calls either and `(NAME::call-once f args…)` calls one and drops it. A function takes a closure as `[(F NAME)] [(f (mut F))]`, so the call is direct. Erased, for keeping or choosing among closures: `(NAME-view-of (mut f))` is a `NAME-view` that borrows `f`; `(NAME-own-of f)` puts an owning closure on the heap as a `NAME-own`; both implement `NAME`. `(spawn (NAME-call-once f))` runs an owning closure on a thread |
 | `safe.view` | `(defview NAME [T…] [(field TYPE)…])`, a view whose fields may be references or views: `NAME::new`, `NAME::field`, `NAME::field-mut`. `(defsubscript NAME [T…] [params…] (-> (ref R) or (mut R)) before… (yield PLACE) after…)`: `NAME::open` runs `before` and gives a view of `PLACE`, read with `NAME::get` and `NAME::get-mut`; `after` runs when the view is dropped |
 | `safe.box` | `(Box T)`, an owner of one heap value: `Box::new`, `get`, `get-mut`, `into`. `(BoxIn T A)` is one in memory from the allocator A, with the same methods: `BoxIn::new-in [T A] value a` for the heap or a lease, `(BoxIn::in-arena [T] arena value)` for an arena. `(Box T)` is a `(BoxIn T Heap)` and one pointer wide |
 | `safe.own` | `(own Trait value)` makes an `(Own (dyn Trait))`, an owned trait object: a value of any type that implements the trait, on the heap, dropped as its own type drops. `(Own::get-mut (mut o))` lends the `(dyn Trait)` |
@@ -222,10 +231,10 @@ each turn, so the body cannot add to it or take from it. With `safe.loop`,
 ### Closures
 
 ```coil
-(deffn Bump [(mut i64)] void)           ; a closure type: takes (mut i64), gives nothing
+(deffn Bump [(mut i64)] void)           ; a closure trait: takes (mut i64), gives nothing
 
-(defn twice [(x (mut i64)) (f (mut Bump))] (-> void)
-  (Bump::run (mut f) (mut x))
+(defn twice [(F Bump)] [(x (mut i64)) (f (mut F))] (-> void)
+  (Bump::run (mut f) (mut x))           ; a direct call of f's own `run`
   (Bump::run (mut f) (mut x)))
 
 (let [(mut total) 0
@@ -241,9 +250,16 @@ each turn, so the body cannot add to it or take from it. With `safe.loop`,
 Inside the body, `total` is an exclusive reference and `step` a shared one; the
 closure keeps `total` lent exclusively and `step` shared until its last use.
 `lambda-own` captures by moving: `(lambda-own Count [n] [] (set! n (+ n 1)) n)`
-is a counter that can be returned, stored, or given to `spawn` through
-`Count-own::call-once`. A closure gives back a value, never a reference into
-what it captured.
+is a counter that can be stored or given to `spawn` through `Count-call-once`;
+it is returned from a function erased, as a `Count-own`, since the lambda's own
+type has no name a function can declare. A closure gives back a value, never a
+reference into what it captured.
+
+`lambda` leaves a marker that `safe.fn`'s transform replaces, once the compiler
+has typed what the lambda captures, with the lambda's type and its
+construction: the struct of captures and its impl of the trait are written in
+the program's module, where the lambda is, so the checker checks the body
+there and a diagnostic about it points at the lambda.
 
 ### Views and subscripts
 
@@ -325,19 +341,19 @@ common operations over a million elements, 200 times, built with `--release`
 | element through a `Box` | 77 ms | 79 ms |
 | element through a `Pool` handle | 186 ms | 19 ms (an array index) |
 | a closure called per element | 18 ms | 19 ms (a direct call) |
-| a closure given to a `fold` | 18 ms | 18 ms (a function pointer) |
+| a closure given to a generic `fold` | 18 ms | 18 ms (a function pointer) |
+| the closure erased, to a `fold` that is not inlined | 182 ms | 19 ms (a function pointer the optimizer still follows) |
 | a list of 10,000 nodes built, summed and freed, 1,000 times: on the heap | 288 ms | 236 ms (malloc and free) |
 | the same in an `Arena`, reset each time | 119 ms | 110 ms (a bump allocator) |
 
 A bounds check is a compare and a branch: the failure is a function of its own
 that is never inlined, and the accessors are `:inline (Always)`, so the check is
 hoisted and the loop vectorized as the raw one is. A `Pool` access checks the
-handle's generation as well, and reads a slot three words wide. A closure is
-called through function pointers, and its trampoline is given the closure's
-fields rather than the closure, so a closure made where it is called, or in a
-function inlined there, stays in registers and the call is resolved and inlined.
-One given to a higher-order function that is not inlined is an indirect call, as
-a C function pointer is.
+handle's generation as well, and reads a slot three words wide. A closure is a
+type of its own, so a function generic over it calls its `run` directly, and the
+call is inlined. An erased closure is a call through a function pointer stored
+behind a reference, which the optimizer does not follow: plain Coil's pointer,
+passed by value, it propagates into the function and inlines there.
 
 An allocation in an arena is the bump of a pointer, inlined: the allocator is a
 type parameter, called directly. What is in an arena owns nothing outside it, so
@@ -444,16 +460,16 @@ run fails if the checker accepts anything the model refuses.
 checker at a time and requires `diff.py` to find a program the weakened checker
 wrongly accepts.
 
-On the model's hand-written cases (195 at that run) and 4000 random programs (seed 7), 3420 can be written
-as Coil; 775 use something Coil cannot express (most often a closure that
-owns a capture that is not a borrow, or one that returns a reference). The
-compiler refuses 1277 of them itself. On the other 2139 the checker accepts
-nothing the model refuses: 1403 accepted by both, 711 refused by both, and 25
-refused only by the checker, each for one of the differences below. All 37
+On the model's 196 hand-written cases and 4000 random programs (seed 7), 3284
+can be written as Coil; 912 use something Coil cannot express (most often a
+closure that borrows made where no name holds it, or one that returns a
+reference). The compiler refuses 1181 of them itself. On the other 2100 the
+checker accepts nothing the model refuses: 1389 accepted by both, 691 refused by
+both, and 20 refused only by the checker, each for one of the differences below. All 39
 weakenings of the checker are caught, by a hand-written case or the
 differential run.
 
-`tests/run.py` has 178 hand-written cases. The programs in `examples/` run clean
+`tests/run.py` has 186 hand-written cases. The programs in `examples/` run clean
 under `--sanitize=address`, and the threaded ones under `--sanitize=thread`.
 
 ### Where Coil and the model differ
@@ -490,6 +506,18 @@ Found by the differential run:
   runs one only through an exclusive reference to it, so it takes either. The
   checker may accept a program the model refuses for that alone; `diff.py`
   counts them apart (`closure-kind`).
+- **A closure is erased where the model's type is structural.** The model's
+  closures have a type of their parameters and result; a Coil lambda has its
+  own. The translation binds each lambda a `let` makes to a name of its own and
+  erases it there, `(F-view-of (mut lambda))`, so every closure has the one type
+  the model gives it; a lambda made anywhere else has no name to be erased from,
+  and the program is not written as Coil. Closures given to generic functions
+  are tested by the hand-written cases.
+- **A view of what is in an arena is not put in an arena when it has a drop.**
+  Coil moves a view that gives exclusive access only if its type has a `Drop`,
+  and the translation gives such a view an empty one. What is put in an arena
+  is never dropped, so the checker lets in no type with a drop of its own,
+  though that drop does nothing.
 - **`par` takes a view only by reference, and only one that may cross
   threads.** The model lets a view be an argument of a `par` call. `safe.par`
   passes each argument through a type parameter, which the checker never lets a

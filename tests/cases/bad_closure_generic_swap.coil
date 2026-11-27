@@ -1,0 +1,24 @@
+(module case.bad-closure-generic-swap)
+(import "coil.primitive" :as primitive)
+(import "safe.fn" :use [deffn lambda lambda-own])
+(import "safe.vec" :use [Vec])
+(import "safe.par" :use [par])
+(import "safe.core" :use [borrow])
+(deffn Get [] i64)
+;;; Generic code cannot swap two closures it was lent: each would then hold the
+;;; other one's captures, which are lent to the wrong name.
+(defn swap-them [(F Get)] [(a (mut F)) (b (mut F))] (-> void)
+  (let [ta (take! (mut a))
+        tb (take! (mut b))]
+    (set! a tb)
+    (set! b ta))
+  0)
+(defn make [(n (ref i64))] (-> i64)
+  (let [(mut f) (lambda Get [(ref n)] [] (primitive/load n))]
+    (Get::run (mut f))))
+(defn main [] (-> i64)
+  (let [x 1 y 2
+        (mut f) (lambda Get [(ref x)] [] x)
+        (mut g) (lambda Get [(ref y)] [] y)]
+    (Get::run (mut f))
+    0))

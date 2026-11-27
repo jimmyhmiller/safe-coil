@@ -10,6 +10,6 @@
     (Vec::push! (mut xs) 4)
     (let [job (lambda-own Sum [xs] []
                 (+ (Vec::at xs 0) (Vec::at xs 1)))
-          task (spawn (Sum-own::call-once job))]
+          task (spawn (Sum-call-once job))]
       (println "{}" (Task::join task))
       0)))

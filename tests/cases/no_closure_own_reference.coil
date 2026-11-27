@@ -9,4 +9,4 @@
   (let [b (Box::new 4)
         r (borrow b)
         (mut f) (lambda-own Get [r] [] 0)]
-    (Get-own::run (mut f))))
+    (Get::run (mut f))))

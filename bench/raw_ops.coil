@@ -51,6 +51,12 @@
     (for i (range 0 (len xs)) (set! acc (f acc (primitive/index (data xs) i))))
     acc))
 
+;;; The same, kept out of line: a call through the pointer it is given.
+(defn fold-erased :inline (Never) [(xs (slice i64)) (start i64) (f (fnptr (cc/C) [i64 (ptr i64)] i64))] (-> i64)
+  (let [(mut acc) start]
+    (for i (range 0 (len xs)) (set! acc (f acc (primitive/index (data xs) i))))
+    acc))
+
 (defn main [] (-> i64)
   (let [n 1000000
         reps 200
@@ -74,6 +80,9 @@
     (let [start (now) (mut sum) 0]
       (for r (range 0 reps) (set! sum (fold v sum (fnptr-of add))))
       (report "fold" start sum))
+    (let [start (now) (mut sum) 0]
+      (for r (range 0 reps) (set! sum (fold-erased v sum (fnptr-of add))))
+      (report "fold erased" start sum))
     (let [start (now) (mut sum) 0]
       (for r (range 0 reps) (for i (range 0 n) (set! sum (+ sum (load (primitive/index (data v) i))))))
       (report "pool" start sum))

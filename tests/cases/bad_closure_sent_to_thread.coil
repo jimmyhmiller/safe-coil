@@ -3,7 +3,7 @@
 (import "safe.fn" :use [deffn lambda])
 (import "safe.thread" :use [spawn Task])
 (deffn Get [] i64)
-(defn run-it [(f Get)] (-> i64) (let [(mut g) f] (Get::run (mut g))))
+(defn run-it [(F Get)] [(f F)] (-> i64) (Get::call-once f))
 (defn main [] (-> i64)
   (let [n 4
         f (lambda Get [(ref n)] [] n)

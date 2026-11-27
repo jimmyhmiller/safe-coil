@@ -1,0 +1,21 @@
+(module case.ok-closure-generic)
+(import "coil.primitive" :as primitive)
+(import "safe.fn" :use [deffn lambda lambda-own])
+(import "safe.vec" :use [Vec])
+(import "safe.par" :use [par])
+(import "safe.core" :use [borrow])
+(deffn Get [] i64)
+;;; Closures given to generic code: called, passed on, and chosen between once
+;;; erased.
+(defn call-it [(F Get)] [(f (mut F))] (-> i64) (Get::run (mut f)))
+(defn twice [(F Get)] [(f (mut F))] (-> i64) (+ (call-it (mut f)) (call-it (mut f))))
+(defn main [] (-> i64)
+  (let [a 1 b 20
+        (mut f) (lambda Get [(ref a)] [] a)
+        (mut g) (lambda Get [(ref b)] [] b)]
+    (println "{}" (twice (mut f)))
+    (let [(mut e) (if (> a 0) (Get-view-of (mut f)) (Get-view-of (mut g)))]
+      (println "{}" (Get::run (mut e))))
+    (let [(mut o) (Get-own-of (lambda-own Get [a] [] (+ a 100)))]
+      (println "{}" (Get::run (mut o))))
+    0))

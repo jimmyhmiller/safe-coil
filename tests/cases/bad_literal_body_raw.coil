@@ -1,0 +1,11 @@
+;;; A function literal whose parameter types the compiler inferred is checked as
+;;; any function is: raw memory in its body needs `unsafe`.
+(module case.bad-literal-body-raw)
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "safe.core" :use [unsafe])
+(defn apply-it [(f (fnptr (cc/C) [(ptr i64)] i64)) (p (ptr i64))] (-> i64)
+  (unsafe (f p)))
+(defn main [] (-> i64)
+  (let [(mut n) 3]
+    (apply-it (fn [p] (load p)) (unsafe (primitive/cast (ptr i64) (mut n))))))

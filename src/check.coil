@@ -87,7 +87,9 @@
    (trusted (ArrayList i64))
    ;;; the locals that hold a trait object: a parameter declared `(dyn T)`, or a
    ;;; `let` bound to one or to a call declared to return one
-   (dyns (ArrayList i64))])
+   (dyns (ArrayList i64))
+   ;;; the type parameters bounded by a closure trait: `((F trait) …)`
+   (closures Code)])
 
 ;;; ---- small things ------------------------------------------------------------
 
@@ -221,7 +223,7 @@
 ;;; Is T a view: a struct its module marked with the trait `safe.core.View`? A
 ;;; view stands for the references it was made from. It is a local, an argument
 ;;; or a result, and is never stored.
-(defn view-type? [(t Code)] (-> bool)
+(defn declared-view? [(t Code)] (-> bool)
   (and (or (primitive/code-list? t) (and (primitive/code-sym? t) (not (scalar-name? t))))
        (not (ref-type? t))
        (not (raw-type? t))
@@ -231,22 +233,30 @@
          (primitive/TraitsAre [names] (name-in? `safe.core.View names))
          (primitive/TraitsUnknown [] false))))
 
+;;; Is T a view where CX is checked: a type marked View, or a type parameter of
+;;; the function bounded by a closure trait. Such a parameter stands for a
+;;; closure, which may borrow, so it is used as a view is: called and passed on,
+;;; never stored, assigned or moved out of where it lies.
+(defn view-type? [(cx (ref Cx)) (t Code)] (-> bool)
+  (or (declared-view? t)
+      (and (primitive/code-sym? t) (primitive/code-sym? (closure-bound-of (.closures cx) t)))))
+
 ;;; Is T a view whose drop uses nothing it borrowed, marked `safe.core.QuietDrop`
 ;;; by the module that defines it (see `check-quiet-drop!`)?
 (defn cross-thread? [(t Code)] (-> bool)
-  (and (view-type? t)
+  (and (declared-view? t)
        (match (primitive/code-type-traits t)
          (primitive/TraitsAre [names] (name-in? `safe.core.CrossThread names))
          (primitive/TraitsUnknown [] false))))
 
 (defn shared-view? [(t Code)] (-> bool)
-  (and (view-type? t)
+  (and (declared-view? t)
        (match (primitive/code-type-traits t)
          (primitive/TraitsAre [names] (name-in? `safe.core.SharedView names))
          (primitive/TraitsUnknown [] false))))
 
 (defn quiet-drop? [(t Code)] (-> bool)
-  (and (view-type? t)
+  (and (declared-view? t)
        (match (primitive/code-type-traits t)
          (primitive/TraitsAre [names] (name-in? `safe.core.QuietDrop names))
          (primitive/TraitsUnknown [] false))))
@@ -790,7 +800,7 @@
         (do (if (owner-type? cx content)
                 (check-write! cx node q "moved")
                 (check-read! cx node q))
-            (if (view-type? content)
+            (if (view-type? cx content)
                 ; a view taken out of a local takes that local's loans with it;
                 ; one copied from anywhere else is tied to where it was
                 (Res :loans (if (head-is? q `loc) (loans-of cx (primitive/code-int (get q 1))) (shared-loan q))
@@ -815,7 +825,7 @@
   (match want
     (WDiscard [] r)
     ; a view keeps the loans of what it was made from
-    (WValue [] (if (view-type? (pointee (type-of node))) (Res :loans (.loans r) :fresh true) (fresh)))
+    (WValue [] (if (view-type? cx (pointee (type-of node))) (Res :loans (.loans r) :fresh true) (fresh)))
     (WBind [_] r)
     (_ (if (and (.fresh r) (not (word-type? (pointee (type-of node)))))
            (carrying (union (if (owner-type? cx (pointee (type-of node))) (dropped-loan) (temporary-loan))
@@ -1024,7 +1034,7 @@
                     ; a `let` copies plain data: a number, or a struct of plain data
                     (if (or mutable (not (ref-type? (type-of e))) (word-type? (pointee (type-of e)))
                             (and (copy-type? cx (pointee (type-of e)) 0)
-                                 (not (view-type? (pointee (type-of e))))
+                                 (not (view-type? cx (pointee (type-of e))))
                                  (not (raw-in? cx (pointee (type-of e)) 0 true))))
                         (fresh)
                         r))
@@ -1038,7 +1048,7 @@
                  (pointee (type-of (get e 1))))]
     ; a field that is a view is lent like any place: a view is never stored, so
     ; no other can be put in its place through the reference
-    (when (and (field-form? (get e 1)) (raw-field? held) (not (view-type? held)))
+    (when (and (field-form? (get e 1)) (raw-field? held) (not (view-type? cx held)))
       (need-unsafe! cx e "an exclusive reference to a field that is raw memory"))
     (if (= (len q) 1)
         (use-place (mut cx) e (get q 0) (WExcl))
@@ -1062,7 +1072,7 @@
 (defn eval-store [(cx (mut Cx)) (e Code)] (-> Res)
   (let [target (get e 1)]
     (guard-raw-flow! cx e (get e 2))
-    (refuse-stored-view! (get e 2))
+    (refuse-stored-view! cx (get e 2))
     (refuse-stored-dyn! (mut cx) (get e 2))
     (eval (mut cx) (get e 2) (WValue))
     (if (and (through-raw? target (type-of (get e 2))) (not (trusted-field? (mut cx) target)))
@@ -1190,8 +1200,8 @@
 ;;; is.
 ;;; A parameter a function says it keeps (`:safe/keeps`) is the exception: the
 ;;; view goes only into the view the call returns, which so holds its loans.
-(defn check-view-argument! [(call Code) (arg Code) (param Code) (kept bool)] (-> i64)
-  (if (and (view-type? (pointee (type-of arg)))
+(defn check-view-argument! [(cx (ref Cx)) (call Code) (arg Code) (param Code) (kept bool)] (-> i64)
+  (if (and (view-type? cx (pointee (type-of arg)))
            (not kept)
            (not (primitive/code-eq (type-base (pointee param)) (type-base (pointee (type-of arg)))))
            (not (and (primitive/code-macro? arg) (expanded-by? call `(safe.par.par))
@@ -1299,7 +1309,7 @@
   (let [t (pointee (type-of arg))]
     (if (and (expanded-by? call `(safe.par.par))
              (or (primitive/code-eq name `safe.par.address-ref)
-                 (and (primitive/code-eq name `safe.par.address-mut) (view-type? t)))
+                 (and (primitive/code-eq name `safe.par.address-mut) (view-type? cx t)))
              (reaches-one-thread? cx t `()))
         (fail! arg "safe: what this shares changes through a shared reference (an arena does), so it stays on one thread; par cannot hand it to the other")
         0)))
@@ -1378,6 +1388,12 @@
         borrows (callee-flags kind module name signature "safe/borrows")
         ; the parameters the result keeps, given views
         keeps (callee-flags kind module name signature "safe/keeps")
+        ; the callee's type parameters bounded by a closure trait
+        closure-params (match (callee-form kind module name signature)
+                         (Some [found] (closure-tparams (get found 0) (primitive/code-int (get found 1))
+                                                        (- (primitive/code-int (get found 2)) 1)
+                                                        (get found 3)))
+                         (None [] `()))
         ; the loans each argument holds while the call runs
         (mut each) (ArrayList::new [Code] (meta/expansion-allocator))]
     (for [i 1 (len e)]
@@ -1412,14 +1428,15 @@
             (let [param (if known (get params (- i 1 before)) `unknown)
                   r (eval-arg (mut cx) arg param (callee-result kind name signature) e)
                   carried (.loans (use-value cx arg r (WShared)))]
-              (check-view-argument! e arg param
-                                    (match keeps
-                                      (Some [flags] (and (< (- i 1 before) (len flags))
-                                                         (primitive/code-eq (get flags (- i 1 before)) `t)))
-                                      (None [] false)))
+              (check-view-argument! cx e arg param
+                                    (or (match keeps
+                                          (Some [flags] (and (< (- i 1 before) (len flags))
+                                                             (primitive/code-eq (get flags (- i 1 before)) `t)))
+                                          (None [] false))
+                                        (closure-accepts? cx closure-params param arg)))
               (check-crossing! cx e name arg)
               (check-dyn-argument! (mut cx) arg param)
-              (when (view-type? (pointee (type-of arg)))
+              (when (view-type? cx (pointee (type-of arg)))
                 (set! all (union all (view-argument-loans (mut cx) arg param r))))
               ; two-phase: what an argument lends exclusively is only reserved
               ; while the arguments after it are evaluated: they may read it
@@ -1442,7 +1459,7 @@
         (unless (args-apart? (get each i) (get each j))
           (fail! e "safe: one argument of this call lends a place exclusively and another still holds a loan on it"))))
     ; a view over an exclusive reference gives exclusive access, so there is one of it
-    (when (view-type? (type-of e)) (refuse-copied-exclusive! cx e (type-of e) all))
+    (when (view-type? cx (type-of e)) (refuse-copied-exclusive! cx e (type-of e) all))
     (check-arena-contents! cx e)
     ; a reference that is thrown away still may not outlive what it refers to
     (cond (dyn-type? (callee-result kind name signature)) (carrying all)
@@ -1453,7 +1470,7 @@
               (WValue [] (fresh))
               (_ (carrying all)))
           ; a view is a value of its own that keeps what it was made from lent
-          (view-type? (type-of e)) (Res :loans all :fresh true)
+          (view-type? cx (type-of e)) (Res :loans all :fresh true)
           :else (fresh))))
 
 ;;; Is HEAD, the head of a form the compiler resolved to no declaration, one of
@@ -1503,13 +1520,13 @@
           (guard-raw-flow! cx e arg)
           (let [r (eval-arg (mut cx) arg `unknown `unknown e)
                 lent-now (.loans (use-value cx arg r (WShared)))]
-            (check-view-argument! e arg `unknown false)
+            (check-view-argument! cx e arg `unknown false)
             (hold! (mut cx) -1 lent-now)
             (set! borrowed (union borrowed lent-now))))))
     (drop-loans-to! (mut cx) loans)
-    (if (or (ref-type? (type-of e)) (view-type? (type-of e)))
+    (if (or (ref-type? (type-of e)) (view-type? cx (type-of e)))
         (match want
-          (WValue [] (if (view-type? (type-of e)) (Res :loans borrowed :fresh true) (fresh)))
+          (WValue [] (if (view-type? cx (type-of e)) (Res :loans borrowed :fresh true) (fresh)))
           (_ (carrying borrowed)))
         (fresh))))
 
@@ -1520,8 +1537,8 @@
     false))
 
 ;;; VALUE is about to be stored: in a struct, a variant, or a place assigned to.
-(defn refuse-stored-view! [(value Code)] (-> i64)
-  (if (view-type? (pointee (type-of value)))
+(defn refuse-stored-view! [(cx (ref Cx)) (value Code)] (-> i64)
+  (if (view-type? cx (pointee (type-of value)))
       (fail! value "safe: a view is stored; it can only be a local, an argument or a result")
       0))
 
@@ -1554,14 +1571,14 @@
 ;;; no view.
 (defn eval-built [(cx (mut Cx)) (e Code)] (-> Res)
   (let [t (pointee (type-of e))
-        view (view-type? t)
+        view (view-type? cx t)
         loans (len (.loans cx))
         (mut all) (no-loans)]
     (for [i 1 (len e)]
       (unless (primitive/code-keyword? (get e i))
         (guard-raw-flow! cx e (get e i))
         (refuse-stored-dyn! (mut cx) (get e i))
-        (unless view (refuse-stored-view! (get e i)))
+        (unless view (refuse-stored-view! cx (get e i)))
         (let [r (eval (mut cx) (get e i) (WValue))]
           (when view
             (refuse-dropped! (get e i) (.loans r))
@@ -1644,13 +1661,13 @@
           (or (head-is? e `fn*) (head-is? e `fn))
             (let [arrow (arrow-index e)]
               (cond (and (> arrow 0) (primitive/code-vector? (get e (- arrow 1))))
-                      (check-function! (.user cx) e arrow (.tparams cx) `())
+                      (check-function! (.user cx) e arrow (.tparams cx) `() (.closures cx))
                     ; parameters whose types the compiler inferred: the literal's
                     ; function-pointer type says what they are
                     (and (> (len e) 1) (primitive/code-vector? (get e 1)))
                       (let [typed (typed-literal e)]
                         (if (> (len typed) 0)
-                            (check-function! (.user cx) typed 2 (.tparams cx) `())
+                            (check-function! (.user cx) typed 2 (.tparams cx) `() (.closures cx))
                             (fail! e "safe: the types of this function's parameters are not known")))
                     :else (fail! e "safe: this function form is not covered by the rules"))
               (fresh))
@@ -1823,24 +1840,33 @@
 
 ;;; For each parameter of the function or method NAME, whether its result
 ;;; borrows from it, when it has a `:safe/borrows`: `(t f …)`.
-(defn callee-flags [(kind primitive/DeclKind) (module Code) (name Code) (signature Code) (key (slice u8))] (-> (Option Code))
+;;; The form that defines the callee: a function's `defn`, or a method's part
+;;; of an `impl` in its module, the one of that name whose first parameter is
+;;; the type the call takes first. -> (FORM FROM ARROW): its parts from FROM up
+;;; to ARROW hold its annotations and type parameter vectors.
+(defn callee-form [(kind primitive/DeclKind) (module Code) (name Code) (signature Code)] (-> (Option Code))
   (match kind
+    ;; the `defn` as written, whose names resolve where it was written: its
+    ;; declaration to another unit is source text parsed again, without them
+    ;; one a macro wrote is known by its declaration, written in its module
     (primitive/FunctionDecl []
-      (match (meta/annotations name)
-        (primitive/Answer [pairs]
-          (match (annotation-in pairs 0 (len pairs) key)
-            (Some [text]
-                  (match (meta/declaration name)
-                    (primitive/Answer [form]
-                      (let [arrow (arrow-index form)]
-                        (if (and (> arrow 0) (primitive/code-vector? (get form (- arrow 1))))
-                            (Some (borrow-flags (get form (- arrow 1)) text))
-                            (None [Code]))))
-                    (_ (None [Code]))))
-            (None [] (None [Code]))))
-        (_ (None [Code]))))
-    ; a method's annotation is on its definition in an `impl` of its module: the
-    ; one of that name whose first parameter is the type the call takes first
+      (let [as-written (match (meta/definition-form name)
+                         (primitive/Answer [form]
+                           (let [arrow (arrow-index form)]
+                             (if (and (> arrow 0) (primitive/code-vector? (get form (- arrow 1))))
+                                 (Some `(~form 2 ~arrow ()))
+                                 (None [Code]))))
+                         (_ (None [Code])))]
+        (match as-written
+          (Some [found] (Some found))
+          (None []
+            (match (meta/declaration name)
+              (primitive/Answer [form]
+                (let [arrow (arrow-index form)]
+                  (if (and (> arrow 0) (primitive/code-vector? (get form (- arrow 1))))
+                      (Some `(~form 2 ~arrow ~module))
+                      (None [Code]))))
+              (_ (None [Code])))))))
     (primitive/MethodDecl []
       (if (not (and (primitive/code-list? signature) (> (len signature) 0)
                     (primitive/code-list? (get signature 0)) (> (len (get signature 0)) 0)))
@@ -1862,15 +1888,115 @@
                               (let [first (get (get part (- arrow 1)) 0)]
                                 (when (and (primitive/code-list? first) (= (len first) 2)
                                            (= (receiver-name (get first 1)) receiver))
-                                  (return-from :found
-                                    (match (annotation-in part 1 (- arrow 1) key)
-                                      (Some [text] (Some (borrow-flags (get part (- arrow 1)) text)))
-                                      (None [] (None [Code]))))))))))))
+                                  (return-from :found (Some `(~part 1 ~arrow ())))))))))))
                   (None [Code])))
               (_ (None [Code]))))))
     (_ (None [Code]))))
 
-(defn check-function! [(user Code) (form Code) (arrow i64) (outer Code) (self-type Code)] (-> i64)
+;;; The callee's annotation KEY, as one flag per parameter: does the annotation
+;;; name it?
+(defn callee-flags [(kind primitive/DeclKind) (module Code) (name Code) (signature Code) (key (slice u8))] (-> (Option Code))
+  (match (callee-form kind module name signature)
+    (Some [found]
+      (let [form (get found 0)
+            arrow (primitive/code-int (get found 2))
+            ; a function's declaration to another unit carries no annotations:
+            ; they are asked for on their own
+            text (match kind
+                   (primitive/FunctionDecl []
+                     (match (meta/annotations name)
+                       (primitive/Answer [pairs] (annotation-in pairs 0 (len pairs) key))
+                       (_ (None [(slice u8)]))))
+                   (_ (annotation-in form (primitive/code-int (get found 1)) (- arrow 1) key)))]
+        (match text
+          (Some [words] (Some (borrow-flags (get form (- arrow 1)) words)))
+          (None [] (None [Code])))))
+    (None [] (None [Code]))))
+
+;;; The type parameters a definition's vectors before its parameters bound by a
+;;; closure trait (one `safe.fn`'s `deffn` declared): `((F safe-trait-name) …)`.
+(defn closure-tparams [(form Code) (from i64) (to i64) (module Code)] (-> Code)
+  (let [(mut out) (primitive/code-list-new)]
+    (for [i from to]
+      (let [part (get form i)]
+        (when (primitive/code-vector? part)
+          (for p (iter part)
+            (when (and (primitive/code-list? p) (>= (len p) 2) (primitive/code-sym? (get p 0)))
+              (for [k 1 (len p)]
+                (match (closure-trait (get p k) module)
+                  (Some [q] (push! (mut out) `(~(get p 0) ~q)))
+                  (None [] 0))))))))
+    `(~@out)))
+
+;;; The qualified name of the closure trait BOUND names, `Step` or `(Visit i64)`:
+;;; a trait `safe.fn`'s `deffn` declared, known by the erased closure it declares
+;;; beside it, `Step-view`, a view that implements the trait. A type parameter
+;;; bounded by one is used as a view (`view-type?`) and is given closures that
+;;; are views (`closure-accepts?`), so the two rules hold of the same parameters
+;;; whatever declared the trait.
+(defn closure-trait [(bound Code) (module Code)] (-> (Option Code))
+  (let [head (if (and (primitive/code-list? bound) (> (len bound) 0)) (get bound 0) bound)
+        ;; a name in a declaration parsed again from text is the trait its module
+        ;; declares by that name, when it declares one
+        named (if (and (primitive/code-sym? head) (primitive/code-sym? module)
+                       (match (primitive/code-decl (primitive/code-symbol module "." head))
+                         (primitive/Declared [_ kind _ _] (match kind (primitive/TraitDecl [] true) (_ false)))
+                         (_ false)))
+                  (primitive/code-symbol module "." head)
+                  head)]
+    (if (not (primitive/code-sym? head))
+        (None [Code])
+        (match (primitive/code-decl named)
+          (primitive/Declared [_ kind q _]
+            (match kind
+              (primitive/TraitDecl []
+                (let [erased-name (primitive/code-symbol q "-view")
+                      erased (if (primitive/code-list? bound)
+                                 `(~erased-name ~@(primitive/code-slice bound 1 (len bound)))
+                                 erased-name)]
+                  (if (and (declared-view? erased)
+                           (match (primitive/code-type-traits erased)
+                             (primitive/TraitsAre [names] (name-in? q names))
+                             (primitive/TraitsUnknown [] false)))
+                      (Some q)
+                      (None [Code]))))
+              (_ (None [Code]))))
+          (_ (None [Code]))))))
+
+;;; Is ARG a closure passed by reference for PARAM, `(mut F)` or `(ref F)` with F
+;;; a type parameter of the callee bounded by a closure trait (in PAIRS)? It is
+;;; when ARG's type implements that trait, or is itself a type parameter here
+;;; bounded by it. The callee then uses it as a view (see `view-type?`).
+(defn closure-accepts? [(cx (ref Cx)) (pairs Code) (param Code) (arg Code)] (-> bool)
+  (or
+   ;; what a trait's method works on is the type's own: `(Step::run (mut f) …)`
+   ;; takes `(ptr Self)`, which the call gives as the closure's own type
+   (and (primitive/code-list? param) (= (len param) 2)
+        (or (ref-type? param) (form-is? param `ptr))
+        (or (= (meta/source (get param 1)) "Self")
+            (primitive/code-eq (get param 1) (pointee (type-of arg)))))
+   (closure-param-accepts? cx pairs param arg)))
+
+(defn closure-param-accepts? [(cx (ref Cx)) (pairs Code) (param Code) (arg Code)] (-> bool)
+  (and (ref-type? param)
+       (let [trait (closure-bound-of pairs (get param 1))
+             t (pointee (type-of arg))]
+         (and (primitive/code-sym? trait)
+              (or (match (primitive/code-type-traits t)
+                    (primitive/TraitsAre [names] (name-in? trait names))
+                    (primitive/TraitsUnknown [] false))
+                  (let [here (closure-bound-of (.closures cx) t)]
+                    (and (primitive/code-sym? here) (primitive/code-eq here trait))))))))
+
+;;; The closure trait the type parameter T is bounded by in PAIRS, or ().
+(defn closure-bound-of [(pairs Code) (t Code)] (-> Code)
+  (block :found
+    (when (primitive/code-sym? t)
+      (for pr (iter pairs)
+        (when (primitive/code-eq (get pr 0) t) (return-from :found (get pr 1)))))
+    `()))
+
+(defn check-function! [(user Code) (form Code) (arrow i64) (outer Code) (self-type Code) (outer-closures Code)] (-> i64)
   (let [params (get form (- arrow 1))
         result (written-type (get (get form arrow) 1))
         own (if (and (>= (- arrow 2) 0) (primitive/code-vector? (get form (- arrow 2))))
@@ -1890,7 +2016,10 @@
                      :path (ArrayList::new [Code] a)
                      :pinned (ArrayList::new [i64] a)
                      :trusted (ArrayList::new [i64] a)
-                     :dyns (ArrayList::new [i64] a))]
+                     :dyns (ArrayList::new [i64] a)
+                     :closures (if (and (>= (- arrow 2) 0) (primitive/code-vector? (get form (- arrow 2))))
+                                   (union outer-closures (closure-tparams form (- arrow 2) (- arrow 1) `()))
+                                   outer-closures))]
     (if (or (mentions-code? params) (mentions-code? result))
         ; compile-time code: it runs in the compiler, not in the program
         0
@@ -1914,11 +2043,11 @@
                     (match borrows
                       (Some [text]
                             (when (word-of? text (meta/source (get p 0)))
-                              (if (or (ref-type? t) (view-type? t))
+                              (if (or (ref-type? t) (view-type? cx t))
                                   (push! (mut named) serial)
                                   (fail! p "safe: :safe/borrows names a parameter that takes no reference"))))
                       (None [] 0))
-                    (when (or (ref-type? t) (view-type? t) (dyn-type? t) self)
+                    (when (or (ref-type? t) (view-type? cx t) (dyn-type? t) self)
                       (hold! (mut cx) serial
                              (if excl `(((ext ~serial) mut)) `(((ext ~serial) shr))))))
                   (fail! p "safe: this parameter form is not covered by the rules"))))
@@ -1955,10 +2084,13 @@
 ;;; body). A vector written directly in the form lists type parameters.
 (defn check-impl! [(user Code) (form Code)] (-> i64)
   (let [(mut outer) `()
+        (mut outer-closures) `()
         (mut names) (primitive/code-list-new)]
     (for part (iter form)
       (when (primitive/code-vector? part)
         (set! outer (union outer (type-parameter-names part)))))
+    (let [impl-closures (closure-tparams form 1 (len form) `())]
+      (set! outer-closures impl-closures))
     ; `(impl TRAIT TYPE methods…)`: TYPE, as the methods spell it; `()` for an
     ; inherent impl or a trait's own default methods
     (for [i 1 (len form)]
@@ -1975,7 +2107,7 @@
         (when (and (primitive/code-list? part) (> (len part) 0) (primitive/code-sym? (get part 0)))
           (let [arrow (arrow-index part)]
             (when (and (> arrow 0) (primitive/code-vector? (get part (- arrow 1))))
-              (check-function! user part arrow outer self-type))))))
+              (check-function! user part arrow outer self-type outer-closures))))))
     0))
 
 (defn check-top! [(user Code) (module Code) (form Code)] (-> i64)
@@ -1984,7 +2116,7 @@
   (cond (or (head-is? form `defn*) (head-is? form `defn))
           (let [arrow (arrow-index form)]
             (if (and (> arrow 1) (primitive/code-vector? (get form (- arrow 1))))
-                (check-function! user form arrow `() `())
+                (check-function! user form arrow `() `() `())
                 (fail! form "safe: this function form is not covered by the rules")))
         (or (head-is? form `impl) (head-is? form `deftrait)) (check-impl! user form)
         :else 0))

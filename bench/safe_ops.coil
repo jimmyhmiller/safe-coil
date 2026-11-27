@@ -12,8 +12,15 @@
 
 (deffn Step [i64 (ref i64)] i64)
 
-;;; A higher-order function the closure is given to.
-(defn fold [(xs (ref (Vec i64))) (start i64) (f (mut Step))] (-> i64)
+;;; A higher-order function the closure is given to: generic over the closure,
+;;; so each closure's call is direct.
+(defn fold [(F Step)] [(xs (ref (Vec i64))) (start i64) (f (mut F))] (-> i64)
+  (let [(mut acc) start]
+    (for i (range 0 (len xs)) (set! acc (Step::run (mut f) acc (Vec::at xs i))))
+    acc))
+
+;;; The same, given the closure erased: a call through a function pointer.
+(defn fold-erased :inline (Never) [(xs (ref (Vec i64))) (start i64) (f (mut Step-view))] (-> i64)
   (let [(mut acc) start]
     (for i (range 0 (len xs)) (set! acc (Step::run (mut f) acc (Vec::at xs i))))
     acc))
@@ -70,6 +77,11 @@
           (mut add) (lambda Step [] [acc x] (+ acc (primitive/load x)))]
       (for r (range 0 reps) (set! sum (fold v sum (mut add))))
       (report "fold" start sum))
+    (let [start (now) (mut sum) 0
+          (mut add) (lambda Step [] [acc x] (+ acc (primitive/load x)))
+          (mut erased) (Step-view-of (mut add))]
+      (for r (range 0 reps) (set! sum (fold-erased v sum (mut erased))))
+      (report "fold erased" start sum))
     (let [start (now) (mut sum) 0]
       (for r (range 0 reps) (for i (range 0 n) (set! sum (+ sum (primitive/load (Pool::at pool (get handles i)))))))
       (report "pool" start sum))

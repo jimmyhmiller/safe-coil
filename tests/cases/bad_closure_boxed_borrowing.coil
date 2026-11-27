@@ -1,0 +1,13 @@
+(module case.bad-closure-boxed-borrowing)
+(import "coil.primitive" :as primitive)
+(import "safe.fn" :use [deffn lambda lambda-own])
+(import "safe.vec" :use [Vec])
+(import "safe.par" :use [par])
+(import "safe.core" :use [borrow])
+(deffn Get [] i64)
+;;; A closure that borrows is not put on the heap as an owner.
+(defn main [] (-> i64)
+  (let [n 4
+        f (lambda Get [(ref n)] [] n)
+        (mut o) (Get-own-of f)]
+    (Get::run (mut o))))
