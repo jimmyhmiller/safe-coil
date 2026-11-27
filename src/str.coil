@@ -110,7 +110,7 @@
 (impl Display Str
   (display-fmt [(s (ref Str)) (f (ptr Formatter))] (-> i64)
     (unsafe
-      (display-fmt (slice::new [u8] (data (.items (.bytes s))) (Str::len s)) f))))
+      (display-fmt (slice::new [u8] (data (.items (.in (.bytes s)))) (Str::len s)) f))))
 
 ;;; ---- formatted text ----------------------------------------------------------------
 ;;;

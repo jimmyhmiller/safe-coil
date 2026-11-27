@@ -65,7 +65,7 @@
 (define base-storables
   '(int int int int unit (box int) (box int) (box int) (box (box int))
     (Pair) (Pt) (Wrap (box int)) (Opt (box int)) (Opt (box int)) (Opt int)
-    (pool (box int)) (handle (box int)) (ptr int) (ptr (box int))))
+    (pool (box int)) (handle (box int)) (ptr int) (ptr (box int)) arena))
 (define (gen-storable)
   (if (and (pair? (tvars)) (zero? (random 3)))
       (pick '(T T (box T) (Opt T) (Wrap T)))
@@ -77,7 +77,7 @@
   (case (random 14)
     [(0 1) `(ref ,(gen-storable))]
     [(2 3) `(mut ,(gen-storable))]
-    [(4) (pick '((view Two) (view Peek) (view Lock) (view Nest) (view Watch)))]
+    [(4) (pick '((view Two) (view Peek) (view Lock) (view Nest) (view Watch) (view InArena)))]
     [(5) (pick closure-types)]
     [else (gen-storable)]))
 
@@ -102,7 +102,7 @@
      (let loop ([p (car b)] [τ (cdr b)])
        (cons (cons p τ)
              (match τ
-               [`(,(or 'box 'ref 'mut) ,σ) (loop `(* ,p) σ)]
+               [`(,(or 'box 'ref 'mut 'abox) ,σ) (loop `(* ,p) σ)]
                [`(pool ,σ) (append* (for/list ([h env] #:when (equal? (cdr h) `(handle ,σ)))
                                       (loop `(at ,p ,(car h)) σ)))]
                [(? pair?) #:when (fields τ)
@@ -141,6 +141,7 @@
     (match τ
       ['int (if (and (pair? here) (< (random 4) 3)) (pick here) (random 3))]
       ['unit 'unit]
+      ['arena (if (and (pair? here) (zero? (random 2))) (pick here) '(arena-new))]
       [(? symbol?) (if (pair? here) (pick here) (error 'gen "no value of type ~a in scope" τ))]
       [`(box ,σ) (if (and (pair? here) (zero? (random 2))) (pick here) `(box ,(sub σ 0)))]
       [`(ptr ,σ)
@@ -149,6 +150,11 @@
              [(and (pair? targets) (< (random 4) 3)) `(addr ,(pick targets))]
              [else (let ([y (fresh 'v)]) `(let ([,y ,(sub σ 0)]) (addr ,y)))])]
       [`(pool ,σ) (if (and (pair? here) (zero? (random 2))) (pick here) `(pool-new ,σ))]
+      [`(abox ,σ)
+       (define arenas (of-type 'arena))
+       (cond [(and (pair? here) (zero? (random 3))) (pick here)]
+             [(pair? arenas) `(abox ,(pick arenas) ,(sub σ 0))]
+             [else (let ([y (fresh 'v)]) `(let ([,y (arena-new)]) (abox ,y ,(sub σ 0))))])]
       [`(handle ,σ)
        (define pools (of-type `(pool ,σ)))
        (cond [(and (pair? here) (< (random 3) 2)) (pick here)]
@@ -489,9 +495,11 @@
       (define (borrowed) (and τr `(let ,τr ,(inner-borrow env τr))))
       (define (inside-of y τy)
         (for/list ([pt (places (list (cons y τy)))] #:when (and (pair? (car pt)) (storable? (cdr pt)))) pt))
+      (define arenas (for/list ([pt (storable-places env)] #:when (eq? (cdr pt) 'arena)) (car pt)))
       (case (cond [(and (pair? entered) (zero? (random 2))) 15]
                   [(and (pair? sums) (zero? (random 3))) 5]
                   [(and (pair? held) (zero? (random 4))) 22]
+                  [(and (pair? arenas) (zero? (random 2))) 24]
                   [else (random 22)])
         ;; a borrow of something whose scope has already ended
         [(13)
@@ -578,6 +586,16 @@
                [(and (pair? inner) (< (random 4) 3)) `(let (view Lock) (new (view Lock) (mut ,(pick inner))))]
                [(pair? boxes) `(let (view Lock) (new (view Lock) (mut ,(pick boxes))))]
                [else (borrowed)])]
+;; a box in an arena: it keeps the arena lent until its scope ends
+        [(24)
+         (define ints (for/list ([pt (storable-places env)] #:when (eq? (cdr pt) 'int)) (car pt)))
+         (case (random 3)
+           [(0) `(let (abox (box int)) (abox ,(pick arenas) (box ,(random 3))))]
+           ;; a view in the arena: the box holds what the view borrowed too
+           [(1) (if (pair? ints)
+                    `(let (abox (view Peek)) (abox ,(pick arenas) (new (view Peek) (ref ,(pick ints)) ,(random 3))))
+                    `(let (abox int) (abox ,(pick arenas) ,(random 3))))]
+           [else `(let (abox int) (abox ,(pick arenas) ,(random 3)))])]
         ;; a closure that owns what it captured, made in a scope that then ends
         [(21)
          (define y (fresh 'v))
@@ -659,12 +677,17 @@
          (define y (fresh 'v))
          `(with mut ,g ,y (set! (* ,y) ,(new-value σ)))]
         [(10) (gen-expr env sigs (gen-type) (min 1 (sub1 d)))]
+        ;; an arena gives back everything in it
+        [(11)
+         (define arenas (for/list ([pt ts] #:when (eq? (cdr pt) 'arena)) (car pt)))
+         (if (pair? arenas) `(reset! ,(pick arenas)) 'unit)]
         [else 'unit]))
     ;; the hazard brings some owners of its own, so there is something to free
     (define owned
       (append*
        (for/list ([i (random 3)])
-         (cond [(zero? (random 4))
+         (cond [(zero? (random 3)) (list (list (fresh 'v) 'arena '(arena-new)))]
+               [(zero? (random 4))
                 (define pl (fresh 'v))
                 (list (list pl '(pool (box int)) '(pool-new (box int)))
                       (list (fresh 'v) '(handle (box int)) `(insert ,pl (box ,(random 3)))))]
@@ -811,7 +834,7 @@
 (define features
   '(("references" ref mut) ("calls" call) ("fields" :) ("match" match match-ref match-mut)
     ("views" view) ("pools" insert remove at) ("take/unbox" take unbox) ("loops" while)
-    ("break" break) ("borrows" borrows) ("globals" with) ("par" par) ("threads" spawn spawn-fn) ("raw pointers" addr)
+    ("break" break) ("borrows" borrows) ("arenas" abox) ("globals" with) ("par" par) ("threads" spawn spawn-fn) ("raw pointers" addr)
     ("closures" lam lamo) ("closure calls" apply) ("out" out) ("return" return)))
 
 ;; -> the first counterexample, or #f

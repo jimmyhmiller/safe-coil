@@ -1,0 +1,164 @@
+;;; A calculator whose syntax trees live in an arena: each line is parsed into a
+;;; tree of nodes allocated in the arena, evaluated, and given back all at once
+;;; when the arena is reset for the next line. A tree is a view: it keeps the
+;;; arena lent, so the arena cannot be reset, or dropped, while one is alive.
+;;; Safe Coil throughout.
+;;;
+;;;   coil run examples/arena.coil --use safe.check
+(module example.arena)
+(import "coil.primitive" :as primitive)
+(import "safe.core" :use [View])
+(import "safe.vec" :use [Vec])
+(import "safe.box" :use [BoxIn])
+(import "safe.alloc" :use [Arena ArenaRef])
+(import "safe.map" :use [Map])
+(import "safe.str" :use [Str str-of])
+
+;; ---- the tree ------------------------------------------------------------------
+
+(defsum Expr
+  (Num [(n i64)])
+  (Var [(name u8)])
+  (Neg [(e (BoxIn Expr ArenaRef))])
+  (Bin [(op u8) (a (BoxIn Expr ArenaRef)) (b (BoxIn Expr ArenaRef))])
+  (Bad [(at i64)]))
+
+(impl View Expr)
+
+(defn node [(ar (ref Arena)) (e Expr)] (-> (BoxIn Expr ArenaRef))
+  (BoxIn::in-arena [Expr] ar e))
+
+;; ---- parsing -------------------------------------------------------------------
+
+(defstruct Parser [(text Str) (at i64)])
+
+(defn peek [(p (ref Parser))] (-> u8)
+  (if (< (.at p) (Str::len (field p text))) (Str::byte (field p text) (.at p)) #\nul))
+
+(defn skip-space! [(p (mut Parser))] (-> void)
+  (while (= (peek p) #\space) (set! (.at p) (+ (.at p) 1))))
+
+(defn digit? [(c u8)] (-> bool) (and (>= c #\0) (<= c #\9)))
+
+(defn letter? [(c u8)] (-> bool) (and (>= c #\a) (<= c #\z)))
+
+;;; atom := number | name | '-' atom | '(' sum ')'
+(defn atom :safe/borrows "ar" [(ar (ref Arena)) (p (mut Parser))] (-> Expr)
+  (skip-space! (mut p))
+  (let [c (peek p)]
+    (cond (digit? c)
+            (let [(mut n) 0]
+              (while (digit? (peek p))
+                (set! n (+ (* n 10) (cast i64 (- (peek p) #\0))))
+                (set! (.at p) (+ (.at p) 1)))
+              (Num n))
+          (letter? c) (do (set! (.at p) (+ (.at p) 1)) (Var c))
+          (= c #\-) (do (set! (.at p) (+ (.at p) 1)) (Neg (node ar (atom ar (mut p)))))
+          (= c #\()
+            (do (set! (.at p) (+ (.at p) 1))
+                (let [inner (sum ar (mut p))]
+                  (skip-space! (mut p))
+                  (if (= (peek p) #\))
+                      (do (set! (.at p) (+ (.at p) 1)) inner)
+                      (Bad (.at p)))))
+          :else (Bad (.at p)))))
+
+;;; product := atom (('*' | '/') atom)*
+(defn product :safe/borrows "ar" [(ar (ref Arena)) (p (mut Parser))] (-> Expr)
+  (let [first (atom ar (mut p))]
+    (more-products ar (mut p) first)))
+
+(defn more-products :safe/borrows "ar left" [(ar (ref Arena)) (p (mut Parser)) (left Expr)] (-> Expr)
+  (skip-space! (mut p))
+  (let [c (peek p)]
+    (if (or (= c #\*) (= c #\/))
+        (do (set! (.at p) (+ (.at p) 1))
+            (let [right (atom ar (mut p))]
+              (more-products ar (mut p) (Bin :op c :a (node ar left) :b (node ar right)))))
+        left)))
+
+;;; sum := product (('+' | '-') product)*
+(defn sum :safe/borrows "ar" [(ar (ref Arena)) (p (mut Parser))] (-> Expr)
+  (let [first (product ar (mut p))]
+    (more-sums ar (mut p) first)))
+
+(defn more-sums :safe/borrows "ar left" [(ar (ref Arena)) (p (mut Parser)) (left Expr)] (-> Expr)
+  (skip-space! (mut p))
+  (let [c (peek p)]
+    (if (or (= c #\+) (= c #\-))
+        (do (set! (.at p) (+ (.at p) 1))
+            (let [right (product ar (mut p))]
+              (more-sums ar (mut p) (Bin :op c :a (node ar left) :b (node ar right)))))
+        left)))
+
+(defn parse :safe/borrows "ar" [(ar (ref Arena)) (text (ref Str))] (-> Expr)
+  (let [(mut p) (Parser :text (Str::copy text) :at 0)
+        e (sum ar (mut p))]
+    (skip-space! (mut p))
+    (if (= (.at p) (Str::len text)) e (Bad (.at p)))))
+
+;; ---- evaluating ----------------------------------------------------------------
+
+(defsum Value (Ok [(n i64)]) (Err [(why Str)]))
+
+(defn eval [(e (ref Expr)) (vars (ref (Map i64 i64)))] (-> Value)
+  (match e
+    (Num [n] (Ok n))
+    (Var [name] (if (Map::has? vars (cast i64 name))
+                    (Ok (get-var vars name))
+                    (Err (str-of "{} is not set" (char name)))))
+    (Neg [inner] (match (eval (BoxIn::get inner) vars)
+                   (Ok [n] (Ok (- 0 n)))
+                   (Err [why] (Err why))))
+    (Bin [op a b]
+         (match (eval (BoxIn::get a) vars)
+           (Err [why] (Err why))
+           (Ok [x] (match (eval (BoxIn::get b) vars)
+                     (Err [why] (Err why))
+                     (Ok [y] (apply op x y))))))
+    (Bad [at] (Err (str-of "cannot read past column {}" at)))))
+
+(defn get-var [(vars (ref (Map i64 i64))) (name u8)] (-> i64)
+  (primitive/load (Map::at vars (cast i64 name))))
+
+(defn apply [(op u8) (x i64) (y i64)] (-> Value)
+  (cond (= op #\+) (Ok (+ x y))
+        (= op #\-) (Ok (- x y))
+        (= op #\*) (Ok (* x y))
+        (= y 0) (Err (Str::from "division by zero"))
+        :else (Ok (/ x y))))
+
+(defn char [(c u8)] (-> Str)
+  (let [(mut s) (Str::new)]
+    (Str::push! (mut s) c)
+    s))
+
+;;; How many nodes the tree has.
+(defn size [(e (ref Expr))] (-> i64)
+  (match e
+    (Neg [inner] (+ 1 (size (BoxIn::get inner))))
+    (Bin [_ a b] (+ 1 (size (BoxIn::get a)) (size (BoxIn::get b))))
+    (_ 1)))
+
+(defn main [] (-> i64)
+  (let [(mut ar) (Arena::new)
+        (mut vars) (Map::new [i64 i64])
+        (mut lines) (Vec::new [Str])]
+    (Vec::push! (mut lines) (Str::from "1 + 2 * 3"))
+    (Vec::push! (mut lines) (Str::from "(1 + 2) * 3"))
+    (Vec::push! (mut lines) (Str::from "x * x - y"))
+    (Vec::push! (mut lines) (Str::from "-(4 - 10) / 2"))
+    (Vec::push! (mut lines) (Str::from "7 / (3 - 3)"))
+    (Vec::push! (mut lines) (Str::from "2 * z"))
+    (Vec::push! (mut lines) (Str::from "2 +"))
+    (Map::insert! (mut vars) (cast i64 #\x) 12)
+    (Map::insert! (mut vars) (cast i64 #\y) 4)
+    (for i (range 0 (len lines))
+      (let [text (Vec::at lines i)
+            tree (parse ar text)]
+        (match (eval tree vars)
+          (Ok [n] (println "{} = {}   ({} nodes, {} bytes in the arena)" text n (size tree) (Arena::live ar)))
+          (Err [why] (println "{}: {}" text why))))
+      ;; the tree is gone: everything it was made of is given back at once
+      (Arena::reset! (mut ar))))
+  0)

@@ -85,6 +85,29 @@ adds the rest of the model:
   no other thread. A view made from an exclusive reference gives exclusive
   access, so its type must be one that is moved (one with a `Drop`), never
   copied.
+- **Views built from parts.** A struct or variant of a view type built in the
+  program holds the loans of every part it was built from, as a call that
+  returns a view does, and each part's loans are alive while the later parts are
+  evaluated. A variant of a sum that is a view may hold views, as a struct that
+  is one may: a tree whose nodes borrow is such a sum.
+- **Arenas.** A list or a box in an arena (`(VecIn T ArenaRef)`, `(BoxIn T
+  ArenaRef)`) is a view that keeps the arena lent, shared: many live at once,
+  none outlives the arena, and `Arena::reset!` lends the arena exclusively, so
+  it is refused while anything in the arena is alive. A box in an arena may hold
+  a view, a node of a tree in the arena, and then holds that view's loans too.
+  Allocating changes an arena though it is lent shared, so an arena is
+  `OneThread`: `par` hands its other thread no shared reference to anything that
+  reaches one (through fields or type arguments), nor a view of one. Lending an
+  arena to the other thread exclusively, `(par (fill (mut a)) …)`, is how each
+  thread gets its own, as Rust's `&mut Bump` is `Send` and `&Bump` is not.
+- **Allocators.** A collection's allocator is a type parameter, trusted to give
+  memory nothing else uses, so only `safe.alloc` implements `Alloc`; any other
+  allocator comes in as a `Lease`, which `unsafe` code vouches for.
+- **What a function keeps.** A view is not passed for a type parameter, which
+  could store it, unless the function says `:safe/keeps "x"`: it puts `x` only
+  into the view it returns, which then holds `x`'s loans. The checker cannot see
+  where `x` goes, so such a function's whole body is one `(unsafe …)`.
+  `BoxIn::in-arena` is one: it is how a tree's nodes are put in an arena.
 - **Closures.** A closure that borrows (`safe.fn`'s `lambda`) is a view over
   what it captured: it keeps each capture lent, shared or exclusively, until
   its last use, and is moved, never copied. Its body is a function of its own
@@ -96,7 +119,9 @@ adds the rest of the model:
   use; `SharedView`, it gives only shared access, so it may be copied even when
   made from an exclusive reference (a function taking `(mut c)` may give back a
   `Maybe`, as Rust's `fn get(&mut self) -> Option<&V>` does); `CrossThread`, it
-  may be lent to `par`'s other thread. A view that gives exclusive access is
+  may be lent to `par`'s other thread; `OneThread` (of any type, not only a
+  view), it changes through a shared reference, so no shared reference to it
+  crosses to another thread. A view that gives exclusive access is
   moved, never copied, and a field of a view that is itself a view is a place of
   its own, lent like any other.
 - **Views the program declares.** `defview` and `defsubscript` make views with
@@ -145,16 +170,17 @@ operations are allowed.
 
 | Module | What it gives |
 |---|---|
-| `safe.core` | `unsafe`; `borrow` and `borrow-mut`, a reference as a value; `replace!`, which swaps an owner out of a place; `move`; `each` and `each-mut`, a loop over a list, a slice or a string; `size` and `nth`, a `(slice T)` read with every index checked; the traits `View`, `QuietDrop`, `SharedView` and `CrossThread`; the annotation `:safe/borrows` |
+| `safe.core` | `unsafe`; `borrow` and `borrow-mut`, a reference as a value; `replace!`, which swaps an owner out of a place; `move`; `each` and `each-mut`, a loop over a list, a slice or a string; `size` and `nth`, a `(slice T)` read with every index checked; the traits `View`, `QuietDrop`, `SharedView`, `CrossThread` and `OneThread`; the annotations `:safe/borrows` and `:safe/keeps` |
+| `safe.alloc` | Where collections get memory. `Heap`, the heap, of no size; `Lease`, any Coil allocator by lease: `Lease::heap`, and `Lease::assume` of a raw `AllocatorLease` inside `unsafe`; `Arena`, an owner that hands out memory by bumping a pointer and gives it all back at once: `Arena::new`, `with-room`, `reset!`, `live`, `reserved`, and `lend`, an `ArenaRef`. The trait `Alloc` |
 | `safe.loop` | `(for (ref x) xs …)` and `(for (mut x) xs …)` over a safe collection, each element by reference; any other `for` is Coil's |
 | `safe.fn` | `(deffn NAME [T…] [PARAM-TYPE…] RESULT)` declares a closure type; `(lambda NAME [(ref x) (mut y) (z (ref PLACE))…] [params…] body…)` makes one that borrows what it captures, `(lambda-own NAME [x (y VALUE)…] [params…] body…)` one of `NAME-own` that owns them; `(NAME::run (mut f) args…)` calls either; `(NAME-own::call-once f args…)` calls one and frees it, so `(spawn (NAME-own::call-once f))` runs it on a thread |
 | `safe.view` | `(defview NAME [T…] [(field TYPE)…])`, a view whose fields may be references or views: `NAME::new`, `NAME::field`, `NAME::field-mut`. `(defsubscript NAME [T…] [params…] (-> (ref R) or (mut R)) before… (yield PLACE) after…)`: `NAME::open` runs `before` and gives a view of `PLACE`, read with `NAME::get` and `NAME::get-mut`; `after` runs when the view is dropped |
-| `safe.box` | `(Box T)`, an owner of one heap value: `Box::new`, `get`, `get-mut`, `into` |
+| `safe.box` | `(Box T)`, an owner of one heap value: `Box::new`, `get`, `get-mut`, `into`. `(BoxIn T A)` is one in memory from the allocator A, with the same methods: `BoxIn::new-in [T A] value a` for the heap or a lease, `(BoxIn::in-arena [T] arena value)` for an arena. `(Box T)` is a `(BoxIn T Heap)` and one pointer wide |
 | `safe.own` | `(own Trait value)` makes an `(Own (dyn Trait))`, an owned trait object: a value of any type that implements the trait, on the heap, dropped as its own type drops. `(Own::get-mut (mut o))` lends the `(dyn Trait)` |
 | `safe.maybe` | `(Maybe T)` and `(MaybeMut T)`: a reference or nothing, for a lookup's result (Coil keeps references out of `Option`). `Maybe::found`, `Maybe::nothing`, `found?`, `get`; `(if-found [x m] then else)`, `when-found`, `if-found-mut`. It is a view: it keeps what it was found in lent |
 | `safe.pool` | `(Pool T)`, a collection that owns its elements, and `(Handle T)`, plain data checked when it is used: `insert!`, `remove!`, `at`, `at-mut`, `live?`, `len`, `handles` |
 | `safe.global` | `defglobal`, `with-ref`, `with-mut`: a global lent for a scope, with exclusivity checked when the scope is entered |
-| `safe.vec` | `(Vec T)`, a growable list that owns its elements: `push!`, `pop!`, `at`, `at-mut`, `swap!`, `insert!`, `remove!`, `clear!`; `(len v)`, `(get v i)` (a copy, for plain data) and `(set! (mut v) i x)` as for Coil's own collections. `(Vec::slice v from to)` is a `(Slice T)`, part of the list lent shared: `len`, `at`, `part`. `(Vec::slice-mut (mut v) from to)` is a `(SliceMut T)`, part of it lent exclusively: `len`, `at`, `at-mut`, `get`, `part`, `part-mut`, and `split`, which gives `(Halves T)`: `left` and `right`, both lent exclusively at once. An index out of range stops the program |
+| `safe.vec` | `(Vec T)`, a growable list that owns its elements: `push!`, `pop!`, `at`, `at-mut`, `swap!`, `insert!`, `remove!`, `clear!`; `(len v)`, `(get v i)` (a copy, for plain data) and `(set! (mut v) i x)` as for Coil's own collections. `(Vec::slice v from to)` is a `(Slice T)`, part of the list lent shared: `len`, `at`, `part`. `(Vec::slice-mut (mut v) from to)` is a `(SliceMut T)`, part of it lent exclusively: `len`, `at`, `at-mut`, `get`, `part`, `part-mut`, and `split`, which gives `(Halves T)`: `left` and `right`, both lent exclusively at once. An index out of range stops the program. `(VecIn T A)` is a list in memory from the allocator A, with the same methods: `VecIn::new-in [T A] a`, `(VecIn::in-arena [T] arena)`. `(Vec T)` holds a `(VecIn T Heap)`. A list takes no memory until something is put in it |
 | `safe.str` | `Str`, text that owns its bytes: `Str::from "…"`, `len`, `byte`, `push!`, `push-text!`, `push-int!`, `append!`, `eq?`, `copy`; `Str::slice` is a `(Slice u8)` of its bytes, with `from-slice` and `push-slice!` to copy one. It prints with `{}`. `(str-of "x={} y={}" x y)` is a new `Str` formatted as `println` formats, and `(str-push! (mut s) "…" args…)` adds to one |
 | `safe.map` | `(Map K V)`, a hash table that owns its keys and values; K needs `Hash` and `Eq`: `insert!`, `remove!`, `has?`, `at`, `at-mut`, `len`; `(each-entry [key value table] …)` walks it, as `first`/`next`/`key-at`/`value-at` do by hand |
 | `safe.par` | `(par (f a…) (g b…))`: two calls at once, on two threads |
@@ -172,9 +198,8 @@ run time.
 
 Each module exports only what safe code may call. The functions it uses inside
 (the ones that trust their arguments) cannot be named from outside it. Every
-type works for an element with no size, such as a struct with no fields:
-`safe.mem` is the allocation the library shares, and it gives such a type an
-address nothing is read from.
+type works for an element with no size, such as a struct with no fields: such a
+type is given an address nothing is read from, and no memory.
 
 ### Loops
 
@@ -242,6 +267,30 @@ An owner, or a part of one, may be moved on some ways through an `if`, a
 and on the ways that kept it Coil still drops it, at the end of its scope or when
 `set!` replaces it, by a flag set at run time (Rust's drop flags).
 
+### Arenas
+
+```coil
+(defsum Expr
+  (Num [(n i64)])
+  (Add [(a (BoxIn Expr ArenaRef)) (b (BoxIn Expr ArenaRef))]))
+(impl View Expr)                        ; a tree in an arena borrows the arena
+
+(defn num [(ar (ref Arena)) (n i64)] (-> (BoxIn Expr ArenaRef))
+  (BoxIn::in-arena [Expr] ar (Num n)))
+
+(let [(mut ar) (Arena::new)]
+  (let [e (Add :a (num ar 1) :b (num ar 2))]
+    (println "{}" (eval e)))            ; the tree is alive: ar cannot be reset here
+  (Arena::reset! (mut ar)))             ; everything it was made of, given back at once
+```
+
+What is in an arena is dropped as anything is, so a `Box` inside a node of
+the tree is freed; only the memory of the nodes themselves comes back all at
+once. A tree in an arena is a view, so its type is marked `View`, and a function
+that builds one from the arena and something else it is given says which it
+borrows from: `examples/arena.coil`'s parser takes the arena and the parser's
+state and says `:safe/borrows "ar"`.
+
 ### Owned trait objects
 
 ```coil
@@ -272,6 +321,8 @@ common operations over a million elements, 200 times, built with `--release`
 | element through a `Pool` handle | 182 ms | 19 ms (an array index) |
 | a closure called per element | 18 ms | 19 ms (a direct call) |
 | a closure given to a `fold` | 19 ms | 20 ms (a function pointer) |
+| a list of 10,000 nodes built, summed and freed, 1,000 times: on the heap | 335 ms | 295 ms (malloc and free) |
+| the same in an `Arena`, reset each time | 200 ms | 127 ms (a bump allocator) |
 
 A bounds check is a compare and a branch: the failure is a function of its own
 that is never inlined, and the accessors are `:inline (Always)`, so the check is
@@ -282,6 +333,12 @@ fields rather than the closure, so a closure made where it is called, or in a
 function inlined there, stays in registers and the call is resolved and inlined.
 One given to a higher-order function that is not inlined is an indirect call, as
 a C function pointer is.
+
+An allocation in an arena is the bump of a pointer, inlined: the allocator is a
+type parameter, called directly, and giving an arena's memory back one value at
+a time is nothing. What the arena list pays beyond the plain one is its drop: the
+nodes are dropped one by one, as the model says, because one could own something
+outside the arena; the plain program only resets the arena.
 
 ## Programs
 
@@ -301,6 +358,7 @@ clean under `--sanitize=address`:
 | `msort.coil` | a parallel merge sort: a slice split into halves sorted on two threads with `par` |
 | `vm.coil` | a tiny language compiled to bytecode and run on a stack machine: trees of boxed sums, jumps patched after the fact, a call stack |
 | `wordcount.coil` | words counted on four threads into a shared table, through a channel |
+| `arena.coil` | a calculator whose syntax trees live in an `Arena`, reset after each line: a recursive sum of boxes in the arena, a parser that says what its trees borrow |
 
 ### par
 
@@ -381,16 +439,16 @@ run fails if the checker accepts anything the model refuses.
 checker at a time and requires `diff.py` to find a program the weakened checker
 wrongly accepts.
 
-On the model's 175 cases and 4000 random programs (seed 7), 3394 can be written
-as Coil; 781 use something Coil cannot express (most often a closure that
-returns a reference, or one that owns a capture that is not a borrow). The
-compiler refuses 1302 of them itself. On the other 2090 the checker accepts
-nothing the model refuses: 1382 accepted by both, 675 refused by both, and 33
-refused only by the checker, each for one of the differences below. All 31
+On the model's 192 cases and 4000 random programs (seed 7), 3409 can be written
+as Coil; 783 use something Coil cannot express (most often a closure that
+owns a capture that is not a borrow, or one that returns a reference). The
+compiler refuses 1300 of them itself. On the other 2105 the checker accepts
+nothing the model refuses: 1382 accepted by both, 695 refused by both, and 28
+refused only by the checker, each for one of the differences below. All 36
 weakenings of the checker are caught, by a hand-written case or the
 differential run.
 
-`tests/run.py` has 149 hand-written cases. The programs in `examples/` run clean
+`tests/run.py` has 174 hand-written cases. The programs in `examples/` run clean
 under `--sanitize=address`, and the threaded ones under `--sanitize=thread`.
 
 ### Where Coil and the model differ
@@ -433,6 +491,10 @@ Found by the differential run:
   view be, except that its own expansion may hand its helpers `(mut v)` or
   `(borrow v)` for a view whose module says it is `CrossThread` (`Slice`,
   `SliceMut`, `Halves`; not a held lock).
+- **`par` shares no arena.** The model lets one side of a `par` hold an arena
+  shared when the other side does not reach it. The checker, as Rust does with
+  `Sync`, hands the other thread no shared reference to anything that reaches an
+  arena at all; lending it there exclusively is the way to give a thread its own.
 - **A shared match on a plain-data payload reads a copy.** Coil copies such a
   payload into the arm, so the Coil form lends the copy. The checker refuses a
   reference to it that leaves the arm; the model lets a reference to the
@@ -458,6 +520,7 @@ A small language with everything the rules are about:
 | `(return e τ)` | leaving a function early |
 | `struct`, `sum`, `match`, `match-ref`, `match-mut` | structs with separately lent fields; sums whose payload reference keeps the variant in place |
 | `(pool σ)`, `(handle σ)`, `(at p h)` | a collection that owns its elements, and plain-data handles checked when used |
+| `arena`, `(arena-new)`, `(abox p e)`, `(abox α)`, `(reset! p)` | an arena, an owner; a box in the arena at `p`, second-class, which holds a shared loan on the arena and, when it holds a view, that view's loans; giving everything in an arena back at once, which needs it exclusively. Two calls at once may not both reach one arena |
 | type parameters | generics: a parameter may be an owner and can never be a reference |
 | `while`, `break` | loops; what is moved before a break is moved after the loop |
 | `(with ref g x …)`, `(with mut g x …)` | a global, lent for a scope, with exclusivity checked on entry |
@@ -491,7 +554,7 @@ racket model/search.rkt teeth       # each rule weakened in turn: the search mus
 racket model/search.rkt teeth 20000 no-union par-split   # only those weakenings
 ```
 
-`teeth` is the check on the search itself. `rules.rkt` lists 35 ways to weaken
+`teeth` is the check on the search itself. `rules.rkt` lists 42 ways to weaken
 one rule (`mutants`), and the machine can drop its run-time check on globals.
 `teeth` fails unless a hand-written case or the search finds a program that goes
 wrong under each one.
@@ -500,8 +563,10 @@ rules refuse is generated again, so `teeth` looks through four seeds before it
 says a weakening was not found.
 
 Four seeds of 20000 programs find no counterexample under the rules as they
-are. All 36 weakenings are found: 34 at 5000 programs a seed, and two (an
-exclusive reference copied, a later branch's loans forgotten) at 20000.
+are. All 43 weakenings are found: 41 at 5000 programs a seed, one (a reference
+to a global leaving its `with`) at 20000, and one (an argument's loans not alive
+while later arguments run) by a hand-written case, since the search never writes
+a place inside an argument.
 
 ## What the rules are stricter about than they need to be
 

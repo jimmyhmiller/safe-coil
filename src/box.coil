@@ -1,50 +1,93 @@
-;;; An owner of one value on the heap.
+;;; An owner of one value in memory from an allocator: the heap, a lease or an
+;;; arena (see safe.alloc).
 (module safe.box)
-(export Box)
+(export Box BoxIn)
 (import "coil.primitive" :as primitive)
-(import "coil.alloc" :as alloc)
-(import "safe.core" :use [unsafe lend lend-mut])
-(import "safe.mem" :as mem)
+(import "safe.core" :use [unsafe lend lend-mut View])
+(import "safe.alloc" :use [Alloc Heap Arena ArenaRef room-in room-in-arena release-in])
 
-;;; A value of type T on the heap, freed when its box leaves scope. A box cannot
-;;; be copied: naming one moves it.
-(defstruct Box [T] [(at (ptr T))])
+;;; A value of type T in memory from A, freed when its box leaves scope. A box
+;;; cannot be copied: naming one moves it. A box in an arena, `(BoxIn T
+;;; ArenaRef)`, is a view: it keeps the arena lent while it lives.
+(defstruct BoxIn [T A] [(at (ptr T)) (alloc A)])
 
-(impl [T] (Box T)
-  ;;; A box holding VALUE.
-  (new [(value T)] (-> (Box T))
+(impl [T] View (BoxIn T ArenaRef))
+
+;;; A value of type T on the heap: `(BoxIn T Heap)`, which it holds, with the
+;;; same methods. It is one pointer.
+(defstruct Box [T] [(in (BoxIn T Heap))])
+
+;;; Room for one T from A, holding VALUE.
+(defn put [T (A Alloc)] [(a (ref A)) (value T)] (-> (ptr T))
+  (unsafe
+    (let [at (data (room-in [T A] a 1))]
+      (store! at value)
+      at)))
+
+(impl [T (A Alloc)] (BoxIn T A)
+  ;;; A box holding VALUE, in memory from A: the heap (`Heap`) or a Lease. A
+  ;;; box in an arena is made by `BoxIn::in-arena`.
+  (new-in [(value T) (a A)] (-> (BoxIn T A))
     (unsafe
-      (let [at (data (mem/room [T] 1))]
-        (store! at value)
-        (Box :at at))))
+      (let [at (put [T A] a value)]
+        (BoxIn :at at :alloc a))))
 
   ;;; The value, lent for as long as the box is.
-  (get :inline (Always) [(box (ref (Box T)))] (-> (ref T))
+  (get :inline (Always) [(box (ref (BoxIn T A)))] (-> (ref T))
     (unsafe (lend (load (field box at)))))
 
   ;;; The value, lent to be changed for as long as the box is.
-  (get-mut :inline (Always) [(box (mut (Box T)))] (-> (mut T))
+  (get-mut :inline (Always) [(box (mut (BoxIn T A)))] (-> (mut T))
     (unsafe (lend-mut (load (field box at)))))
 
   ;;; The value, taken out of the box, which is freed.
-  (into [(box (Box T))] (-> T)
+  (into [(box (BoxIn T A))] (-> T)
     (unsafe
-      (let [held (manually-drop box)
+      (let [(mut held) (manually-drop box)
             at (load (field (field held value) at))
-            value (take! [T] at)]
-        (mem/release (slice::new [T] at 1))
+            value (take! [T] at)
+            ; the allocator goes with the box: it is dropped here
+            a (take! [A] (mut (.alloc (.value held))))]
+        (release-in [T A] a (slice::new [T] at 1))
         (forget held)
         value))))
+
+;;; A box in ARENA holding VALUE. The arena stays lent while the box lives.
+(impl [T] (BoxIn T ArenaRef)
+  ;;; VALUE may be a view, as a node of a tree in the arena is: the box then
+  ;;; keeps what it borrowed lent too.
+  (in-arena :safe/keeps "value" [(arena (ref Arena)) (value T)] (-> (BoxIn T ArenaRef))
+    (unsafe
+      (let [at (data (room-in-arena [T] arena 1))]
+        (store! at value)
+        (BoxIn :at at :alloc (Arena::lend arena))))))
+
+(impl [T] (Box T)
+  ;;; A box holding VALUE.
+  (new :inline (Always) [(value T)] (-> (Box T))
+    (Box :in (BoxIn::new-in [T Heap] value (Heap))))
+
+  ;;; The value, lent for as long as the box is.
+  (get :inline (Always) [(box (ref (Box T)))] (-> (ref T))
+    (unsafe (lend (load (field (field box in) at)))))
+
+  ;;; The value, lent to be changed for as long as the box is.
+  (get-mut :inline (Always) [(box (mut (Box T)))] (-> (mut T))
+    (unsafe (lend-mut (load (field (field box in) at)))))
+
+  ;;; The value, taken out of the box, which is freed.
+  (into :inline (Always) [(box (Box T))] (-> T)
+    (BoxIn::into [T Heap] (.in box))))
 
 ;;; `(clone b)`: a new box holding a clone of what B holds.
 (impl [(T Clone)] Clone (Box T)
   (clone [(b (ref (Box T)))] (-> (Box T))
     (Box::new (clone (Box::get b)))))
 
-(impl [T] Drop (Box T)
-  (drop [(self (mut (Box T)))] (-> void)
+(impl [T (A Alloc)] Drop (BoxIn T A)
+  (drop [(self (mut (BoxIn T A)))] (-> void)
     (unsafe
       (let [at (load (field self at))]
         (let [value (take! [T] at)] 0)
-        (mem/release (slice::new [T] at 1))
+        (release-in [T A] (field self alloc) (slice::new [T] at 1))
         0))))

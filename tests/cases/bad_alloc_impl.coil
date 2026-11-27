@@ -1,0 +1,10 @@
+(module case.bad-alloc-impl)
+(import "coil.alloc" :as alloc)
+(import "safe.core" :use [unsafe])
+(import "safe.alloc" :use [Alloc])
+(defstruct Mine [])
+(impl Alloc Mine
+  (grab [(a (ref Mine)) (request alloc/AllocRequest)] (-> (Option (ptr i8)))
+    (unsafe (alloc/raw-alloc (alloc/malloc-allocator) request)))
+  (give [(a (ref Mine)) (memory (ptr i8)) (request alloc/AllocRequest)] (-> void) 0))
+(defn main [] (-> i64) 0)

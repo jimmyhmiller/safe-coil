@@ -119,6 +119,8 @@
     (match v
       [`(own ,_) #t]
       [`(oclo ,_) #t]
+      [`(arena ,_) #t]
+      [`(abox ,_) #t]
       ;; a view whose drop runs code is moved, so that the code runs once
       [`(rec (%drop . ,_) . ,_) #t]
       [`(task ,_) #t]
@@ -142,6 +144,19 @@
        (kill! a)]
       [`(rec (%drop . ,V) . ,fs)
        (drop-val! (invoke (find 'defn (view-drop V)) (list `(rec ,@fs))))]
+      ;; an arena gives back the memory of everything in it; what is still in
+      ;; a box there is dropped
+      [`(arena ,a)
+       (define c (hash-ref store a))
+       (unless (cell-live? c) (raise (stuck "double free")))
+       (empty-arena! a)
+       (kill! a)]
+      ;; a box in an arena drops what it holds; its memory is the arena's
+      [`(abox ,m)
+       (define c (live-cell m "drop in"))
+       (define v (cell-v c))
+       (set-cell-v! c 'moved)
+       (unless (eq? v 'moved) (drop-val! v))]
       [`(rec (,_ . ,vs) ...) (for-each drop-val! vs)]
       [`(var ,_ ,pv) (drop-val! pv)]
       [`(tbl (,_ . ,vs) ...) (for-each drop-val! vs)]
@@ -153,6 +168,16 @@
     (define t (hash-ref tasks id (λ () (raise (stuck "a task joined twice")))))
     (hash-remove! tasks id)
     (cdr t))
+  ;; every cell the arena A gave out is given back, what is still in one dropped
+  (define (empty-arena! a)
+    (match (cell-v (hash-ref store a))
+      [`(members . ,ms)
+       (for ([m ms])
+         (define c (hash-ref store m))
+         (when (cell-live? c)
+           (unless (eq? (cell-v c) 'moved) (drop-val! (cell-v c)))
+           (kill! m)))
+       (set-cell-v! (hash-ref store a) '(members))]))
   (define (end-scope! a)
     (drop-val! (cell-v (hash-ref store a)))
     (kill! a))
@@ -168,6 +193,7 @@
       [(? symbol? x) (cons (hash-ref env x) '())]
       [`(* ,p2) (match (read! (addr p2 env))
                   [`(own ,a) (cons a '())]
+                  [`(abox ,a) (cons a '())]
                   [`(ptr ,a ,path) (cons a path)]
                   [v (raise (stuck (format "dereference of ~a" v)))])]
       [`(: ,p2 ,fld) (let ([ad (addr p2 env)]) (cons (car ad) (append (cdr ad) `((f ,fld)))))]
@@ -277,7 +303,27 @@
          [`(own ,a)
           (define v (read! (cons a '())))
           (kill! a)
+          v]
+         [`(abox ,a)
+          (define v (read! (cons a '())))
+          (write! (cons a '()) 'moved)
           v])]
+      ['(arena-new) `(arena ,(alloc! '(members) #t))]
+      [`(abox ,p ,e1)
+       (define v (ev e1 env))
+       (match (read! (addr p env))
+         [`(arena ,a)
+          ;; making room changes the arena
+          (log! a '() #t)
+          (define m (alloc! v #t))
+          (match (cell-v (live-cell a "allocation in"))
+            [`(members . ,ms) (set-cell-v! (hash-ref store a) `(members ,@ms ,m))])
+          `(abox ,m)]
+         [x (raise (stuck (format "allocation in ~a" x)))])]
+      [`(reset! ,p)
+       (match (read! (addr p env))
+         [`(arena ,a) (log! a '() #t) (empty-arena! a) 'unit]
+         [x (raise (stuck (format "reset of ~a" x)))])]
       [`(,(or 'ref 'mut 'out 'addr) ,p) (let ([ad (addr p env)]) `(ptr ,(car ad) ,(cdr ad)))]
       [`(set! ,p ,e1)
        (define v (ev e1 env))

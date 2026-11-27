@@ -45,6 +45,8 @@
     ['int "i64"]
     ['unit "i64"]
     [`(box ,σ) (format "(Box ~a)" (coil-type σ))]
+    ['arena "Arena"]
+    [`(abox ,σ) (format "(BoxIn ~a ArenaRef)" (coil-type σ))]
     [`(ptr ,σ) (format "(ptr ~a)" (coil-type σ))]
     [`(pool ,σ) (format "(Pool ~a)" (coil-type σ))]
     [`(handle ,σ) (format "(Handle ~a)" (coil-type σ))]
@@ -77,7 +79,7 @@
   (match p
     [(? symbol? x) (lookup Γ x)]
     [`(* ,q) (match (place-type Σ Γ q)
-               [`(,(or 'box 'ref 'mut) ,σ) σ]
+               [`(,(or 'box 'ref 'mut 'abox) ,σ) σ]
                [_ (bail "an ill-typed program")])]
     [`(: ,q ,fld) (match (assq fld (or (fields-of Σ (place-type Σ Γ q)) '()))
                     [(list _ t) t]
@@ -135,7 +137,10 @@
        [_ (bail "an ill-typed program")])]
     [`(spawn-fn ,e1) (match (type-of Σ Γ e1) [`(fno () ,σ) `(task ,σ)] [_ (bail "an ill-typed program")])]
     [`(box ,e1) `(box ,(type-of Σ Γ e1))]
-    [`(unbox ,e1) (match (type-of Σ Γ e1) [`(box ,σ) σ] [_ (bail "an ill-typed program")])]
+    [`(unbox ,e1) (match (type-of Σ Γ e1) [`(,(or 'box 'abox) ,σ) σ] [_ (bail "an ill-typed program")])]
+    ['(arena-new) 'arena]
+    [`(abox ,_ ,e1) `(abox ,(type-of Σ Γ e1))]
+    [`(reset! ,_) 'unit]
     [`(ref ,p) `(ref ,(place-type Σ Γ p))]
     [`(mut ,p) `(mut ,(place-type Σ Γ p))]
     [`(set! ,_ ,_) 'unit]
@@ -185,6 +190,7 @@
     [(? symbol? x) (var-name x)]
     [`(* ,q) (match (place-type Σ Γ q)
                [`(box ,_) (format "(Box::get ~a)" (shared-place Σ Γ q))]
+               [`(abox ,_) (format "(BoxIn::get ~a)" (shared-place Σ Γ q))]
                [_ (shared-place Σ Γ q)])]
     [`(: ,q ,fld)
      (define V (view-reference Σ Γ q fld))
@@ -199,6 +205,7 @@
     [(? symbol? x) (var-name x)]
     [`(* ,q) (match (place-type Σ Γ q)
                [`(box ,_) (format "(Box::get-mut (mut ~a))" (written-place Σ Γ q))]
+               [`(abox ,_) (format "(BoxIn::get-mut (mut ~a))" (written-place Σ Γ q))]
                [_ (written-place Σ Γ q)])]
     [`(: ,q ,fld)
      (define V (view-reference Σ Γ q fld))
@@ -336,7 +343,13 @@
        [`(fno () ,σ) (format "(spawn (~a-own::call-once ~a))" (closure-name '() σ) (plain Σ Γ e1))]
        [_ (bail "an ill-typed program")])]
     [`(box ,e1) (format "(Box::new ~a)" (plain Σ Γ e1))]
-    [`(unbox ,e1) (format "(Box::into ~a)" (plain Σ Γ e1))]
+    [`(unbox ,e1) (match (type-of Σ Γ e1)
+                    [`(abox ,_) (format "(BoxIn::into ~a)" (plain Σ Γ e1))]
+                    [_ (format "(Box::into ~a)" (plain Σ Γ e1))])]
+    ['(arena-new) "(Arena::new)"]
+    [`(abox ,p ,e1) (format "(BoxIn::in-arena [~a] ~a ~a)"
+                            (coil-type (type-of Σ Γ e1)) (shared-place Σ Γ p) (plain Σ Γ e1))]
+    [`(reset! ,p) (unit-after (format "(Arena::reset! (mut ~a))" (written-place Σ Γ p)))]
     [`(set! ,p ,e1)
      (unit-after
       (if (symbol? p)
@@ -619,7 +632,8 @@
              "(import \"coil.primitive\" :as primitive)\n"
              "(import \"coil.alloc\" :as alloc)\n"
              "(import \"safe.core\" :use [unsafe replace! borrow borrow-mut move lend lend-mut View])\n"
-             "(import \"safe.box\" :use [Box])\n"
+             "(import \"safe.box\" :use [Box BoxIn])\n"
+             "(import \"safe.alloc\" :use [Arena ArenaRef])\n"
              "(import \"safe.pool\" :use [Pool Handle])\n"
              "(import \"safe.global\" :use [defglobal with-ref with-mut Global])\n"
              "(import \"safe.par\" :use [par])\n"

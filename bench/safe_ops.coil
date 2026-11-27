@@ -3,7 +3,9 @@
 (import "coil.time" :as time)
 (import "coil.primitive" :as primitive)
 (import "safe.vec" :use [Vec])
-(import "safe.box" :use [Box])
+(import "safe.box" :use [Box BoxIn])
+(import "safe.alloc" :use [Arena ArenaRef])
+(import "safe.core" :use [View])
 (import "safe.pool" :use [Pool Handle])
 (import "safe.fn" :use [deffn lambda])
 (import "safe.loop" :use [for])
@@ -15,6 +17,26 @@
   (let [(mut acc) start]
     (for i (range 0 (len xs)) (set! acc (Step::run (mut f) acc (Vec::at xs i))))
     acc))
+
+;;; A list of numbers on the heap, a box a node.
+(defsum HeapList (HeapEnd) (HeapLink [(n i64) (next (Box HeapList))]))
+
+(defn heap-list [(k i64)] (-> HeapList)
+  (if (= k 0) (HeapEnd) (HeapLink :n k :next (Box::new (heap-list (- k 1))))))
+
+(defn heap-total [(l (ref HeapList))] (-> i64)
+  (match l (HeapEnd [] 0) (HeapLink [n next] (+ n (heap-total (Box::get next))))))
+
+;;; The same list in an arena: a view, which keeps the arena lent.
+(defsum ArenaList (ArenaEnd) (ArenaLink [(n i64) (next (BoxIn ArenaList ArenaRef))]))
+
+(impl View ArenaList)
+
+(defn arena-list [(ar (ref Arena)) (k i64)] (-> ArenaList)
+  (if (= k 0) (ArenaEnd) (ArenaLink :n k :next (BoxIn::in-arena [ArenaList] ar (arena-list ar (- k 1))))))
+
+(defn arena-total [(l (ref ArenaList))] (-> i64)
+  (match l (ArenaEnd [] 0) (ArenaLink [n next] (+ n (arena-total (BoxIn::get next))))))
 
 (defn now [] (-> i64) (match (time/monotonic-now-ms) (Ok [ms] ms) (Err [_] 0)))
 
@@ -53,5 +75,16 @@
       (report "pool" start sum))
     (let [start (now) (mut sum) 0]
       (for r (range 0 reps) (for i (range 0 n) (set! sum (+ sum (primitive/load (Box::get (Vec::at boxes i)))))))
-      (report "box" start sum)))
+      (report "box" start sum))
+    ;; a list of ten thousand nodes made, summed and given back, a thousand times
+    (let [start (now) (mut sum) 0]
+      (for r (range 0 1000)
+        (let [l (heap-list 10000)] (set! sum (+ sum (heap-total l)))))
+      (report "heap list" start sum))
+    (let [start (now) (mut sum) 0
+          (mut ar) (Arena::new)]
+      (for r (range 0 1000)
+        (let [l (arena-list ar 10000)] (set! sum (+ sum (arena-total l))))
+        (Arena::reset! (mut ar)))
+      (report "arena list" start sum)))
   0)

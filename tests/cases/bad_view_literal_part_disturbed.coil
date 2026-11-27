@@ -1,0 +1,12 @@
+(module case.bad-view-literal-part-disturbed)
+(import "coil.primitive" :as primitive)
+(import "safe.core" :use [View])
+(import "safe.vec" :use [Vec Slice])
+(defstruct Two [(s (Slice i64)) (n i64)])
+(impl View Two)
+(defn grow [(v (mut (Vec i64)))] (-> i64) (Vec::push! (mut v) 1) 0)
+(defn main [] (-> i64)
+  (let [(mut v) (Vec::new [i64])]
+    (Vec::push! (mut v) 2)
+    (let [t (Two :s (Vec::slice v 0 1) :n (grow (mut v)))]
+      (primitive/load (Slice::at (field t s) 0)))))

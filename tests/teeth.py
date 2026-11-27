@@ -108,6 +108,21 @@ WEAKENINGS = [
     ("any-trait-checked", "a method of any trait is taken to be checked code",
      "(checked-type? cx (get signature 3))))",
      "true))"),
+    ("arena-crosses", "par may hand its other thread a shared reference to an arena",
+     "(reaches-one-thread? cx t `()))\n        (fail! arg",
+     "false)\n        (fail! arg"),
+    ("arena-fields-unseen", "a struct holding an arena is not seen to reach it",
+     "(when (reaches-one-thread? cx (primitive/code-field-type t i) more)",
+     "(when false"),
+    ("view-literal-fresh", "a view built from its fields holds none of their loans",
+     "(if view (Res :loans all :fresh true) (fresh))",
+     "(fresh)"),
+    ("keeps-unvouched", "a function may say :safe/keeps without vouching for its body",
+     '(fail! form "safe: a function that says :safe/keeps vouches for where the view goes: its whole body is one (unsafe …)")',
+     "0"),
+    ("alloc-unsealed", "any module may implement Alloc",
+     '(fail! form "safe: only safe.alloc implements Alloc; give a collection another allocator through a Lease")',
+     "0"),
 ]
 
 n = sys.argv[1] if len(sys.argv) > 1 else "600"

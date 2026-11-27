@@ -1,0 +1,12 @@
+(module case.ok-borrows-view-parameter)
+(import "coil.primitive" :as primitive)
+(import "safe.core" :use [View])
+(import "safe.vec" :use [Vec Slice])
+(defstruct Seen [(s (Slice i64))])
+(impl View Seen)
+(defn pass :safe/borrows "x" [(x Seen) (y (ref i64))] (-> Seen) x)
+(defn main [] (-> i64)
+  (let [(mut v) (Vec::new [i64])]
+    (Vec::push! (mut v) 5)
+    (let [r (let [n 1] (pass (Seen :s (Vec::slice v 0 1)) n))]
+      (primitive/load (Slice::at (field r s) 0)))))

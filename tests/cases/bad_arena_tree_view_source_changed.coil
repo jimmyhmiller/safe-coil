@@ -1,0 +1,25 @@
+(module case.bad-arena-tree-view-source-changed)
+(import "coil.primitive" :as primitive)
+(import "safe.core" :use [View unsafe])
+(import "safe.box" :use [Box BoxIn])
+(import "safe.vec" :use [Vec Slice])
+(import "safe.alloc" :use [Arena ArenaRef])
+(defsum Expr
+  (Num [(n i64)])
+  (Seen [(s (Slice i64))])
+  (Add [(a (BoxIn Expr ArenaRef)) (b (BoxIn Expr ArenaRef))]))
+(impl View Expr)
+(defn eval [(e (ref Expr))] (-> i64)
+  (match e
+    (Num [n] n)
+    (Seen [s] (primitive/load (Slice::at s 0)))
+    (Add [a b] (+ (eval (BoxIn::get a)) (eval (BoxIn::get b))))))
+(defn num [(ar (ref Arena)) (n i64)] (-> (BoxIn Expr ArenaRef)) (BoxIn::in-arena [Expr] ar (Num n)))
+(defn tree [(ar (ref Arena))] (-> Expr) (Add :a (num ar 1) :b (num ar 2)))
+(defn main [] (-> i64)
+  (let [ar (Arena::new)
+        (mut v) (Vec::new [i64])]
+    (Vec::push! (mut v) 5)
+    (let [b (BoxIn::in-arena [Expr] ar (Seen (Vec::slice v 0 1)))]
+      (Vec::push! (mut v) 6)
+      (eval (BoxIn::get b)))))

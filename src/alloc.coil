@@ -1,0 +1,186 @@
+;;; Where the library's owners get their memory: the heap, a lease on another
+;;; allocator, or an arena.
+;;;
+;;; A collection takes its allocator as a type parameter, `(VecIn T A)`, and
+;;; `(Vec T)` is `(VecIn T Heap)`. An arena gives memory back all at once, when
+;;; it is reset or dropped, so what is allocated in it borrows it: a collection
+;;; in an arena is a view that keeps the arena lent, shared, for as long as it
+;;; lives. Many can live at once; none outlives the arena, and the arena is not
+;;; reset while one is alive.
+;;;
+;;;   (let [arena (Arena::new)
+;;;         (mut xs) (VecIn::in-arena [i64] arena)]
+;;;     (VecIn::push! (mut xs) 1)
+;;;     …)
+(module safe.alloc)
+(export Alloc Heap Lease Arena ArenaRef room-in room-in-arena release-in)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.scratch" :use [ScratchArena])
+(import "safe.core" :use [unsafe View SharedView OneThread])
+
+;;; Gives a collection its memory, and takes it back. The collection trusts that
+;;; what it is given is memory nothing else uses, so only this module implements
+;;; it (the checker refuses an impl anywhere else); another allocator is reached
+;;; through a Lease. Each is called directly, not through a trait object, so an
+;;; arena's allocation is a bump of a pointer, inlined, and its give-back
+;;; nothing at all.
+(deftrait Alloc [Self]
+  (grab [(a (ref Self)) (request alloc/AllocRequest)] (-> (Option (ptr i8))))
+  (give [(a (ref Self)) (memory (ptr i8)) (request alloc/AllocRequest)] (-> void)))
+
+;;; What asking for COUNT values of T asks for, COUNT above zero and T with a
+;;; size. More than memory can hold stops the program. It is built where it is
+;;; used, so a box's request is constants.
+(defn request-for :inline (Always) [T] [(count i64)] (-> alloc/AllocRequest)
+  (unsafe
+    (when (> count (/ 9223372036854775807 (primitive/sizeof T)))
+      (out-of-memory))
+    (alloc/AllocRequest :type-id (alloc/type-id [T]) :count count
+                        :bytes (* count (primitive/sizeof T)) :align (primitive/alignof T))))
+
+;;; Room for COUNT values of T from A, holding none yet. Running out of memory
+;;; stops the program. A type with no size needs no memory, and Coil's
+;;; allocators refuse to give it any: its room is an address nothing is ever
+;;; read from.
+(defn room-in :inline (Always) [T (A Alloc)] [(a (ref A)) (count i64)] (-> (slice T))
+  (unsafe
+    (if (or (= (primitive/sizeof T) 0) (= count 0))
+        (slice::new [T] (primitive/cast (ptr T) (primitive/alignof T)) count)
+        (match (grab a (request-for [T] count))
+          (Some [memory] (slice::new [T] (primitive/cast (ptr T) memory) count))
+          (None [] (out-of-memory))))))
+
+(defn out-of-memory :inline (Never) [] (-> never)
+  (panic "safe: out of memory"))
+
+;;; Room for COUNT values of T in ARENA, holding none yet: `room-in` for a
+;;; collection made in an arena, before it holds the ArenaRef it keeps.
+(defn room-in-arena :inline (Always) [T] [(arena (ref Arena)) (count i64)] (-> (slice T))
+  (unsafe
+    (if (or (= (primitive/sizeof T) 0) (= count 0))
+        (slice::new [T] (primitive/cast (ptr T) (primitive/alignof T)) count)
+        (match (alloc/allocate (load (field arena at)) (request-for [T] count))
+          (Some [memory] (slice::new [T] (primitive/cast (ptr T) memory) count))
+          (None [] (out-of-memory))))))
+
+;;; Give back to A what `room-in` gave. The values it held must have been taken
+;;; out.
+(defn release-in :inline (Always) [T (A Alloc)] [(a (ref A)) (memory (slice T))] (-> void)
+  (unsafe
+    (unless (or (= (primitive/sizeof T) 0) (= (len memory) 0))
+      (give a (primitive/cast (ptr i8) (data memory)) (request-for [T] (len memory))))
+    0))
+
+;; ---- the heap ----------------------------------------------------------------
+
+;;; The heap, through malloc. It has no size: a collection on the heap is as big
+;;; as it was before collections took an allocator.
+(defstruct Heap [])
+
+(impl Alloc Heap
+  (grab :inline (Always) [(a (ref Heap)) (request alloc/AllocRequest)] (-> (Option (ptr i8)))
+    (unsafe (alloc/raw-alloc (alloc/malloc-allocator) request)))
+  (give :inline (Always) [(a (ref Heap)) (memory (ptr i8)) (request alloc/AllocRequest)] (-> void)
+    (unsafe (alloc/raw-free (alloc/malloc-allocator) memory request) 0)))
+
+;; ---- a lease -----------------------------------------------------------------
+
+;;; Any of Coil's allocators, held by a lease: the allocator lives until the
+;;; last lease on it is dropped. A Lease is an owner; cloning it takes another
+;;; lease on the same allocator.
+(defstruct Lease [(lease alloc/AllocatorLease)])
+
+(impl Lease
+  ;;; The heap, as a lease.
+  (heap [] (-> Lease)
+    (unsafe (Lease :lease (alloc/malloc-allocator-lease))))
+
+  ;;; A Lease on what LEASE leases. Taking a raw lease is allowed only inside
+  ;;; `(unsafe …)`, which vouches for two things the checker cannot see: the
+  ;;; allocator gives memory nothing else uses and stays valid until the last
+  ;;; lease is released, and it may be used from two threads at once, since a
+  ;;; lease and its clones can move to other threads.
+  (assume [(lease alloc/AllocatorLease)] (-> Lease)
+    (unsafe (Lease :lease lease))))
+
+(impl Alloc Lease
+  (grab :inline (Always) [(a (ref Lease)) (request alloc/AllocRequest)] (-> (Option (ptr i8)))
+    (unsafe (alloc/lease-raw-alloc (field a lease) request)))
+  (give :inline (Always) [(a (ref Lease)) (memory (ptr i8)) (request alloc/AllocRequest)] (-> void)
+    (unsafe (alloc/lease-raw-free (field a lease) memory request) 0)))
+
+(impl Clone Lease
+  (clone [(a (ref Lease))] (-> Lease)
+    (unsafe (Lease :lease (clone (field a lease))))))
+
+;; ---- arenas ------------------------------------------------------------------
+
+;;; An arena: memory handed out by bumping a pointer through segments taken
+;;; from the heap, all given back at once by `reset!` or when the arena is
+;;; dropped. It is an owner. What is allocated in it borrows it (see ArenaRef),
+;;; and allocating changes it though it is lent shared, so it stays on one
+;;; thread.
+(defstruct Arena [(at (ptr ScratchArena))])
+
+(impl OneThread Arena)
+
+(impl Arena
+  ;;; An empty arena; its first segment is taken when something is allocated.
+  (new [] (-> Arena)
+    (Arena::with-room 4096))
+
+  ;;; An empty arena whose first segment holds BYTES.
+  (with-room [(bytes i64)] (-> Arena)
+    (unsafe
+      (let [at (match (alloc/alloc [ScratchArena] (alloc/malloc-allocator) 1)
+                 (Some [memory] (data memory))
+                 (None [] (out-of-memory)))]
+        (ScratchArena::init-with-capacity at (alloc/malloc-allocator) bytes)
+        (Arena :at at))))
+
+  ;;; The arena, lent to allocate in: what is allocated through the ArenaRef
+  ;;; keeps the arena lent.
+  (lend :inline (Always) [(a (ref Arena))] (-> ArenaRef)
+    (unsafe (ArenaRef :at (load (field a at)))))
+
+  ;;; Give back everything allocated in the arena, keeping nothing. Nothing in
+  ;;; it may be alive: the arena is lent exclusively.
+  (reset! [(a (mut Arena))] (-> void)
+    (unsafe
+      (ScratchArena::reset! (load (field a at)))
+      0))
+
+  ;;; Bytes allocated in the arena since it was made or last reset.
+  (live [(a (ref Arena))] (-> i64)
+    (unsafe (ScratchArena::live (load (field a at)))))
+
+  ;;; Bytes the arena has taken from the heap for its segments, over its life.
+  (reserved [(a (ref Arena))] (-> i64)
+    (unsafe (ScratchArena::reserved-total (load (field a at))))))
+
+(impl Drop Arena
+  (drop [(self (mut Arena))] (-> void)
+    (unsafe
+      (let [at (load (field self at))]
+        (ScratchArena::close! at)
+        (alloc/free (alloc/malloc-allocator) (slice::new [ScratchArena] at 1))
+        0))))
+
+;;; An arena, lent shared to allocate in. It is a view, so it keeps the arena
+;;; lent while it lives, and so does whatever is made from it: a collection in
+;;; the arena is a view too. It may be copied, and stays on the arena's thread.
+(defstruct ArenaRef [(at (ptr ScratchArena))])
+
+(impl View ArenaRef)
+
+(impl SharedView ArenaRef)
+
+(impl OneThread ArenaRef)
+
+(impl Alloc ArenaRef
+  (grab :inline (Always) [(a (ref ArenaRef)) (request alloc/AllocRequest)] (-> (Option (ptr i8)))
+    (unsafe (alloc/allocate (load (field a at)) request)))
+  ;; an arena gives its memory back all at once
+  (give :inline (Always) [(a (ref ArenaRef)) (memory (ptr i8)) (request alloc/AllocRequest)] (-> void)
+    0))

@@ -1,14 +1,22 @@
 ;;; A growable list that owns its elements.
 (module safe.vec)
-(export Vec Slice SliceMut Halves)
+(export Vec VecIn Slice SliceMut Halves)
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc)
 (import "safe.core" :use [unsafe lend lend-mut View Each EachMut SharedView CrossThread stop-index stop-range])
-(import "safe.mem" :use [room release])
+(import "safe.alloc" :use [Alloc Heap Arena ArenaRef room-in release-in])
 
-;;; A list of T. It owns its elements: they are freed with it. An index out of
-;;; range stops the program.
-(defstruct Vec [T] [(items (slice T)) (count i64)])
+;;; A list of T, in memory from A (see safe.alloc). It owns its elements: they
+;;; are freed with it. An index out of range stops the program. A list in an
+;;; arena, `(VecIn T ArenaRef)`, is a view: it keeps the arena lent while it
+;;; lives.
+(defstruct VecIn [T A] [(items (slice T)) (count i64) (alloc A)])
+
+(impl [T] View (VecIn T ArenaRef))
+
+;;; A list of T on the heap: `(VecIn T Heap)`, which it holds, with the same
+;;; methods.
+(defstruct Vec [T] [(in (VecIn T Heap))])
 
 ;;; Part of a list, lent shared: `count` elements from `items`. It is a view: the
 ;;; list stays lent for as long as the slice lives, so it cannot grow or be
@@ -59,38 +67,43 @@
       (stop-range from to count))
     (primitive/index items from)))
 
+;;; No room at all: a list takes its first room when something is put in it.
+(defn empty :inline (Always) [T] [] (-> (slice T))
+  (unsafe (slice::new [T] (primitive/cast (ptr T) (primitive/alignof T)) 0)))
+
 ;;; Where element I of V is. An index out of range stops the program.
-(defn slot :inline (Always) [T] [(v (ref (Vec T))) (i i64)] (-> (ptr T))
+(defn slot :inline (Always) [T A] [(v (ref (VecIn T A))) (i i64)] (-> (ptr T))
   (unsafe
     (when (or (< i 0) (>= i (.count v)))
       (stop-index i "a Vec" (.count v)))
     (primitive/index (data (.items v)) i)))
 
-(impl [T] (Vec T)
-  ;;; An empty list.
-  (new [] (-> (Vec T))
-    (unsafe (Vec :items (room [T] 4) :count 0)))
+(impl [T (A Alloc)] (VecIn T A)
+  ;;; An empty list in memory from A: the heap (`Heap`) or a Lease. A list in
+  ;;; an arena is made by `VecIn::in-arena`.
+  (new-in [(a A)] (-> (VecIn T A))
+    (unsafe (VecIn :items (empty [T]) :count 0 :alloc a)))
 
   ;;; How many elements it holds.
-  (len :inline (Always) [(v (ref (Vec T)))] (-> i64)
+  (len :inline (Always) [(v (ref (VecIn T A)))] (-> i64)
     (.count v))
 
   ;;; Add VALUE at the end.
-  (push! [(v (mut (Vec T))) (value T)] (-> void)
+  (push! [(v (mut (VecIn T A))) (value T)] (-> void)
     (unsafe
       (when (= (.count v) (len (.items v)))
-        (let [bigger (room [T] (* 2 (len (.items v))))]
+        (let [bigger (room-in [T A] (field v alloc) (if (= (len (.items v)) 0) 4 (* 2 (len (.items v)))))]
           (for i (range 0 (.count v))
             (store! (primitive/index (data bigger) i)
                     (take! [T] (primitive/index (data (.items v)) i))))
-          (release (.items v))
+          (release-in [T A] (field v alloc) (.items v))
           (set! (.items v) bigger)))
       (store! (primitive/index (data (.items v)) (.count v)) value)
       (set! (.count v) (+ (.count v) 1))
       0))
 
   ;;; Take the last element off, or None when there is none.
-  (pop! [(v (mut (Vec T)))] (-> (Option T))
+  (pop! [(v (mut (VecIn T A)))] (-> (Option T))
     (unsafe
       (if (= (.count v) 0)
           (None [T])
@@ -98,7 +111,7 @@
               (Some (take! [T] (primitive/index (data (.items v)) (.count v))))))))
 
   ;;; Exchange elements I and J. An index out of range stops the program.
-  (swap! [(v (mut (Vec T))) (i i64) (j i64)] (-> void)
+  (swap! [(v (mut (VecIn T A))) (i i64) (j i64)] (-> void)
     (unsafe
       (let [a (slot v i)
             b (slot v j)]
@@ -110,53 +123,96 @@
 
   ;;; Put VALUE at I, moving the elements from I on one place later. I may be
   ;;; the length, which adds VALUE at the end.
-  (insert! [(v (mut (Vec T))) (i i64) (value T)] (-> void)
+  (insert! [(v (mut (VecIn T A))) (i i64) (value T)] (-> void)
     (unsafe
       (when (or (< i 0) (> i (.count v)))
         (stop-index i "inserting into a Vec" (.count v)))
-      (Vec::push! (mut v) value)
+      (VecIn::push! (mut v) value)
       (let [(mut k) (- (.count v) 1)]
         (while (> k i)
-          (Vec::swap! (mut v) k (- k 1))
+          (VecIn::swap! (mut v) k (- k 1))
           (set! k (- k 1))))
       0))
 
   ;;; Take element I out, moving the elements after it one place earlier. An
   ;;; index out of range stops the program.
-  (remove! [(v (mut (Vec T))) (i i64)] (-> T)
+  (remove! [(v (mut (VecIn T A))) (i i64)] (-> T)
     (unsafe
       (slot v i)
       (let [(mut k) i]
         (while (< k (- (.count v) 1))
-          (Vec::swap! (mut v) k (+ k 1))
+          (VecIn::swap! (mut v) k (+ k 1))
           (set! k (+ k 1))))
       (set! (.count v) (- (.count v) 1))
       (take! [T] (primitive/index (data (.items v)) (.count v)))))
 
   ;;; Drop every element, keeping the room.
-  (clear! [(v (mut (Vec T)))] (-> void)
-    (while (> (Vec::len v) 0)
-      (Vec::pop! (mut v)))
+  (clear! [(v (mut (VecIn T A)))] (-> void)
+    (while (> (VecIn::len v) 0)
+      (VecIn::pop! (mut v)))
     0)
 
   ;;; Element I, lent for as long as the list is.
-  (at :inline (Always) [(v (ref (Vec T))) (i i64)] (-> (ref T))
+  (at :inline (Always) [(v (ref (VecIn T A))) (i i64)] (-> (ref T))
     (unsafe (lend (slot v i))))
 
   ;;; Element I, lent to be changed for as long as the list is.
-  (at-mut :inline (Always) [(v (mut (Vec T))) (i i64)] (-> (mut T))
+  (at-mut :inline (Always) [(v (mut (VecIn T A))) (i i64)] (-> (mut T))
     (unsafe (lend-mut (slot v i))))
 
   ;;; The elements from FROM up to TO, lent shared. A range that is not inside
   ;;; the list stops the program.
-  (slice [(v (ref (Vec T))) (from i64) (to i64)] (-> (Slice T))
+  (slice [(v (ref (VecIn T A))) (from i64) (to i64)] (-> (Slice T))
     (unsafe
       (Slice :items (range-within (data (.items v)) (.count v) from to) :count (- to from))))
 
   ;;; The elements from FROM up to TO, lent to be changed.
-  (slice-mut [(v (mut (Vec T))) (from i64) (to i64)] (-> (SliceMut T))
+  (slice-mut [(v (mut (VecIn T A))) (from i64) (to i64)] (-> (SliceMut T))
     (unsafe
       (SliceMut :items (range-within (data (.items v)) (.count v) from to) :count (- to from)))))
+
+
+;;; An empty list in ARENA, which stays lent while the list lives.
+(impl [T] (VecIn T ArenaRef)
+  (in-arena [(arena (ref Arena))] (-> (VecIn T ArenaRef))
+    (unsafe (VecIn :items (empty [T]) :count 0 :alloc (Arena::lend arena)))))
+
+(impl [T] (Vec T)
+  ;;; An empty list.
+  (new :inline (Always) [] (-> (Vec T))
+    (Vec :in (VecIn::new-in [T Heap] (Heap))))
+
+  (len :inline (Always) [(v (ref (Vec T)))] (-> i64) (VecIn::len (field v in)))
+
+  (push! :inline (Always) [(v (mut (Vec T))) (value T)] (-> void)
+    (VecIn::push! (mut (field v in)) value))
+
+  (pop! :inline (Always) [(v (mut (Vec T)))] (-> (Option T))
+    (VecIn::pop! (mut (field v in))))
+
+  (swap! :inline (Always) [(v (mut (Vec T))) (i i64) (j i64)] (-> void)
+    (VecIn::swap! (mut (field v in)) i j))
+
+  (insert! :inline (Always) [(v (mut (Vec T))) (i i64) (value T)] (-> void)
+    (VecIn::insert! (mut (field v in)) i value))
+
+  (remove! :inline (Always) [(v (mut (Vec T))) (i i64)] (-> T)
+    (VecIn::remove! (mut (field v in)) i))
+
+  (clear! :inline (Always) [(v (mut (Vec T)))] (-> void)
+    (VecIn::clear! (mut (field v in))))
+
+  (at :inline (Always) [(v (ref (Vec T))) (i i64)] (-> (ref T))
+    (VecIn::at (field v in) i))
+
+  (at-mut :inline (Always) [(v (mut (Vec T))) (i i64)] (-> (mut T))
+    (VecIn::at-mut (mut (field v in)) i))
+
+  (slice :inline (Always) [(v (ref (Vec T))) (from i64) (to i64)] (-> (Slice T))
+    (VecIn::slice (field v in) from to))
+
+  (slice-mut :inline (Always) [(v (mut (Vec T))) (from i64) (to i64)] (-> (SliceMut T))
+    (VecIn::slice-mut (mut (field v in)) from to)))
 
 (impl [T] (Slice T)
   ;;; How many elements it covers.
@@ -210,16 +266,28 @@
       (SliceMut :items (range-within (.items s) (.count s) from to) :count (- to from)))))
 
 ;;; `(len v)`, as for Coil's own collections.
+(impl [T A] Len (VecIn T A)
+  (len :inline (Always) [(v (ref (VecIn T A)))] (-> i64) (.count v)))
+
 (impl [T] Len (Vec T)
-  (len :inline (Always) [(v (ref (Vec T)))] (-> i64) (.count v)))
+  (len :inline (Always) [(v (ref (Vec T)))] (-> i64) (.count (field v in))))
 
 ;;; `(get v i)`: a copy of element I, for elements that are plain data; one
 ;;; that owns something is lent with `(Vec::at v i)`.
-(impl [T] Get (Vec T)
-  (get :inline (Always) :collection/copies-element "(Vec::at v i)" [(v (ref (Vec T))) (i i64)] (-> T)
+(impl [T A] Get (VecIn T A)
+  (get :inline (Always) :collection/copies-element "(VecIn::at v i)" [(v (ref (VecIn T A))) (i i64)] (-> T)
     (unsafe (load (slot v i)))))
 
+(impl [T] Get (Vec T)
+  (get :inline (Always) :collection/copies-element "(Vec::at v i)" [(v (ref (Vec T))) (i i64)] (-> T)
+    (unsafe (load (slot (field v in) i)))))
+
 ;;; `(set! (mut v) i x)`: element I replaced, the old one dropped.
+(impl [T (A Alloc)] Set (VecIn T A)
+  (set! [(v (mut (VecIn T A))) (i i64) (x T)] (-> i64)
+    (set! (VecIn::at-mut (mut v) i) x)
+    0))
+
 (impl [T] Set (Vec T)
   (set! [(v (mut (Vec T))) (i i64) (x T)] (-> i64)
     (set! (Vec::at-mut (mut v) i) x)
@@ -232,6 +300,13 @@
       (for i (range 0 (Vec::len v))
         (Vec::push! (mut out) (clone (Vec::at v i))))
       out)))
+
+(impl [T (A Alloc)] Each (VecIn T A)
+  (count :inline (Always) [(xs (ref (VecIn T A)))] (-> i64) (VecIn::len xs))
+  (item :inline (Always) [(xs (ref (VecIn T A))) (i i64)] (-> (ref T)) (VecIn::at xs i)))
+
+(impl [T (A Alloc)] EachMut (VecIn T A)
+  (item-mut :inline (Always) [(xs (mut (VecIn T A))) (i i64)] (-> (mut T)) (VecIn::at-mut (mut xs) i)))
 
 (impl [T] Each (Vec T)
   (count :inline (Always) [(xs (ref (Vec T)))] (-> i64) (Vec::len xs))
@@ -251,10 +326,10 @@
 (impl [T] EachMut (SliceMut T)
   (item-mut [(xs (mut (SliceMut T))) (i i64)] (-> (mut T)) (SliceMut::at-mut (mut xs) i)))
 
-(impl [T] Drop (Vec T)
-  (drop [(self (mut (Vec T)))] (-> void)
+(impl [T (A Alloc)] Drop (VecIn T A)
+  (drop [(self (mut (VecIn T A)))] (-> void)
     (unsafe
       (for i (range 0 (.count self))
         (let [value (take! [T] (primitive/index (data (.items self)) i))] 0))
-      (release (.items self))
+      (release-in [T A] (field self alloc) (.items self))
       0)))

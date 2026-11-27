@@ -1,0 +1,13 @@
+(module case.bad-view-literal-loses-loans)
+(import "coil.primitive" :as primitive)
+(import "safe.core" :use [View])
+(import "safe.box" :use [BoxIn])
+(import "safe.alloc" :use [Arena ArenaRef])
+(defstruct Two [(a (BoxIn i64 ArenaRef))])
+(impl View Two)
+(impl Drop Two (drop [(self (mut Two))] (-> void) 0))
+(defn main [] (-> i64)
+  (let [(mut ar) (Arena::new)]
+    (let [t (Two :a (BoxIn::in-arena [i64] ar 1))]
+      (Arena::reset! (mut ar))
+      (primitive/load (BoxIn::get (.a t))))))

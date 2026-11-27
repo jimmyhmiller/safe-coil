@@ -64,7 +64,12 @@
     (return-escape "a value returned early may hold a loan on the function's own storage")
     (out-unfilled "a function may leave its out parameter unfilled")
     (borrows-unchecked "a function may return a loan from a parameter its borrows declaration leaves out")
-    (two-phase-unchecked "an argument lent exclusively may be lent again by a later argument of the call")))
+    (two-phase-unchecked "an argument lent exclusively may be lent again by a later argument of the call")
+    (abox-no-loan "a box in an arena carries no loan on the arena")
+    (abox-unpinned "a box in an arena gives up its loan on the arena at its last use, though its drop uses the arena")
+    (reset-unchecked "an arena is reset while what is in it is used")
+    (par-arena-shared "an arena may be lent shared to both of two calls at once")
+    (abox-view-loans "a box in an arena that holds a view does not hold the view's loans")))
 (define (mutant? m) (eq? (mutant) m))
 
 (define-language Safe
@@ -84,15 +89,21 @@
   ;; what it captured is storable; one that borrows is second-class, exclusive
   ;; when it captured something exclusively. An out parameter refers to a place
   ;; that holds nothing yet, which the callee must fill.
+;; An arena owns the memory of what is allocated in it, all of it given back
+  ;; at once; a box in an arena, `(abox α)`, holds a shared loan on the arena.
+  ;; It may hold a view, whose loans it then holds too: what an arena holds can
+  ;; borrow what else is in it, so a tree can be built there.
   (σ ::= int unit (box σ) (ptr σ) (pool σ) (handle σ) (task σ) (S σ ...) T
-         (fno (τ ...) τ))
+         (fno (τ ...) τ) arena)
   (ρ ::= σ (ref σ) (mut σ) (view V))
   ;; a reference to a view: a view lent where it lies, as `(mut (SliceMut T))`
-  (τ ::= ρ (ref (view V)) (mut (view V)) (fnb k (τ ...) τ) (out σ))
+  (τ ::= ρ (ref (view V)) (mut (view V)) (fnb k (τ ...) τ) (out σ) (abox α))
+  (α ::= σ (view V))
   (e ::= n unit p
          (let ([x e]) e) (seq e e) (if0 e e e) (+ e e)
          (while e e) (break) (return e τ)
          (box e) (unbox e) (ref p) (mut p) (out p) (set! p e) (take p e) (uninit σ)
+         (arena-new) (abox p e) (reset! p)
          (new τ e ...) (inj σ K e)
          (match e ((K x) e) ...) (match-ref p ((K x) e) ...) (match-mut p ((K x) e) ...)
          (pool-new σ) (insert p e) (remove p x)
@@ -224,9 +235,9 @@
 ;; every name in the type is declared, with the right number of arguments
 (define (wf? Σ τ)
   (match τ
-    [(or 'int 'unit) #t]
+    [(or 'int 'unit 'arena) #t]
     [(? symbol? t) (and (memq t (tparams Σ)) #t)]
-    [`(,(or 'box 'ptr 'pool 'handle 'task 'ref 'mut 'out) ,σ) (wf? Σ σ)]
+    [`(,(or 'box 'ptr 'pool 'handle 'task 'ref 'mut 'out 'abox) ,σ) (wf? Σ σ)]
     [`(view ,V) (and (find-decl Σ 'view V) #t)]
     [`(fnb ,k (,τs ...) ,τr) (and (memq k '(shr mut)) (andmap (λ (t) (wf? Σ t)) (cons τr τs)))]
     [`(fno (,τs ...) ,τr) (andmap (λ (t) (wf? Σ t)) (cons τr τs))]
@@ -236,11 +247,11 @@
     [_ #f]))
 
 (define (second-class? τ)
-  (match τ [`(,(or 'ref 'mut 'view 'out) ,_) #t] [`(fnb . ,_) #t] [_ #f]))
+  (match τ [`(,(or 'ref 'mut 'view 'out 'abox) ,_) #t] [`(fnb . ,_) #t] [_ #f]))
 ;; a second-class value that cannot be copied: it gives exclusive access
 (define (exclusive? Σ τ [seen '()])
   (match τ
-    [`(,(or 'mut 'out) ,_) #t]
+    [`(,(or 'mut 'out 'abox) ,_) #t]
     [`(fnb mut . ,_) #t]
     [`(view ,V) (and (not (memq V seen))
                      (for/or ([f (fields-of Σ τ)]) (exclusive? Σ (cadr f) (cons V seen))))]
@@ -271,6 +282,7 @@
     [(? symbol?) (mutant? 'copy-typevar)]
     [`(,(or 'ptr 'handle) ,_) #t]
     [`(,(or 'box 'pool 'task) ,_) #f]
+    ['arena #f]
     [`(fno . ,_) #f]
     [_ (let ([parts (or (fields-of Σ σ) (variants-of Σ σ))])
          (and parts
@@ -290,7 +302,7 @@
   (match p
     [(? symbol? x) (lookup Γ x)]
     [`(* ,p2) (match (place-type Σ Γ p2)
-                [`(,(or 'box 'ref 'mut 'out) ,σ) σ]
+                [`(,(or 'box 'ref 'mut 'out 'abox) ,σ) σ]
                 [_ #f])]
     [`(: ,p2 ,fld) (let* ([t (place-type Σ Γ p2)]
                           [fs (and t (fields-of Σ t))])
@@ -329,7 +341,7 @@
   (match p
     [(? symbol?) #t]
     [`(* ,p2) (and (or (mutant? 'write-through-shared)
-                       (match (place-type Σ Γ p2) [`(,(or 'box 'mut 'out) ,_) #t] [_ #f]))
+                       (match (place-type Σ Γ p2) [`(,(or 'box 'mut 'out 'abox) ,_) #t] [_ #f]))
                    (writable? Σ Γ p2))]
     [`(,_ ,p2 ,_) (writable? Σ Γ p2)]))
 (define (through-shared? Σ Γ p)
@@ -365,6 +377,8 @@
                                 [`(view ,_) (if (mutant? 'drop-view-unpinned)
                                                 (exclusive? Σ τ)
                                                 (dropped-view? Σ τ))]
+                                ;; its drop runs in the arena's memory
+                                [`(abox ,_) (not (mutant? 'abox-unpinned))]
                                 [_ #f]))]
           [_ #t])))
   (define holders (remove-duplicates (map car Λ)))
@@ -407,6 +421,37 @@
   (cond [(and (mutant? 'no-elem-loans) (has-at? p)) '()]
         [(through-shared? Σ Γ p) (loans-of Λ (place-root p))]
         [else `((,(norm p) shr))]))
+;; Can a value of type τ reach an arena? An arena changes when something is
+;; allocated in it, though it is lent only shared, so it is never lent to two
+;; threads at once.
+(define (holds-arena? Σ τ [seen '()])
+  (match τ
+    ['arena #t]
+    [(? symbol?) #f]
+    [`(,(or 'box 'ref 'mut 'out 'abox 'pool 'ptr 'task) ,σ) (holds-arena? Σ σ seen)]
+    [`(,(or 'fnb 'fno) . ,_) #f]
+    [_ (and (not (member τ seen))
+            (let ([parts (or (fields-of Σ τ) (variants-of Σ τ) '())])
+              (for/or ([part parts]) (holds-arena? Σ (cadr part) (cons τ seen)))))]))
+;; the loans one of two calls at once holds, as the other sees them: a shared
+;; loan on something that reaches an arena is an exclusive one. What it
+;; borrows reaches what that holds borrowed, so those loans count too.
+(define (par-loans Σ Γ Λ L0)
+  (define L
+    (let grow ([L L0])
+      (define more (union L (append* (for/list ([l L]) (loans-of Λ (place-root (car l)))))))
+      (if (= (length more) (length L)) L (grow more))))
+  (for/list ([l L])
+    (match l
+      [`(,q shr)
+       #:when (and (not (mutant? 'par-arena-shared))
+                   (let* ([r (place-root q)]
+                          [τ (match (assq r Γ)
+                               [(list _ τ _ _) τ]
+                               [_ (match (find-decl Σ 'global r) [`(global ,_ ,σ ,_) σ] [_ #f])])])
+                     (or (not τ) (holds-arena? Σ τ))))
+       `(,q mut)]
+      [_ l])))
 (define (exclusive-loans p)
   (if (and (mutant? 'no-elem-loans) (has-at? p)) '() `((,(norm p) mut))))
 
@@ -716,6 +761,39 @@
    -------------------------------------------- "unbox"
    (chk Σ Γ Λ (unbox e) σ () Γ_1)]
 
+  ;; ---- arenas
+
+  [-------------------------------------------- "arena-new"
+   (chk Σ Γ Λ (arena-new) arena () Γ)]
+
+  ;; what is put in an arena keeps the arena lent, shared: many boxes share it,
+  ;; and none outlives it or is in it when it is reset
+  [(chk ,(Σ+ (term Σ) (term p)) Γ Λ e α L_e Γ_1)
+   (side-condition ,(equal? (place-type (term Σ) (term Γ_1) (term p)) 'arena))
+   (side-condition ,(available? (term Γ_1) (term p)))
+   ;; what the value holds is alive while the arena is lent
+   (side-condition ,(read-ok? (active (term Σ) (term Γ_1) (add-loans (term Λ) (term tmp) (term L_e))) (term p)))
+   (where L ,(union (if (mutant? 'abox-no-loan) '() (shared-loans (term Σ) (term Γ_1) (term Λ) (term p)))
+                    (if (mutant? 'abox-view-loans) '() (term L_e))))
+   -------------------------------------------- "abox"
+   (chk Σ Γ Λ (abox p e) (abox α) L Γ_1)]
+
+  ;; giving back all of an arena's memory needs it exclusively
+  [(side-condition ,(equal? (place-type (term Σ) (term Γ) (term p)) 'arena))
+   (side-condition ,(available? (term Γ) (term p)))
+   (side-condition ,(writable? (term Σ) (term Γ) (term p)))
+   (side-condition ,(or (mutant? 'reset-unchecked)
+                        (write-ok? (active (term Σ) (term Γ) (term Λ)) (term p))))
+   -------------------------------------------- "reset"
+   (chk Σ Γ Λ (reset! p) unit () Γ)]
+
+  ;; what a box in an arena holds, moved out of it
+  ;; a view moved out keeps everything the box held lent
+  [(chk Σ Γ Λ e (abox α) L Γ_1)
+   (where L_r ,(if (second-class? (term α)) (term L) '()))
+   -------------------------------------------- "unbox-arena"
+   (chk Σ Γ Λ (unbox e) α L_r Γ_1)]
+
   ;; The loans of e_1's value belong to x, and count while x is still named. A
   ;; `let` of `(uninit σ)` makes a variable with nothing in it yet.
   [(chk ,(Σ+ (term Σ) (term e_2)) Γ Λ e_1 τ_1 L_1 Γ_1)
@@ -953,7 +1031,7 @@
    (where (τ_a1 ...) ,(for/list ([t (term (τ_1 ...))]) (subst t (term (T_1 ...)) (term (σ_1 ...)))))
    (where (τ_a2 ...) ,(for/list ([t (term (τ_2 ...))]) (subst t (term (T_2 ...)) (term (σ_2 ...)))))
    (chk-args ,(Σ+* (term Σ) (term (e_2 ...))) Γ Λ (e_1 ...) (τ_a1 ...) L_1 Γ_1)
-   (where Λ_2 ,(if (mutant? 'par-split) (term Λ) (add-loans (term Λ) (term tmp) (term L_1))))
+   (where Λ_2 ,(if (mutant? 'par-split) (term Λ) (add-loans (term Λ) (term tmp) (par-loans (term Σ) (term Γ_1) (term Λ) (term L_1)))))
    (chk-args Σ Γ_1 Λ_2 (e_2 ...) (τ_a2 ...) L_2 Γ_2)
    -------------------------------------------- "par"
    (chk Σ Γ Λ (par (call f_1 (σ_1 ...) e_1 ...) (call f_2 (σ_2 ...) e_2 ...)) unit () Γ_2)]

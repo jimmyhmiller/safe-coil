@@ -12,6 +12,8 @@
 
 (define prelude
   '((struct Pair () ((a (box int)) (b (box int))))
+    (struct Holds () ((a arena)))
+    (view InArena ((r (ref arena))))
     (struct Pt () ((m int) (n int)))
     (struct Wrap (T) ((v T) (w int)))
     (sum Opt (T) ((None unit) (Some T)))
@@ -337,6 +339,61 @@
     (reject "what a lock holds is not freed while the lock lives, even after its last use"
      ,(prog '() '(let ([b (box (box 1))])
                    (let ([g (new (view Lock) (mut (* b)))]) (set! b (box (box 2)))))))
+    (reject "a later argument frees what an earlier one refers into"
+     ,(prog '((defn first-of () ((r (ref int)) (n int)) int (* r)))
+            '(let ([b (box 1)]) (call first-of () (ref (* b)) (seq (set! b (box 2)) 0)))))
+
+    ;; ================================================== arenas
+    (accept "two boxes in one arena, and the arena reset once they are gone"
+     ,(prog '() '(let ([a (arena-new)])
+                   (seq (let ([x (abox a (box 1))]) (let ([y (abox a 2)]) (+ (* (* x)) (* y))))
+                        (seq (reset! a) 0)))))
+    (accept "a box in an arena is changed through"
+     ,(prog '() '(let ([a (arena-new)]) (let ([x (abox a 1)]) (seq (set! (* x) 5) (* x))))))
+    (accept "what a box in an arena holds is moved out, and outlives a reset"
+     ,(prog '() '(let ([a (arena-new)])
+                   (let ([v (let ([x (abox a (box 3))]) (unbox x))])
+                     (seq (reset! a) (* v))))))
+    (reject "an arena is not reset while a box in it is used"
+     ,(prog '() '(let ([a (arena-new)]) (let ([x (abox a 1)]) (seq (reset! a) (* x))))))
+    (reject "a box in an arena does not outlive the arena"
+     ,(prog '() '(let ([x (let ([a (arena-new)]) (abox a 1))]) (* x))))
+    (reject "an arena is not reset while a box in it is still to be dropped"
+     ,(prog '() '(let ([a (arena-new)]) (let ([x (abox a (box 1))]) (seq (* (* x)) (seq (reset! a) 0))))))
+    (reject "a box in an arena is moved, not copied"
+     ,(prog '() '(let ([a (arena-new)]) (let ([x (abox a (box 1))]) (let ([y x]) (* (* x)))))))
+    (reject "two calls at once do not both allocate in one arena"
+     ,(prog '((defn put () ((r (ref arena))) int (let ([x (abox (* r) 1)]) (* x))))
+            '(let ([a (arena-new)]) (seq (par (call put () (ref a)) (call put () (ref a))) 0))))
+    (accept "two calls at once allocate in two arenas"
+     ,(prog '((defn put () ((r (ref arena))) int (let ([x (abox (* r) 1)]) (* x))))
+            '(let ([a (arena-new)]) (let ([b (arena-new)])
+               (seq (par (call put () (ref a)) (call put () (ref b))) 0)))))
+    (reject "an arena inside a struct is not lent to both of two calls at once"
+     ,(prog '((defn put () ((r (ref (Holds)))) int (let ([x (abox (: (* r) a) 1)]) (* x))))
+            '(let ([h (new (Holds) (arena-new))]) (seq (par (call put () (ref h)) (call put () (ref h))) 0))))
+    (reject "a view of an arena is not lent to one of two calls at once while the other has the arena"
+     ,(prog '((defn put () ((r (ref arena))) int (let ([x (abox (* r) 1)]) (* x)))
+              (defn put-via () ((v (ref (view InArena)))) int (let ([x (abox (* (: (* v) r)) 1)]) (* x))))
+            '(let ([a (arena-new)])
+               (let ([va (new (view InArena) (ref a))])
+                 (seq (par (call put-via () (ref va)) (call put () (ref a))) 0)))))
+    (accept "a box in an arena holds a view"
+     ,(prog '() '(let ([n 4]) (let ([a (arena-new)])
+                   (let ([x (abox a (new (view Peek) (ref n) 1))]) (* (: (* x) s)))))))
+    (reject "what a view in an arena borrowed is not changed while the box lives"
+     ,(prog '() '(let ([n 4]) (let ([a (arena-new)])
+                   (let ([x (abox a (new (view Peek) (ref n) 1))]) (seq (set! n 5) (* (: (* x) s))))))))
+    (reject "a box in an arena holding a view does not outlive what the view borrowed"
+     ,(prog '() '(let ([a (arena-new)])
+                   (let ([x (let ([n (box 4)]) (abox a (new (view Peek) (ref (* n)) 1)))]) (* (: (* x) s))))))
+    (reject "a view moved out of a box in an arena keeps what it borrowed lent"
+     ,(prog '() '(let ([n (box 4)]) (let ([a (arena-new)])
+                   (let ([w (unbox (abox a (new (view Peek) (ref (* n)) 1)))])
+                     (seq (set! n (box 5)) (* (: w s))))))))
+    (reject "an arena is not moved while a box in it lives"
+     ,(prog '() '(let ([a (arena-new)]) (let ([x (abox a 1)]) (let ([b a]) (* x))))))
+
     ;; ================================================== references to views
     (accept "a view lent exclusively where it lies, and changed through"
      ,(prog '((defn relock () ((k (mut (view Lock)))) unit (set! (* (: (* k) r)) (box 5))))
