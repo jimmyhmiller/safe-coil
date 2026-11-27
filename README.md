@@ -256,6 +256,29 @@ An `Own` keeps no `(dyn Trait)` in it: `get-mut` makes one each time, lent
 exclusively from the `Own`, so the `Own` is not moved, dropped or used again while
 it is in use.
 
+## Cost
+
+The checker costs nothing at run time: it runs while the program compiles and
+adds no code. A program's machine code is the same with `--use safe.check` and
+without it. The library costs what its run-time checks cost. `bench/` times the
+common operations over a million elements, 200 times, built with `--release`
+(Apple M-series):
+
+| Operation | Safe Coil | Plain Coil (raw slices and pointers) |
+|---|---|---|
+| `(get v i)` | 19 ms | 18 ms |
+| `(for (ref x) v …)` | 19 ms | 397 ms (Coil's own slice `for`) |
+| element through a `Box` | 78 ms | 76 ms |
+| element through a `Pool` handle | 190 ms | 18 ms (an array index) |
+| a closure called per element | 241 ms | 19 ms (a direct call) |
+
+A bounds check is a compare and a branch: the failure is a function of its own
+that is never inlined, and the accessors are `:inline (Always)`, so the check is
+hoisted and the loop vectorized as the raw one is. A `Pool` access checks the
+handle's generation as well, and reads a slot three words wide. A closure is
+called through the function pointer its erased type holds, which the optimizer
+cannot see through: every closure of one `deffn` type is one type.
+
 ## Programs
 
 `examples/` holds programs written in safe Coil, none with `unsafe` in it. Each runs

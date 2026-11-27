@@ -3,7 +3,7 @@
 (export Vec Slice SliceMut Halves)
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc)
-(import "safe.core" :use [unsafe lend lend-mut View Each EachMut SharedView CrossThread])
+(import "safe.core" :use [unsafe lend lend-mut View Each EachMut SharedView CrossThread stop-index stop-range])
 (import "safe.mem" :use [room release])
 
 ;;; A list of T. It owns its elements: they are freed with it. An index out of
@@ -45,25 +45,25 @@
 
 ;;; Where element I of the COUNT at ITEMS is. An index out of range stops the
 ;;; program.
-(defn within [T] [(items (ptr T)) (count i64) (i i64)] (-> (ptr T))
+(defn within :inline (Always) [T] [(items (ptr T)) (count i64) (i i64)] (-> (ptr T))
   (unsafe
     (when (or (< i 0) (>= i count))
-      (panic "safe: index {} is out of range for a slice of {}" i count))
+      (stop-index i "a slice" count))
     (primitive/index items i)))
 
 ;;; Where the elements FROM up to TO of the COUNT at ITEMS start. A range that is
 ;;; not inside them stops the program.
-(defn range-within [T] [(items (ptr T)) (count i64) (from i64) (to i64)] (-> (ptr T))
+(defn range-within :inline (Always) [T] [(items (ptr T)) (count i64) (from i64) (to i64)] (-> (ptr T))
   (unsafe
     (when (or (< from 0) (> to count) (> from to))
-      (panic "safe: the range {} to {} is not inside {} elements" from to count))
+      (stop-range from to count))
     (primitive/index items from)))
 
 ;;; Where element I of V is. An index out of range stops the program.
-(defn slot [T] [(v (ref (Vec T))) (i i64)] (-> (ptr T))
+(defn slot :inline (Always) [T] [(v (ref (Vec T))) (i i64)] (-> (ptr T))
   (unsafe
     (when (or (< i 0) (>= i (.count v)))
-      (panic "safe: index {} is out of range for a Vec of {}" i (.count v)))
+      (stop-index i "a Vec" (.count v)))
     (primitive/index (data (.items v)) i)))
 
 (impl [T] (Vec T)
@@ -72,7 +72,7 @@
     (unsafe (Vec :items (room [T] 4) :count 0)))
 
   ;;; How many elements it holds.
-  (len [(v (ref (Vec T)))] (-> i64)
+  (len :inline (Always) [(v (ref (Vec T)))] (-> i64)
     (.count v))
 
   ;;; Add VALUE at the end.
@@ -113,7 +113,7 @@
   (insert! [(v (mut (Vec T))) (i i64) (value T)] (-> void)
     (unsafe
       (when (or (< i 0) (> i (.count v)))
-        (panic "safe: index {} is out of range for inserting into a Vec of {}" i (.count v)))
+        (stop-index i "inserting into a Vec" (.count v)))
       (Vec::push! (mut v) value)
       (let [(mut k) (- (.count v) 1)]
         (while (> k i)
@@ -140,11 +140,11 @@
     0)
 
   ;;; Element I, lent for as long as the list is.
-  (at [(v (ref (Vec T))) (i i64)] (-> (ref T))
+  (at :inline (Always) [(v (ref (Vec T))) (i i64)] (-> (ref T))
     (unsafe (lend (slot v i))))
 
   ;;; Element I, lent to be changed for as long as the list is.
-  (at-mut [(v (mut (Vec T))) (i i64)] (-> (mut T))
+  (at-mut :inline (Always) [(v (mut (Vec T))) (i i64)] (-> (mut T))
     (unsafe (lend-mut (slot v i))))
 
   ;;; The elements from FROM up to TO, lent shared. A range that is not inside
@@ -160,11 +160,11 @@
 
 (impl [T] (Slice T)
   ;;; How many elements it covers.
-  (len [(s (ref (Slice T)))] (-> i64)
+  (len :inline (Always) [(s (ref (Slice T)))] (-> i64)
     (.count s))
 
   ;;; Element I of the slice. An index out of range stops the program.
-  (at [(s (ref (Slice T))) (i i64)] (-> (ref T))
+  (at :inline (Always) [(s (ref (Slice T))) (i i64)] (-> (ref T))
     (unsafe (lend [T] (within (.items s) (.count s) i))))
 
   ;;; The elements of the slice from FROM up to TO.
@@ -174,15 +174,15 @@
 
 (impl [T] (SliceMut T)
   ;;; How many elements it covers.
-  (len [(s (ref (SliceMut T)))] (-> i64)
+  (len :inline (Always) [(s (ref (SliceMut T)))] (-> i64)
     (.count s))
 
   ;;; Element I of the slice. An index out of range stops the program.
-  (at [(s (ref (SliceMut T))) (i i64)] (-> (ref T))
+  (at :inline (Always) [(s (ref (SliceMut T))) (i i64)] (-> (ref T))
     (unsafe (lend [T] (within (.items s) (.count s) i))))
 
   ;;; Element I of the slice, to be changed.
-  (at-mut [(s (mut (SliceMut T))) (i i64)] (-> (mut T))
+  (at-mut :inline (Always) [(s (mut (SliceMut T))) (i i64)] (-> (mut T))
     (unsafe (lend-mut [T] (within (.items s) (.count s) i))))
 
   ;;; The elements of the slice from FROM up to TO, lent shared.
@@ -191,7 +191,7 @@
       (Slice :items (range-within (.items s) (.count s) from to) :count (- to from))))
 
   ;;; A copy of element I, for an element of plain data.
-  (get :collection/copies-element "(SliceMut::at s i)" [(s (ref (SliceMut T))) (i i64)] (-> T)
+  (get :inline (Always) :collection/copies-element "(SliceMut::at s i)" [(s (ref (SliceMut T))) (i i64)] (-> T)
     (unsafe (load (within (.items s) (.count s) i))))
 
   ;;; The elements before MID and from MID on, both to be changed, as Halves.
@@ -199,7 +199,7 @@
   (split [(s (mut (SliceMut T))) (mid i64)] (-> (Halves T))
     (unsafe
       (when (or (< mid 0) (> mid (.count s)))
-        (panic "safe: {} is not inside a slice of {}" mid (.count s)))
+        (stop-range 0 mid (.count s)))
       (Halves :left (SliceMut :items (.items s) :count mid)
               :right (SliceMut :items (primitive/index (.items s) mid) :count (- (.count s) mid)))))
 
@@ -211,12 +211,12 @@
 
 ;;; `(len v)`, as for Coil's own collections.
 (impl [T] Len (Vec T)
-  (len [(v (ref (Vec T)))] (-> i64) (.count v)))
+  (len :inline (Always) [(v (ref (Vec T)))] (-> i64) (.count v)))
 
 ;;; `(get v i)`: a copy of element I, for elements that are plain data; one
 ;;; that owns something is lent with `(Vec::at v i)`.
 (impl [T] Get (Vec T)
-  (get :collection/copies-element "(Vec::at v i)" [(v (ref (Vec T))) (i i64)] (-> T)
+  (get :inline (Always) :collection/copies-element "(Vec::at v i)" [(v (ref (Vec T))) (i i64)] (-> T)
     (unsafe (load (slot v i)))))
 
 ;;; `(set! (mut v) i x)`: element I replaced, the old one dropped.
@@ -234,11 +234,11 @@
       out)))
 
 (impl [T] Each (Vec T)
-  (count [(xs (ref (Vec T)))] (-> i64) (Vec::len xs))
-  (item [(xs (ref (Vec T))) (i i64)] (-> (ref T)) (Vec::at xs i)))
+  (count :inline (Always) [(xs (ref (Vec T)))] (-> i64) (Vec::len xs))
+  (item :inline (Always) [(xs (ref (Vec T))) (i i64)] (-> (ref T)) (Vec::at xs i)))
 
 (impl [T] EachMut (Vec T)
-  (item-mut [(xs (mut (Vec T))) (i i64)] (-> (mut T)) (Vec::at-mut (mut xs) i)))
+  (item-mut :inline (Always) [(xs (mut (Vec T))) (i i64)] (-> (mut T)) (Vec::at-mut (mut xs) i)))
 
 (impl [T] Each (Slice T)
   (count [(xs (ref (Slice T)))] (-> i64) (Slice::len xs))

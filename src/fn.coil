@@ -40,18 +40,18 @@
 (defn most-captures [] (-> i64) 4)
 
 ;;; The address of what R refers to, as a raw pointer: a capture's place.
-(defn place-of [T] [(r (ref T))] (-> (ptr T))
+(defn place-of :inline (Always) [T] [(r (ref T))] (-> (ptr T))
   (unsafe (primitive/cast (ptr T) r)))
 
-(defn place-of-mut [T] [(r (mut T))] (-> (ptr T))
+(defn place-of-mut :inline (Always) [T] [(r (mut T))] (-> (ptr T))
   (unsafe (primitive/cast (ptr T) (mut r))))
 
 ;;; What P points at, lent: a capture inside a closure's body. Only `unsafe` code
 ;;; can call these, as with any reference made from a raw pointer.
-(defn at [T] [(p (ptr T))] (-> (ref T))
+(defn at :inline (Always) [T] [(p (ptr T))] (-> (ref T))
   (unsafe (lend (primitive/cast (ptr T) p))))
 
-(defn at-mut [T] [(p (ptr T))] (-> (mut T))
+(defn at-mut :inline (Always) [T] [(p (ptr T))] (-> (mut T))
   (unsafe (lend-mut (primitive/cast (ptr T) p))))
 
 ;;; ---- what a closure type is made of -------------------------------------------
@@ -125,9 +125,9 @@
                `(impl Drop ~own-self
                   (drop [(self (mut ~own-self))] (-> void)
                     (unsafe (let [free (load (field self free))] (free (load (field self env)))) 0)))))
-    (let [run-borrow `(run [(f (mut ~self)) ~@xparams] (-> ~result)
+    (let [run-borrow `(run :inline (Always) [(f (mut ~self)) ~@xparams] (-> ~result)
                         (unsafe (let [t (load (field f tramp))] (t (primitive/cast (ptr ~self) (mut f)) ~@xargs))))
-          run-own `(run [(f (mut ~own-self)) ~@xparams] (-> ~result)
+          run-own `(run :inline (Always) [(f (mut ~own-self)) ~@xparams] (-> ~result)
                      (unsafe (let [t (load (field f tramp))] (t (primitive/cast (ptr ~own-self) (mut f)) ~@xargs))))
           ;; called once and freed: what `spawn` can be given
           call-once `(call-once [(f ~own-self) ~@xparams] (-> ~result)
@@ -135,8 +135,8 @@
       (push! (mut defs) (if generic `(impl [~@tps] ~self ~run-borrow) `(impl ~self ~run-borrow)))
       (push! (mut defs) (if generic `(impl [~@tps] ~own-self ~run-own ~call-once) `(impl ~own-self ~run-own ~call-once))))
     ;; lending a capture to a closure: the closure, and the loan the checker sees
-    (push! (mut defs) `(defn ~(name+ name "--lend") [~@tps C] [(f ~self) (r (ref C))] (-> ~self) f))
-    (push! (mut defs) `(defn ~(name+ name "--lend-mut") [~@tps C] [(f ~self) (r (mut C))] (-> ~self) f))
+    (push! (mut defs) `(defn ~(name+ name "--lend") :inline (Always) [~@tps C] [(f ~self) (r (ref C))] (-> ~self) f))
+    (push! (mut defs) `(defn ~(name+ name "--lend-mut") :inline (Always) [~@tps C] [(f ~self) (r (mut C))] (-> ~self) f))
     ;; for each count of captures, a maker and a trampoline of each kind
     (for n (range 0 (+ (most-captures) 1))
       (let [(mut cap-types) (primitive/code-list-new)
@@ -189,12 +189,12 @@
                 (push! (mut cap-refs) (if (exclusive-at? mask k) `(mut ~t) `(ref ~t)))
                 (push! (mut cap-args) (if (exclusive-at? mask k) `(mut (at-mut ~from)) `(at ~from)))))
             (push! (mut defs)
-                   `(defn ~tramp ~@(tparams `(~@tps ~@cap-types)) [(~sid (ptr ~self)) ~@xparams] (-> ~result)
+                   `(defn ~tramp :inline (Always) ~@(tparams `(~@tps ~@cap-types)) [(~sid (ptr ~self)) ~@xparams] (-> ~result)
                       (unsafe
                         (let [code (primitive/cast (fnptr (cc/C) [~@cap-refs ~@params] ~result) (load (field ~sid user)))]
                           (code ~@cap-args ~@xargs)))))
             (push! (mut defs)
-                   `(defn ~make ~@(tparams `(~@tps ~@cap-types))
+                   `(defn ~make :inline (Always) ~@(tparams `(~@tps ~@cap-types))
                       [(witness (ptr ~self)) ~@cap-params (code (fnptr (cc/C) [~@cap-refs ~@params] ~result))]
                       (-> ~self)
                       (unsafe
@@ -216,13 +216,13 @@
                         (mem/release (slice::new [~env-of] ~eid 1))
                         0))))
           (push! (mut defs)
-                 `(defn ~tramp-own ~@(tparams `(~@tps ~@cap-types)) [(self (ptr ~own-self)) ~@xparams] (-> ~result)
+                 `(defn ~tramp-own :inline (Always) ~@(tparams `(~@tps ~@cap-types)) [(self (ptr ~own-self)) ~@xparams] (-> ~result)
                     (unsafe
                       (let [code (primitive/cast (fnptr (cc/C) [~@cap-muts ~@params] ~result) (load (field self user)))
                             ~eid (primitive/cast (ptr ~env-of) (load (field self env)))]
                         (code ~@from-env ~@xargs)))))
           (push! (mut defs)
-                 `(defn ~make-own ~@(tparams `(~@tps ~@cap-types))
+                 `(defn ~make-own :inline (Always) ~@(tparams `(~@tps ~@cap-types))
                     [(witness (ptr ~own-self)) ~@own-params (code (fnptr (cc/C) [~@cap-muts ~@params] ~result))]
                     (-> ~own-self)
                     (unsafe

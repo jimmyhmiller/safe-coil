@@ -19,11 +19,11 @@
         (Box :at at))))
 
   ;;; The value, lent for as long as the box is.
-  (get [(box (ref (Box T)))] (-> (ref T))
+  (get :inline (Always) [(box (ref (Box T)))] (-> (ref T))
     (unsafe (lend (load (field box at)))))
 
   ;;; The value, lent to be changed for as long as the box is.
-  (get-mut [(box (mut (Box T)))] (-> (mut T))
+  (get-mut :inline (Always) [(box (mut (Box T)))] (-> (mut T))
     (unsafe (lend-mut (load (field box at)))))
 
   ;;; The value, taken out of the box, which is freed.

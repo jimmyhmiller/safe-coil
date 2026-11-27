@@ -1,0 +1,47 @@
+;;; The safe library's common operations, timed: compiled with --use safe.check.
+(module bench.safe-ops)
+(import "coil.time" :as time)
+(import "coil.primitive" :as primitive)
+(import "safe.vec" :use [Vec])
+(import "safe.box" :use [Box])
+(import "safe.pool" :use [Pool Handle])
+(import "safe.fn" :use [deffn lambda])
+(import "safe.loop" :use [for])
+
+(deffn Step [i64 (ref i64)] i64)
+
+(defn now [] (-> i64) (match (time/monotonic-now-ms) (Ok [ms] ms) (Err [_] 0)))
+
+(defn report [(name (slice u8)) (start i64) (result i64)] (-> void)
+  (println "{:>10} {:>6} ms  ({})" name (- (now) start) result))
+
+(defn main [] (-> i64)
+  (let [n 1000000
+        reps 200
+        (mut v) (Vec::new [i64])
+        (mut boxes) (Vec::new [(Box i64)])
+        (mut pool) (Pool::new [i64])
+        (mut handles) (Vec::new [(Handle i64)])
+        (mut seed) (now)]
+    (for i (range 0 n)
+      (set! seed (% (+ (* seed 1103515245) 12345) 2147483648))
+      (Vec::push! (mut v) (% seed 100))
+      (Vec::push! (mut boxes) (Box::new (% seed 100)))
+      (Vec::push! (mut handles) (Pool::insert! (mut pool) (% seed 100))))
+    (let [start (now) (mut sum) 0]
+      (for r (range 0 reps) (for i (range 0 n) (set! sum (+ sum (get v i)))))
+      (report "get" start sum))
+    (let [start (now) (mut sum) 0]
+      (for r (range 0 reps) (for (ref x) v (set! sum (+ sum (primitive/load x)))))
+      (report "for" start sum))
+    (let [start (now) (mut sum) 0
+          (mut add) (lambda Step [] [acc x] (+ acc (primitive/load x)))]
+      (for r (range 0 reps) (for i (range 0 n) (set! sum (Step::run (mut add) sum (Vec::at v i)))))
+      (report "closure" start sum))
+    (let [start (now) (mut sum) 0]
+      (for r (range 0 reps) (for i (range 0 n) (set! sum (+ sum (primitive/load (Pool::at pool (get handles i)))))))
+      (report "pool" start sum))
+    (let [start (now) (mut sum) 0]
+      (for r (range 0 reps) (for i (range 0 n) (set! sum (+ sum (primitive/load (Box::get (Vec::at boxes i)))))))
+      (report "box" start sum)))
+  0)

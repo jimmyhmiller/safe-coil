@@ -76,6 +76,21 @@
 (deftrait EachMut [Self Item]
   (item-mut [(xs (mut Self)) (i i64)] (-> (mut Item))))
 
+;;; ---- run-time checks that fail -------------------------------------------------
+;;;
+;;; Each stops the program with a message. None is inlined: the check that calls
+;;; one stays a compare and a branch where it is made, so what it guards can be
+;;; inlined, hoisted and vectorized around it.
+
+(defn stop-index :inline (Never) [(i i64) (what (slice u8)) (n i64)] (-> never)
+  (panic "safe: index {} is out of range for {} of {}" i what n))
+
+(defn stop-range :inline (Never) [(from i64) (to i64) (n i64)] (-> never)
+  (panic "safe: the range {} to {} is not inside {} elements" from to n))
+
+(defn stop :inline (Never) [(message (slice u8))] (-> never)
+  (panic "safe: {}" message))
+
 ;;; ---- Coil's slices, read safely ----------------------------------------------
 ;;;
 ;;; Safe code meets a `(slice T)` only as a string literal, or as a parameter
@@ -84,14 +99,14 @@
 ;;; read through these, which check every one.
 
 ;;; How many elements S has.
-(defn size [T] [(s (slice T))] (-> i64)
+(defn size :inline (Always) [T] [(s (slice T))] (-> i64)
   (unsafe (len s)))
 
 ;;; A copy of element I of S. An index out of range stops the program.
-(defn nth [T] [(s (slice T)) (i i64)] (-> T)
+(defn nth :inline (Always) [T] [(s (slice T)) (i i64)] (-> T)
   (unsafe
     (when (or (< i 0) (>= i (len s)))
-      (panic "safe: index {} is out of range for a slice of {}" i (len s)))
+      (stop-index i "a slice" (len s)))
     (get s i)))
 
 (impl [T] Each (slice T)
@@ -101,7 +116,7 @@
     (unsafe
       (let [s (load (primitive/cast (ptr (slice T)) xs))]
         (when (or (< i 0) (>= i (len s)))
-          (panic "safe: index {} is out of range for a slice of {}" i (len s)))
+          (stop-index i "a slice" (len s)))
         (lend (primitive/index (data s) i))))))
 
 ;;; Is XS a name, or a field of one: a place `each` can name again and again?

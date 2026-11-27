@@ -1,0 +1,43 @@
+;;; The same operations in plain Coil: raw slices and pointers, no checks.
+(module bench.raw-ops)
+(import "coil.time" :as time)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+
+(defn now [] (-> i64) (match (time/monotonic-now-ms) (Ok [ms] ms) (Err [_] 0)))
+
+(defn report [(name (slice u8)) (start i64) (result i64)] (-> void)
+  (println "{:>10} {:>6} ms  ({})" name (- (now) start) result))
+
+(defn add [(acc i64) (x (ptr i64))] (-> i64) (+ acc (load x)))
+
+(defn main [] (-> i64)
+  (let [n 1000000
+        reps 200
+        a (alloc/malloc-allocator)
+        v (some-or-panic (alloc/alloc [i64] a n))
+        boxes (some-or-panic (alloc/alloc [(ptr i64)] a n))
+        (mut seed) (now)]
+    (for i (range 0 n)
+      (set! seed (% (+ (* seed 1103515245) 12345) 2147483648))
+      (store! (primitive/index (data v) i) (% seed 100))
+      (store! (primitive/index (data boxes) i) (alloc/box! a i64 (% seed 100))))
+    (let [start (now) (mut sum) 0]
+      (for r (range 0 reps) (for i (range 0 n) (set! sum (+ sum (load (primitive/index (data v) i))))))
+      (report "get" start sum))
+    (let [start (now) (mut sum) 0]
+      (for r (range 0 reps) (for x v (set! sum (+ sum x))))
+      (report "for" start sum))
+    (let [start (now) (mut sum) 0]
+      (for r (range 0 reps) (for i (range 0 n) (set! sum (add sum (primitive/index (data v) i)))))
+      (report "closure" start sum))
+    (let [start (now) (mut sum) 0]
+      (for r (range 0 reps) (for i (range 0 n) (set! sum (+ sum (load (primitive/index (data v) i))))))
+      (report "pool" start sum))
+    (let [start (now) (mut sum) 0]
+      (for r (range 0 reps) (for i (range 0 n) (set! sum (+ sum (load (load (primitive/index (data boxes) i)))))))
+      (report "box" start sum)))
+  0)
+
+(defn some-or-panic [T] [(o (Option (slice T)))] (-> (slice T))
+  (match o (Some [s] s) (None [] (panic "out of memory"))))

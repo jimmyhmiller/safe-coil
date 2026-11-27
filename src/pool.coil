@@ -4,7 +4,7 @@
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc)
 (import "safe.vec" :use [Vec])
-(import "safe.core" :use [unsafe lend lend-mut])
+(import "safe.core" :use [unsafe lend lend-mut stop])
 
 ;;; The name of one element of a `(Pool T)`. A handle is plain data: it can be
 ;;; copied and stored, and it keeps nothing alive. Using one whose element has
@@ -15,9 +15,9 @@
 (defstruct Slot [T] [(generation i64) (full bool) (value T)])
 
 ;;; A collection of T that owns its elements. They are freed with the pool.
-(defstruct Pool [T] [(slots (slice (Slot T))) (used i64)])
+(defstruct Pool [T] [(slots (slice (Slot T))) (used i64) (free (Vec i64))])
 
-(defn slot-at [T] [(slots (slice (Slot T))) (i i64)] (-> (ptr (Slot T)))
+(defn slot-at :inline (Always) [T] [(slots (slice (Slot T))) (i i64)] (-> (ptr (Slot T)))
   (unsafe (primitive/index (data slots) i)))
 
 (defn room [T] [(count i64)] (-> (slice (Slot T)))
@@ -27,27 +27,25 @@
       (None [] (panic "safe: out of memory")))))
 
 ;;; The live slot H names in POOL. A handle to a removed element stops the program.
-(defn live [T] [(pool (ref (Pool T))) (h (Handle T))] (-> (ptr (Slot T)))
+(defn live :inline (Always) [T] [(pool (ref (Pool T))) (h (Handle T))] (-> (ptr (Slot T)))
   (unsafe
     (when (or (< (.slot h) 0) (>= (.slot h) (.used pool)))
-      (panic "safe: a handle was used with a pool it does not belong to"))
+      (stop "a handle was used with a pool it does not belong to"))
     (let [slot (slot-at (.slots pool) (.slot h))]
       (unless (and (load (field slot full)) (= (load (field slot generation)) (.generation h)))
-        (panic "safe: a handle was used after its element was removed"))
+        (stop "a handle was used after its element was removed"))
       slot)))
 
 (impl [T] (Pool T)
   ;;; An empty pool.
   (new [] (-> (Pool T))
-    (unsafe (Pool :slots (room [T] 4) :used 0)))
+    (unsafe (Pool :slots (room [T] 4) :used 0 :free (Vec::new [i64]))))
 
   ;;; Put VALUE in the pool. The handle names it until it is removed.
   (insert! [(pool (mut (Pool T))) (value T)] (-> (Handle T))
     (unsafe
-      (let [(mut at) -1]
-        (for i (range 0 (.used pool))
-          (when (and (< at 0) (not (load (field (slot-at (.slots pool) i) full))))
-            (set! at i)))
+      ; a slot an element was removed from, else a new one
+      (let [(mut at) (match (Vec::pop! (mut (field pool free))) (Some [i] i) (None [] -1))]
         (when (< at 0)
           (when (= (.used pool) (len (.slots pool)))
             (let [bigger (room [T] (* 2 (len (.slots pool))))]
@@ -70,6 +68,7 @@
             value (take! [T] (field slot value))]
         (store! (field slot full) false)
         (store! (field slot generation) (+ (load (field slot generation)) 1))
+        (Vec::push! (mut (field pool free)) (.slot h))
         value)))
 
   ;;; Does H still name an element of the pool: one not removed?
@@ -81,11 +80,7 @@
 
   ;;; How many elements the pool holds.
   (len [(pool (ref (Pool T)))] (-> i64)
-    (unsafe
-      (let [(mut n) 0]
-        (for i (range 0 (.used pool))
-          (when (load (field (slot-at (.slots pool) i) full)) (set! n (+ n 1))))
-        n)))
+    (- (.used pool) (Vec::len (field pool free))))
 
   ;;; A handle to every element, in the order of their slots.
   (handles [(pool (ref (Pool T)))] (-> (Vec (Handle T)))
@@ -98,11 +93,11 @@
         out)))
 
   ;;; The element H names, lent for as long as the pool is.
-  (at [(pool (ref (Pool T))) (h (Handle T))] (-> (ref T))
+  (at :inline (Always) [(pool (ref (Pool T))) (h (Handle T))] (-> (ref T))
     (unsafe (lend (field (live pool h) value))))
 
   ;;; The element H names, lent to be changed for as long as the pool is.
-  (at-mut [(pool (mut (Pool T))) (h (Handle T))] (-> (mut T))
+  (at-mut :inline (Always) [(pool (mut (Pool T))) (h (Handle T))] (-> (mut T))
     (unsafe (lend-mut (field (live pool h) value)))))
 
 (impl [T] Drop (Pool T)

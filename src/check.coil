@@ -1224,6 +1224,8 @@
           ; a raw pointer passed for a reference parameter becomes a reference
           (raw-type? content)
             (cond (not (ref-type? param)) (eval (mut cx) arg (WValue))
+                  ; a slice of plain data lent where it lies (see `static-slice?`)
+                  (static-slice? cx content) (eval (mut cx) arg (WShared))
                   ; the parameter is a reference to a raw pointer: the name is lent
                   (or (raw-type? (pointee param)) (lends-the-name? param content result call))
                     (eval (mut cx) arg (WShared))

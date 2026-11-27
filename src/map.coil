@@ -3,7 +3,7 @@
 (export Map each-entry)
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc)
-(import "safe.core" :use [unsafe lend lend-mut])
+(import "safe.core" :use [unsafe lend lend-mut stop])
 
 ;;; One place in the table. `state` is 0 when it never held a pair, 1 while it
 ;;; holds one, 2 after its pair was removed. `key` and `value` hold values only
@@ -78,10 +78,10 @@
 (defn pair-at [K V] [(m (ref (Map K V))) (i i64)] (-> (ptr (Entry K V)))
   (unsafe
     (when (or (< i 0) (>= i (len (.entries m))))
-      (panic "safe: a cursor was used with a Map it does not belong to"))
+      (stop "a cursor was used with a Map it does not belong to"))
     (let [entry (primitive/index (data (.entries m)) i)]
       (when (!= (load (field entry state)) 1)
-        (panic "safe: a cursor was used after its pair was removed"))
+        (stop "a cursor was used after its pair was removed"))
       entry)))
 
 ;;; The first place at or after I that holds a pair, or -1.
@@ -141,14 +141,14 @@
   (at :safe/borrows "m" [(m (ref (Map K V))) (key (ref K))] (-> (ref V))
     (unsafe
       (let [at (find m key)]
-        (when (< at 0) (panic "safe: a Map was asked for a key it does not hold"))
+        (when (< at 0) (stop "a Map was asked for a key it does not hold"))
         (lend (field (primitive/index (data (.entries m)) at) value)))))
 
   ;;; KEY's value, lent to be changed for as long as the table is.
   (at-mut :safe/borrows "m" [(m (mut (Map K V))) (key (ref K))] (-> (mut V))
     (unsafe
       (let [at (find m key)]
-        (when (< at 0) (panic "safe: a Map was asked for a key it does not hold"))
+        (when (< at 0) (stop "a Map was asked for a key it does not hold"))
         (lend-mut (field (primitive/index (data (.entries m)) at) value)))))
 
   ;;; A cursor on the first pair, or -1 when there is none. A cursor is a number:
