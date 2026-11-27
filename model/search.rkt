@@ -77,7 +77,7 @@
   (case (random 14)
     [(0 1) `(ref ,(gen-storable))]
     [(2 3) `(mut ,(gen-storable))]
-    [(4) (pick '((view Two) (view Peek) (view Lock) (view Nest) (view Watch) (view InArena)))]
+    [(4) (pick '((view Two) (view Peek) (view Lock) (view Nest) (view Watch) (view InArena) (view Node)))]
     [(5) (pick closure-types)]
     [else (gen-storable)]))
 
@@ -590,7 +590,10 @@
         [(24)
          (define ints (for/list ([pt (storable-places env)] #:when (eq? (cdr pt) 'int)) (car pt)))
          (case (random 3)
-           [(0) `(let (abox (box int)) (abox ,(pick arenas) (box ,(random 3))))]
+           ;; now and then an owner, which an arena refuses
+           [(0) (if (zero? (random 4))
+                    `(let (abox (box int)) (abox ,(pick arenas) (box ,(random 3))))
+                    `(let (abox (Pt)) (abox ,(pick arenas) (new (Pt) ,(random 3) ,(random 3)))))]
            ;; a view in the arena: the box holds what the view borrowed too
            [(1) (if (pair? ints)
                     `(let (abox (view Peek)) (abox ,(pick arenas) (new (view Peek) (ref ,(pick ints)) ,(random 3))))

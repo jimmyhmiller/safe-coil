@@ -93,8 +93,12 @@ adds the rest of the model:
 - **Arenas.** A list or a box in an arena (`(VecIn T ArenaRef)`, `(BoxIn T
   ArenaRef)`) is a view that keeps the arena lent, shared: many live at once,
   none outlives the arena, and `Arena::reset!` lends the arena exclusively, so
-  it is refused while anything in the arena is alive. A box in an arena may hold
-  a view, a node of a tree in the arena, and then holds that view's loans too.
+  it is refused while anything in the arena is alive. An arena drops nothing it
+  holds: its memory comes back all at once. So what is put in one owns nothing
+  outside it: plain data, references, other lists and boxes in the arena, and
+  structs, sums and views of those with no drop of their own (a type marked
+  `InArena` holds only such things). A box in an arena may hold a view, a node
+  of a tree in the arena, and then holds that view's loans too.
   Allocating changes an arena though it is lent shared, so an arena is
   `OneThread`: `par` hands its other thread no shared reference to anything that
   reaches one (through fields or type arguments), nor a view of one. Lending an
@@ -171,7 +175,7 @@ operations are allowed.
 | Module | What it gives |
 |---|---|
 | `safe.core` | `unsafe`; `borrow` and `borrow-mut`, a reference as a value; `replace!`, which swaps an owner out of a place; `move`; `each` and `each-mut`, a loop over a list, a slice or a string; `size` and `nth`, a `(slice T)` read with every index checked; the traits `View`, `QuietDrop`, `SharedView`, `CrossThread` and `OneThread`; the annotations `:safe/borrows` and `:safe/keeps` |
-| `safe.alloc` | Where collections get memory. `Heap`, the heap, of no size; `Lease`, any Coil allocator by lease: `Lease::heap`, and `Lease::assume` of a raw `AllocatorLease` inside `unsafe`; `Arena`, an owner that hands out memory by bumping a pointer and gives it all back at once: `Arena::new`, `with-room`, `reset!`, `live`, `reserved`, and `lend`, an `ArenaRef`. The trait `Alloc` |
+| `safe.alloc` | Where collections get memory. `Heap`, the heap, of no size; `Lease`, any Coil allocator by lease: `Lease::heap`, and `Lease::assume` of a raw `AllocatorLease` inside `unsafe`; `Arena`, an owner that hands out memory by bumping a pointer and gives it all back at once: `Arena::new`, `with-room`, `reset!`, `live`, `reserved`, and `lend`, an `ArenaRef`. The traits `Alloc`, and `InArena`, a collection in an arena, which drops nothing it holds |
 | `safe.loop` | `(for (ref x) xs …)` and `(for (mut x) xs …)` over a safe collection, each element by reference; any other `for` is Coil's |
 | `safe.fn` | `(deffn NAME [T…] [PARAM-TYPE…] RESULT)` declares a closure type; `(lambda NAME [(ref x) (mut y) (z (ref PLACE))…] [params…] body…)` makes one that borrows what it captures, `(lambda-own NAME [x (y VALUE)…] [params…] body…)` one of `NAME-own` that owns them; `(NAME::run (mut f) args…)` calls either; `(NAME-own::call-once f args…)` calls one and frees it, so `(spawn (NAME-own::call-once f))` runs it on a thread |
 | `safe.view` | `(defview NAME [T…] [(field TYPE)…])`, a view whose fields may be references or views: `NAME::new`, `NAME::field`, `NAME::field-mut`. `(defsubscript NAME [T…] [params…] (-> (ref R) or (mut R)) before… (yield PLACE) after…)`: `NAME::open` runs `before` and gives a view of `PLACE`, read with `NAME::get` and `NAME::get-mut`; `after` runs when the view is dropped |
@@ -284,9 +288,10 @@ and on the ways that kept it Coil still drops it, at the end of its scope or whe
   (Arena::reset! (mut ar)))             ; everything it was made of, given back at once
 ```
 
-What is in an arena is dropped as anything is, so a `Box` inside a node of
-the tree is freed; only the memory of the nodes themselves comes back all at
-once. A tree in an arena is a view, so its type is marked `View`, and a function
+What is in an arena is never dropped, so it owns nothing elsewhere: a node
+holds numbers, references and other boxes in the arena, never a heap `Box` or a
+`Str`, and the checker refuses one that does. Giving the arena back is then all
+a tree costs. A tree in an arena is a view, so its type is marked `View`, and a function
 that builds one from the arena and something else it is given says which it
 borrows from: `examples/arena.coil`'s parser takes the arena and the parser's
 state and says `:safe/borrows "ar"`.
@@ -315,14 +320,14 @@ common operations over a million elements, 200 times, built with `--release`
 
 | Operation | Safe Coil | Plain Coil (raw slices and pointers) |
 |---|---|---|
-| `(get v i)` | 19 ms | 18 ms |
-| `(for (ref x) v …)` | 19 ms | 397 ms (Coil's own slice `for`) |
-| element through a `Box` | 78 ms | 76 ms |
-| element through a `Pool` handle | 182 ms | 19 ms (an array index) |
+| `(get v i)` | 18 ms | 18 ms |
+| `(for (ref x) v …)` | 17 ms | 121 ms (Coil's own slice `for`) |
+| element through a `Box` | 77 ms | 79 ms |
+| element through a `Pool` handle | 186 ms | 19 ms (an array index) |
 | a closure called per element | 18 ms | 19 ms (a direct call) |
-| a closure given to a `fold` | 19 ms | 20 ms (a function pointer) |
-| a list of 10,000 nodes built, summed and freed, 1,000 times: on the heap | 335 ms | 295 ms (malloc and free) |
-| the same in an `Arena`, reset each time | 200 ms | 127 ms (a bump allocator) |
+| a closure given to a `fold` | 18 ms | 18 ms (a function pointer) |
+| a list of 10,000 nodes built, summed and freed, 1,000 times: on the heap | 288 ms | 236 ms (malloc and free) |
+| the same in an `Arena`, reset each time | 119 ms | 110 ms (a bump allocator) |
 
 A bounds check is a compare and a branch: the failure is a function of its own
 that is never inlined, and the accessors are `:inline (Always)`, so the check is
@@ -335,10 +340,10 @@ One given to a higher-order function that is not inlined is an indirect call, as
 a C function pointer is.
 
 An allocation in an arena is the bump of a pointer, inlined: the allocator is a
-type parameter, called directly, and giving an arena's memory back one value at
-a time is nothing. What the arena list pays beyond the plain one is its drop: the
-nodes are dropped one by one, as the model says, because one could own something
-outside the arena; the plain program only resets the arena.
+type parameter, called directly. What is in an arena owns nothing outside it, so
+nothing in it is dropped and giving it back is a reset. On the heap, a `Box`'s
+drop moves its value out of the cell before dropping it (Coil has no drop in
+place), which is what the heap list pays over the plain one.
 
 ## Programs
 
@@ -439,16 +444,16 @@ run fails if the checker accepts anything the model refuses.
 checker at a time and requires `diff.py` to find a program the weakened checker
 wrongly accepts.
 
-On the model's 192 cases and 4000 random programs (seed 7), 3409 can be written
-as Coil; 783 use something Coil cannot express (most often a closure that
+On the model's hand-written cases (195 at that run) and 4000 random programs (seed 7), 3420 can be written
+as Coil; 775 use something Coil cannot express (most often a closure that
 owns a capture that is not a borrow, or one that returns a reference). The
-compiler refuses 1300 of them itself. On the other 2105 the checker accepts
-nothing the model refuses: 1382 accepted by both, 695 refused by both, and 28
-refused only by the checker, each for one of the differences below. All 36
+compiler refuses 1277 of them itself. On the other 2139 the checker accepts
+nothing the model refuses: 1403 accepted by both, 711 refused by both, and 25
+refused only by the checker, each for one of the differences below. All 37
 weakenings of the checker are caught, by a hand-written case or the
 differential run.
 
-`tests/run.py` has 174 hand-written cases. The programs in `examples/` run clean
+`tests/run.py` has 178 hand-written cases. The programs in `examples/` run clean
 under `--sanitize=address`, and the threaded ones under `--sanitize=thread`.
 
 ### Where Coil and the model differ
@@ -520,7 +525,7 @@ A small language with everything the rules are about:
 | `(return e τ)` | leaving a function early |
 | `struct`, `sum`, `match`, `match-ref`, `match-mut` | structs with separately lent fields; sums whose payload reference keeps the variant in place |
 | `(pool σ)`, `(handle σ)`, `(at p h)` | a collection that owns its elements, and plain-data handles checked when used |
-| `arena`, `(arena-new)`, `(abox p e)`, `(abox α)`, `(reset! p)` | an arena, an owner; a box in the arena at `p`, second-class, which holds a shared loan on the arena and, when it holds a view, that view's loans; giving everything in an arena back at once, which needs it exclusively. Two calls at once may not both reach one arena |
+| `arena`, `(arena-new)`, `(abox p e)`, `(abox α)`, `(reset! p)` | an arena, an owner; a box in the arena at `p`, second-class, which holds a shared loan on the arena and, when it holds a view, that view's loans, and holds only what owns nothing (the machine never drops it); giving everything in an arena back at once, which needs it exclusively. A view may hold boxes in an arena, so a tree can be built there. Two calls at once may not both reach one arena |
 | type parameters | generics: a parameter may be an owner and can never be a reference |
 | `while`, `break` | loops; what is moved before a break is moved after the loop |
 | `(with ref g x …)`, `(with mut g x …)` | a global, lent for a scope, with exclusivity checked on entry |
@@ -554,7 +559,7 @@ racket model/search.rkt teeth       # each rule weakened in turn: the search mus
 racket model/search.rkt teeth 20000 no-union par-split   # only those weakenings
 ```
 
-`teeth` is the check on the search itself. `rules.rkt` lists 42 ways to weaken
+`teeth` is the check on the search itself. `rules.rkt` lists 43 ways to weaken
 one rule (`mutants`), and the machine can drop its run-time check on globals.
 `teeth` fails unless a hand-written case or the search finds a program that goes
 wrong under each one.
@@ -563,10 +568,11 @@ rules refuse is generated again, so `teeth` looks through four seeds before it
 says a weakening was not found.
 
 Four seeds of 20000 programs find no counterexample under the rules as they
-are. All 43 weakenings are found: 41 at 5000 programs a seed, one (a reference
-to a global leaving its `with`) at 20000, and one (an argument's loans not alive
-while later arguments run) by a hand-written case, since the search never writes
-a place inside an argument.
+are. All 44 weakenings are found at 5000 programs a seed. Two (an argument's
+loans not alive while later arguments run, a later branch's loans forgotten) are
+found only by a hand-written case that goes wrong when run: the search never
+writes a place inside an argument, and since it learned arenas it no longer
+builds, even in 20000 programs a seed, the branches the second needs.
 
 ## What the rules are stricter about than they need to be
 

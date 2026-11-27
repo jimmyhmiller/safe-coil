@@ -13,7 +13,7 @@
 ;;;     (VecIn::push! (mut xs) 1)
 ;;;     …)
 (module safe.alloc)
-(export Alloc Heap Lease Arena ArenaRef room-in room-in-arena release-in)
+(export Alloc InArena Heap Lease Arena ArenaRef room-in room-in-arena release-in)
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc)
 (import "coil.scratch" :use [ScratchArena])
@@ -27,7 +27,18 @@
 ;;; nothing at all.
 (deftrait Alloc [Self]
   (grab [(a (ref Self)) (request alloc/AllocRequest)] (-> (Option (ptr i8))))
-  (give [(a (ref Self)) (memory (ptr i8)) (request alloc/AllocRequest)] (-> void)))
+  (give [(a (ref Self)) (memory (ptr i8)) (request alloc/AllocRequest)] (-> void))
+  ;;; Is what a collection holds in this memory dropped with it? Not in an
+  ;;; arena, which holds only what owns nothing (see InArena).
+  (drops? [(a (ref Self))] (-> bool)))
+
+;;; `(impl InArena (C T ArenaRef))`: the collection C keeps its contents, of
+;;; type T, in an arena, and drops none of them: the arena gives their memory
+;;; back all at once. So the checker lets only what owns nothing outside the
+;;; arena be its T: plain data, references, other things in the arena, and
+;;; views made of those with no drop of their own. Then nothing is ever left
+;;; undropped, and giving an arena back is all it costs.
+(deftrait InArena [Self])
 
 ;;; What asking for COUNT values of T asks for, COUNT above zero and T with a
 ;;; size. More than memory can hold stops the program. It is built where it is
@@ -79,10 +90,12 @@
 (defstruct Heap [])
 
 (impl Alloc Heap
+  ;; what Coil's malloc allocator does, called directly
   (grab :inline (Always) [(a (ref Heap)) (request alloc/AllocRequest)] (-> (Option (ptr i8)))
-    (unsafe (alloc/raw-alloc (alloc/malloc-allocator) request)))
+    (unsafe (alloc/malloc-allocate request)))
   (give :inline (Always) [(a (ref Heap)) (memory (ptr i8)) (request alloc/AllocRequest)] (-> void)
-    (unsafe (alloc/raw-free (alloc/malloc-allocator) memory request) 0)))
+    (unsafe (primitive/free memory) 0))
+  (drops? :inline (Always) [(a (ref Heap))] (-> bool) true))
 
 ;; ---- a lease -----------------------------------------------------------------
 
@@ -108,7 +121,8 @@
   (grab :inline (Always) [(a (ref Lease)) (request alloc/AllocRequest)] (-> (Option (ptr i8)))
     (unsafe (alloc/lease-raw-alloc (field a lease) request)))
   (give :inline (Always) [(a (ref Lease)) (memory (ptr i8)) (request alloc/AllocRequest)] (-> void)
-    (unsafe (alloc/lease-raw-free (field a lease) memory request) 0)))
+    (unsafe (alloc/lease-raw-free (field a lease) memory request) 0))
+  (drops? :inline (Always) [(a (ref Lease))] (-> bool) true))
 
 (impl Clone Lease
   (clone [(a (ref Lease))] (-> Lease)
@@ -183,4 +197,5 @@
     (unsafe (alloc/allocate (load (field a at)) request)))
   ;; an arena gives its memory back all at once
   (give :inline (Always) [(a (ref ArenaRef)) (memory (ptr i8)) (request alloc/AllocRequest)] (-> void)
-    0))
+    0)
+  (drops? :inline (Always) [(a (ref ArenaRef))] (-> bool) false))

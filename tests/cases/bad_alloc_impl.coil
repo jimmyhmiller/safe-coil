@@ -6,5 +6,6 @@
 (impl Alloc Mine
   (grab [(a (ref Mine)) (request alloc/AllocRequest)] (-> (Option (ptr i8)))
     (unsafe (alloc/raw-alloc (alloc/malloc-allocator) request)))
-  (give [(a (ref Mine)) (memory (ptr i8)) (request alloc/AllocRequest)] (-> void) 0))
+  (give [(a (ref Mine)) (memory (ptr i8)) (request alloc/AllocRequest)] (-> void) 0)
+  (drops? [(a (ref Mine))] (-> bool) true))
 (defn main [] (-> i64) 0)

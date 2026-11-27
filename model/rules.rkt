@@ -69,7 +69,8 @@
     (abox-unpinned "a box in an arena gives up its loan on the arena at its last use, though its drop uses the arena")
     (reset-unchecked "an arena is reset while what is in it is used")
     (par-arena-shared "an arena may be lent shared to both of two calls at once")
-    (abox-view-loans "a box in an arena that holds a view does not hold the view's loans")))
+    (abox-view-loans "a box in an arena that holds a view does not hold the view's loans")
+    (arena-owner "an owner may be put in an arena, which drops nothing it holds")))
 (define (mutant? m) (eq? (mutant) m))
 
 (define-language Safe
@@ -89,15 +90,15 @@
   ;; what it captured is storable; one that borrows is second-class, exclusive
   ;; when it captured something exclusively. An out parameter refers to a place
   ;; that holds nothing yet, which the callee must fill.
-;; An arena owns the memory of what is allocated in it, all of it given back
+  ;; An arena owns the memory of what is allocated in it, all of it given back
   ;; at once; a box in an arena, `(abox α)`, holds a shared loan on the arena.
   ;; It may hold a view, whose loans it then holds too: what an arena holds can
   ;; borrow what else is in it, so a tree can be built there.
   (σ ::= int unit (box σ) (ptr σ) (pool σ) (handle σ) (task σ) (S σ ...) T
          (fno (τ ...) τ) arena)
-  (ρ ::= σ (ref σ) (mut σ) (view V))
+  (ρ ::= σ (ref σ) (mut σ) (view V) (abox α))
   ;; a reference to a view: a view lent where it lies, as `(mut (SliceMut T))`
-  (τ ::= ρ (ref (view V)) (mut (view V)) (fnb k (τ ...) τ) (out σ) (abox α))
+  (τ ::= ρ (ref (view V)) (mut (view V)) (fnb k (τ ...) τ) (out σ))
   (α ::= σ (view V))
   (e ::= n unit p
          (let ([x e]) e) (seq e e) (if0 e e e) (+ e e)
@@ -421,6 +422,24 @@
   (cond [(and (mutant? 'no-elem-loans) (has-at? p)) '()]
         [(through-shared? Σ Γ p) (loans-of Λ (place-root p))]
         [else `((,(norm p) shr))]))
+;; Does a value of type τ own nothing an arena would have to drop? What is in
+;; an arena is never dropped: its memory comes back when the arena is reset.
+;; So it holds plain data, references, boxes in an arena (whose contents were
+;; asked this when they were made) and views made of those, none with a drop of
+;; its own to run.
+(define (arena-safe? Σ τ [seen '()])
+  (match τ
+    [(or 'int 'unit) #t]
+    [`(,(or 'ptr 'handle 'ref 'mut 'abox) ,_) #t]
+    [`(view ,_) (and (not (view-drop Σ τ))
+                     (for/and ([f (fields-of Σ τ)]) (arena-safe? Σ (cadr f) seen)))]
+    [(? symbol?) #f]
+    [`(,(or 'box 'pool 'task 'out 'fnb 'fno) . ,_) #f]
+    ['arena #f]
+    [_ (or (member τ seen)
+           (let ([parts (or (fields-of Σ τ) (variants-of Σ τ))])
+             (and parts (for/and ([part parts]) (arena-safe? Σ (cadr part) (cons τ seen))))))]))
+
 ;; Can a value of type τ reach an arena? An arena changes when something is
 ;; allocated in it, though it is lent only shared, so it is never lent to two
 ;; threads at once.
@@ -771,6 +790,7 @@
   [(chk ,(Σ+ (term Σ) (term p)) Γ Λ e α L_e Γ_1)
    (side-condition ,(equal? (place-type (term Σ) (term Γ_1) (term p)) 'arena))
    (side-condition ,(available? (term Γ_1) (term p)))
+   (side-condition ,(or (mutant? 'arena-owner) (arena-safe? (term Σ) (term α))))
    ;; what the value holds is alive while the arena is lent
    (side-condition ,(read-ok? (active (term Σ) (term Γ_1) (add-loans (term Λ) (term tmp) (term L_e))) (term p)))
    (where L ,(union (if (mutant? 'abox-no-loan) '() (shared-loans (term Σ) (term Γ_1) (term Λ) (term p)))

@@ -4,7 +4,7 @@
 (export Box BoxIn)
 (import "coil.primitive" :as primitive)
 (import "safe.core" :use [unsafe lend lend-mut View])
-(import "safe.alloc" :use [Alloc Heap Arena ArenaRef room-in room-in-arena release-in])
+(import "safe.alloc" :use [Alloc InArena Heap Arena ArenaRef room-in room-in-arena release-in])
 
 ;;; A value of type T in memory from A, freed when its box leaves scope. A box
 ;;; cannot be copied: naming one moves it. A box in an arena, `(BoxIn T
@@ -13,12 +13,15 @@
 
 (impl [T] View (BoxIn T ArenaRef))
 
+;;; What a box in an arena holds owns nothing, and is not dropped.
+(impl [T] InArena (BoxIn T ArenaRef))
+
 ;;; A value of type T on the heap: `(BoxIn T Heap)`, which it holds, with the
 ;;; same methods. It is one pointer.
 (defstruct Box [T] [(in (BoxIn T Heap))])
 
 ;;; Room for one T from A, holding VALUE.
-(defn put [T (A Alloc)] [(a (ref A)) (value T)] (-> (ptr T))
+(defn put :inline (Always) [T (A Alloc)] [(a (ref A)) (value T)] (-> (ptr T))
   (unsafe
     (let [at (data (room-in [T A] a 1))]
       (store! at value)
@@ -27,7 +30,7 @@
 (impl [T (A Alloc)] (BoxIn T A)
   ;;; A box holding VALUE, in memory from A: the heap (`Heap`) or a Lease. A
   ;;; box in an arena is made by `BoxIn::in-arena`.
-  (new-in [(value T) (a A)] (-> (BoxIn T A))
+  (new-in :inline (Always) [(value T) (a A)] (-> (BoxIn T A))
     (unsafe
       (let [at (put [T A] a value)]
         (BoxIn :at at :alloc a))))
@@ -55,7 +58,8 @@
 ;;; A box in ARENA holding VALUE. The arena stays lent while the box lives.
 (impl [T] (BoxIn T ArenaRef)
   ;;; VALUE may be a view, as a node of a tree in the arena is: the box then
-  ;;; keeps what it borrowed lent too.
+  ;;; keeps what it borrowed lent too. It owns nothing outside the arena: the
+  ;;; box never drops it (see safe.alloc's InArena).
   (in-arena :safe/keeps "value" [(arena (ref Arena)) (value T)] (-> (BoxIn T ArenaRef))
     (unsafe
       (let [at (data (room-in-arena [T] arena 1))]
@@ -88,6 +92,7 @@
   (drop [(self (mut (BoxIn T A)))] (-> void)
     (unsafe
       (let [at (load (field self at))]
-        (let [value (take! [T] at)] 0)
+        (when (drops? (field self alloc))
+          (let [value (take! [T] at)] 0))
         (release-in [T A] (field self alloc) (slice::new [T] at 1))
         0))))

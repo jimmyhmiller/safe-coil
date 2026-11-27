@@ -1199,6 +1199,57 @@
       (fail! arg "safe: a view is passed where it could be stored; it can only be a local, an argument that names its type, or a result")
       0))
 
+;;; Is T a collection that keeps what it holds in an arena and never drops it,
+;;; marked `safe.alloc.InArena`?
+(defn in-arena? [(t Code)] (-> bool)
+  (and (primitive/code-list? t)
+       (match (primitive/code-type-traits t)
+         (primitive/TraitsAre [names] (name-in? `safe.alloc.InArena names))
+         (primitive/TraitsUnknown [] false))))
+
+;;; Does a value of type T own nothing an arena would have to drop? Plain data,
+;;; references, raw memory (its own module's), collections in an arena (whose
+;;; contents were asked this when they were made), and structs and sums of
+;;; those with no drop of their own. A type parameter may stand for an owner.
+(defn arena-safe? [(cx (ref Cx)) (t Code) (seen Code)] (-> bool)
+  (cond (ref-type? t) true
+        (raw-type? t) true
+        (primitive/code-sym? t)
+          (cond (scalar-name? t) true
+                (name-in? t (.tparams cx)) false
+                :else (arena-safe-parts? cx t seen))
+        (primitive/code-list? t) (arena-safe-parts? cx t seen)
+        :else false))
+
+(defn arena-safe-parts? [(cx (ref Cx)) (t Code) (seen Code)] (-> bool)
+  (cond (in-arena? t) true
+        (name-in? t seen) true
+        (has-drop? t) false
+        :else
+          (let [more `(~t ~@seen)]
+            (match (primitive/code-type-shape t)
+              (primitive/StructShape []
+                (block :all
+                  (for [i 0 (primitive/code-field-count t)]
+                    (unless (arena-safe? cx (primitive/code-field-type t i) more) (return-from :all false)))
+                  true))
+              (primitive/SumShape []
+                (block :all
+                  (for [v 0 (primitive/code-variant-count t)]
+                    (for [i 0 (primitive/code-variant-fields t v)]
+                      (unless (arena-safe? cx (primitive/code-variant-field-type t v i) more)
+                        (return-from :all false))))
+                  true))
+              (primitive/UnknownShape [] false)))))
+
+;;; E makes a collection in an arena: what it holds is never dropped, so it must
+;;; own nothing outside the arena.
+(defn check-arena-contents! [(cx (ref Cx)) (e Code)] (-> i64)
+  (let [t (type-of e)]
+    (if (and (in-arena? t) (> (len t) 1) (not (arena-safe? cx (get t 1) `())))
+        (fail! e "safe: an arena drops nothing it holds, so what is put in one owns nothing outside it; use a list or a box in the arena for what this holds on the heap")
+        0)))
+
 ;;; Is T marked `safe.core.OneThread`: changed through a shared reference?
 (defn one-thread? [(t Code)] (-> bool)
   (match (primitive/code-type-traits t)
@@ -1392,6 +1443,7 @@
           (fail! e "safe: one argument of this call lends a place exclusively and another still holds a loan on it"))))
     ; a view over an exclusive reference gives exclusive access, so there is one of it
     (when (view-type? (type-of e)) (refuse-copied-exclusive! cx e (type-of e) all))
+    (check-arena-contents! cx e)
     ; a reference that is thrown away still may not outlive what it refers to
     (cond (dyn-type? (callee-result kind name signature)) (carrying all)
           ; a trait object a generic call gives back, `(Own::get-mut (mut o))`

@@ -14,6 +14,7 @@
   '((struct Pair () ((a (box int)) (b (box int))))
     (struct Holds () ((a arena)))
     (view InArena ((r (ref arena))))
+    (view Node ((next (abox int)) (n int)))
     (struct Pt () ((m int) (n int)))
     (struct Wrap (T) ((v T) (w int)))
     (sum Opt (T) ((None unit) (Some T)))
@@ -339,6 +340,9 @@
     (reject "what a lock holds is not freed while the lock lives, even after its last use"
      ,(prog '() '(let ([b (box (box 1))])
                    (let ([g (new (view Lock) (mut (* b)))]) (set! b (box (box 2)))))))
+    (reject "a reference from the later branch keeps what it refers into lent"
+     ,(prog '() '(let ([n 5]) (let ([b (box 1)])
+                   (let ([r (if0 1 (ref n) (ref (* b)))]) (seq (set! b (box 2)) (* r)))))))
     (reject "a later argument frees what an earlier one refers into"
      ,(prog '((defn first-of () ((r (ref int)) (n int)) int (* r)))
             '(let ([b (box 1)]) (call first-of () (ref (* b)) (seq (set! b (box 2)) 0)))))
@@ -346,14 +350,24 @@
     ;; ================================================== arenas
     (accept "two boxes in one arena, and the arena reset once they are gone"
      ,(prog '() '(let ([a (arena-new)])
-                   (seq (let ([x (abox a (box 1))]) (let ([y (abox a 2)]) (+ (* (* x)) (* y))))
+                   (seq (let ([x (abox a 1)]) (let ([y (abox a 2)]) (+ (* x) (* y))))
                         (seq (reset! a) 0)))))
     (accept "a box in an arena is changed through"
      ,(prog '() '(let ([a (arena-new)]) (let ([x (abox a 1)]) (seq (set! (* x) 5) (* x))))))
     (accept "what a box in an arena holds is moved out, and outlives a reset"
      ,(prog '() '(let ([a (arena-new)])
-                   (let ([v (let ([x (abox a (box 3))]) (unbox x))])
-                     (seq (reset! a) (* v))))))
+                   (let ([v (let ([x (abox a (new (Pt) 3 4))]) (unbox x))])
+                     (seq (reset! a) (: v m))))))
+    (reject "an owner is not put in an arena, which drops nothing it holds"
+     ,(prog '() '(let ([a (arena-new)]) (let ([x (abox a (box 1))]) (* (* x))))))
+    (reject "a view whose drop runs code is not put in an arena"
+     ,(prog '() '(let ([n (box 1)]) (let ([a (arena-new)])
+                   (let ([x (abox a (new (view Lock) (mut n)))]) 0)))))
+    (accept "a box in an arena holds a view of another box in it"
+     ,(prog '() '(let ([a (arena-new)])
+                   (let ([leaf (abox a 7)])
+                     (let ([top (abox a (new (view Node) leaf 1))])
+                       (+ (* (: (* top) next)) (: (* top) n)))))))
     (reject "an arena is not reset while a box in it is used"
      ,(prog '() '(let ([a (arena-new)]) (let ([x (abox a 1)]) (seq (reset! a) (* x))))))
     (reject "a box in an arena does not outlive the arena"

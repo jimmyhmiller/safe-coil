@@ -1,0 +1,11 @@
+(module case.bad-arena-holds-box)
+(import "safe.vec" :use [Vec VecIn])
+(import "safe.box" :use [Box BoxIn])
+(import "safe.str" :use [Str])
+(import "safe.alloc" :use [Arena ArenaRef])
+(defstruct Pt [(x i64) (y i64)])
+(defstruct Named [(name Str) (n i64)])
+(defn main [] (-> i64)
+  (let [a (Arena::new)
+        b (BoxIn::in-arena [(Box i64)] a (Box::new 1))]
+    0))

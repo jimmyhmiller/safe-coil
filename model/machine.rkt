@@ -144,19 +144,15 @@
        (kill! a)]
       [`(rec (%drop . ,V) . ,fs)
        (drop-val! (invoke (find 'defn (view-drop V)) (list `(rec ,@fs))))]
-      ;; an arena gives back the memory of everything in it; what is still in
-      ;; a box there is dropped
+      ;; an arena gives back the memory of everything in it
       [`(arena ,a)
        (define c (hash-ref store a))
        (unless (cell-live? c) (raise (stuck "double free")))
        (empty-arena! a)
        (kill! a)]
-      ;; a box in an arena drops what it holds; its memory is the arena's
-      [`(abox ,m)
-       (define c (live-cell m "drop in"))
-       (define v (cell-v c))
-       (set-cell-v! c 'moved)
-       (unless (eq? v 'moved) (drop-val! v))]
+      ;; a box in an arena owns nothing to drop; its memory is the arena's.
+      ;; Its cell must still be there: the box may not outlive the arena.
+      [`(abox ,m) (live-cell m "drop in") (void)]
       [`(rec (,_ . ,vs) ...) (for-each drop-val! vs)]
       [`(var ,_ ,pv) (drop-val! pv)]
       [`(tbl (,_ . ,vs) ...) (for-each drop-val! vs)]
@@ -168,15 +164,12 @@
     (define t (hash-ref tasks id (λ () (raise (stuck "a task joined twice")))))
     (hash-remove! tasks id)
     (cdr t))
-  ;; every cell the arena A gave out is given back, what is still in one dropped
+  ;; every cell the arena A gave out is given back; nothing in one is dropped
   (define (empty-arena! a)
     (match (cell-v (hash-ref store a))
       [`(members . ,ms)
        (for ([m ms])
-         (define c (hash-ref store m))
-         (when (cell-live? c)
-           (unless (eq? (cell-v c) 'moved) (drop-val! (cell-v c)))
-           (kill! m)))
+         (when (cell-live? (hash-ref store m)) (kill! m)))
        (set-cell-v! (hash-ref store a) '(members))]))
   (define (end-scope! a)
     (drop-val! (cell-v (hash-ref store a)))

@@ -13,7 +13,7 @@
 (defn put-in [(h (ref Holds))] (-> i64) (put (field h arena)))
 (defn main [] (-> i64)
   (let [(mut a) (Arena::new)]
-    (let [(mut xs) (VecIn::in-arena [(Box i64)] a)]
-      (VecIn::push! (mut xs) (Box::new 1))
+    (let [(mut xs) (VecIn::in-arena [i64] a)]
+      (VecIn::push! (mut xs) 1)
       (Arena::reset! (mut a))
       0)))

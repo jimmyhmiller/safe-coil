@@ -4,7 +4,7 @@
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc)
 (import "safe.core" :use [unsafe lend lend-mut View Each EachMut SharedView CrossThread stop-index stop-range])
-(import "safe.alloc" :use [Alloc Heap Arena ArenaRef room-in release-in])
+(import "safe.alloc" :use [Alloc InArena Heap Arena ArenaRef room-in release-in])
 
 ;;; A list of T, in memory from A (see safe.alloc). It owns its elements: they
 ;;; are freed with it. An index out of range stops the program. A list in an
@@ -13,6 +13,9 @@
 (defstruct VecIn [T A] [(items (slice T)) (count i64) (alloc A)])
 
 (impl [T] View (VecIn T ArenaRef))
+
+;;; What a list in an arena holds owns nothing, and is not dropped.
+(impl [T] InArena (VecIn T ArenaRef))
 
 ;;; A list of T on the heap: `(VecIn T Heap)`, which it holds, with the same
 ;;; methods.
@@ -329,7 +332,8 @@
 (impl [T (A Alloc)] Drop (VecIn T A)
   (drop [(self (mut (VecIn T A)))] (-> void)
     (unsafe
-      (for i (range 0 (.count self))
-        (let [value (take! [T] (primitive/index (data (.items self)) i))] 0))
+      (when (drops? (field self alloc))
+        (for i (range 0 (.count self))
+          (let [value (take! [T] (primitive/index (data (.items self)) i))] 0)))
       (release-in [T A] (field self alloc) (.items self))
       0)))
