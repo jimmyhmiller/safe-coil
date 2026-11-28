@@ -1,0 +1,8 @@
+(module case.bad-linear-discarded)
+(import "safe.core" :use [Linear Droppable destroy])
+(defstruct Tx [(conn i64) (amount i64)])
+(impl Drop Tx (drop [(self (mut Tx))] (-> void) 0))
+(impl Linear Tx)
+(defn open [(id i64)] (-> Tx) (Tx :conn id :amount 0))
+(defn commit [(t Tx)] (-> i64) (let [n (.amount t)] (destroy t) n))
+(defn main [] (-> i64) (open 1) 0)

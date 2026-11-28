@@ -1,0 +1,5 @@
+(module case.bad-linear-copied)
+(import "safe.core" :use [Linear destroy])
+(defstruct Tx [(n i64)])
+(impl Linear Tx)
+(defn main [] (-> i64) (let [t (Tx :n 1) u t] (destroy t) (destroy u) 0))

@@ -6,6 +6,7 @@
 (import "safe.vec" :use [Vec])
 (import "safe.str" :use [Str])
 (import "safe.fn" :use [deffn lambda lambda-own])
+(import "safe.core" :use [Droppable])
 (import "safe.loop" :use [for])
 
 ;; ---- closure types ---------------------------------------------------------------
@@ -17,24 +18,24 @@
 
 ;; ---- generic higher-order functions ------------------------------------------
 
-(defn keep [T (F (Test T))] [(xs (ref (Vec T))) (test (mut F))] (-> (Vec i64))
+(defn keep [(T Droppable) (F (Test T))] [(xs (ref (Vec T))) (test (mut F))] (-> (Vec i64))
   (let [(mut out) (Vec::new [i64])]
     (for i (range 0 (len xs))
       (when (Test::run (mut test) (Vec::at xs i)) (Vec::push! (mut out) i)))
     out))
 
-(defn turn [T U (F (Turn T U))] [(xs (ref (Vec T))) (f (mut F))] (-> (Vec U))
+(defn turn [(T Droppable) (U Droppable) (F (Turn T U))] [(xs (ref (Vec T))) (f (mut F))] (-> (Vec U))
   (let [(mut out) (Vec::new [U])]
     (for (ref x) xs (Vec::push! (mut out) (Turn::run (mut f) x)))
     out))
 
-(defn fold [A T (F (Step A T))] [(xs (ref (Vec T))) (start A) (f (mut F))] (-> A)
+(defn fold [(A Droppable) (T Droppable) (F (Step A T))] [(xs (ref (Vec T))) (start A) (f (mut F))] (-> A)
   (let [(mut acc) start]
     (for (ref x) xs (set! acc (Step::run (mut f) acc x)))
     acc))
 
 ;;; Sort XS in place: insertion sort, by BEFORE.
-(defn sort-by! [T (F (Before T))] [(xs (mut (Vec T))) (before (mut F))] (-> void)
+(defn sort-by! [(T Droppable) (F (Before T))] [(xs (mut (Vec T))) (before (mut F))] (-> void)
   (for i (range 1 (len xs))
     (let [(mut j) i]
       (while (and (> j 0) (Before::run (mut before) (Vec::at xs j) (Vec::at xs (- j 1))))

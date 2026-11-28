@@ -4,7 +4,7 @@
 ;;;   coil run examples/graph.coil --use safe.check
 (module example.graph)
 (import "safe.vec" :use [Vec])
-(import "safe.core" :use [replace!])
+(import "safe.core" :use [replace! Droppable])
 (import "safe.loop" :use [for])
 
 ;; ---- a binary heap -------------------------------------------------------------
@@ -12,7 +12,7 @@
 ;;; The smallest element first, by `<`.
 (defstruct Heap [T] [(items (Vec T))])
 
-(impl [(T Ord)] (Heap T)
+(impl [(T Ord Droppable)] (Heap T)
   (new [] (-> (Heap T))
     (Heap :items (Vec::new [T])))
 

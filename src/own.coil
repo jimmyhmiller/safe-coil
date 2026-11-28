@@ -15,7 +15,7 @@
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc)
 (import "coil.cc" :as cc)
-(import "safe.core" :use [unsafe])
+(import "safe.core" :use [unsafe Droppable])
 
 ;;; A value whose type implements the trait D is the object of, on the heap.
 (defstruct Own [D] [(at (ptr u8))
@@ -33,11 +33,11 @@
     (unsafe (let [view (.view o)] (view (.at o))))))
 
 ;;; VALUE on the heap. Only `own` calls it, inside `unsafe`.
-(defn box-raw [T] [(value T)] (-> (ptr T))
+(defn box-raw [(T Droppable)] [(value T)] (-> (ptr T))
   (unsafe (alloc/box! (alloc/malloc-allocator) T value)))
 
 ;;; Drop the T at P and give back its memory.
-(defn free-as [T] [(p (ptr u8))] (-> void)
+(defn free-as [(T Droppable)] [(p (ptr u8))] (-> void)
   (unsafe
     (let [at (primitive/cast (ptr T) p)
           value (take! [T] at)]

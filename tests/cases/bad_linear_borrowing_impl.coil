@@ -1,0 +1,9 @@
+(module case.bad-linear-borrowing-impl)
+(import "safe.core" :use [Linear destroy])
+(defstruct Tx [(n i64)])
+(impl Drop Tx (drop [(self (mut Tx))] (-> void) 0))
+(impl Linear Tx)
+(deftrait Settle [Self] (settle [(x Self)] (-> i64)))
+;; the trait takes a Tx by value: an impl that borrows it leaves the caller to drop it
+(impl Settle Tx (settle [(x (ref Tx))] (-> i64) (.n x)))
+(defn main [] (-> i64) 0)

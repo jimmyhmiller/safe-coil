@@ -1,0 +1,30 @@
+(module case.ok-linear)
+(import "safe.core" :use [Linear Droppable destroy move])
+(defstruct Tx [(conn i64) (amount i64)])
+(impl Drop Tx (drop [(self (mut Tx))] (-> void) 0))
+(impl Linear Tx)
+(defn open [(id i64)] (-> Tx) (Tx :conn id :amount 0))
+(defn commit [(t Tx)] (-> i64) (let [n (.amount t)] (destroy t) n))
+(defn debit [(t (mut Tx)) (n i64)] (-> void) (set! (.amount t) (+ (.amount t) n)))
+;; a type parameter takes a linear value when its function drops none
+(defn keep [T] [(x T)] (-> T) x)
+(defn either [(c bool) (t Tx)] (-> i64) (if c (commit t) (+ 1 (commit t))))
+;; a linear struct with no drop of its own, taken apart: every field moved out
+(defstruct Deal [(a Tx) (b Tx)])
+(impl Linear Deal)
+(defn settle [(d Deal)] (-> i64) (let [a (.a d) b (.b d)] (+ (commit a) (commit b))))
+;; one that holds a linear value is linear too: matched, and what it held ended
+(defn maybe [(o (Option Tx))] (-> i64) (match (move o) (Some [t] (commit t)) (None [] 0)))
+;; given by value to a trait method through a bound, which ends it
+(deftrait Settle [Self] (settle [(x Self)] (-> i64)))
+(impl Settle Tx (settle [(x Tx)] (-> i64) (commit x)))
+(defn hand [(T Settle)] [(x T)] (-> i64) (Settle::settle x))
+;; a type parameter bounded Droppable takes what is not linear
+(defn toss [(T Droppable)] [(x T)] (-> i64) 0)
+(defn main [] (-> i64)
+  (let [(mut t) (open 1)]
+    (debit (mut t) 5)
+    (let [u (keep t)
+          n (either true u)
+          m (settle (Deal :a (open 2) :b (open 3)))]
+      (+ n m (maybe (Some (open 4))) (toss 7) (hand (open 5))))))

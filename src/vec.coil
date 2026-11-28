@@ -3,7 +3,7 @@
 (export Vec VecIn Slice SliceMut Halves)
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc)
-(import "safe.core" :use [unsafe lend lend-mut View Each EachMut SharedView CrossThread stop-index stop-range])
+(import "safe.core" :use [unsafe lend lend-mut View Each EachMut SharedView CrossThread stop-index stop-range Droppable])
 (import "safe.alloc" :use [Alloc InArena Heap Arena ArenaRef room-in release-in])
 
 ;;; A list of T, in memory from A (see safe.alloc). It owns its elements: they
@@ -81,7 +81,7 @@
       (stop-index i "a Vec" (.count v)))
     (primitive/index (data (.items v)) i)))
 
-(impl [T (A Alloc)] (VecIn T A)
+(impl [(T Droppable) (A Alloc)] (VecIn T A)
   ;;; An empty list in memory from A: the heap (`Heap`) or a Lease. A list in
   ;;; an arena is made by `VecIn::in-arena`.
   (new-in [(a A)] (-> (VecIn T A))
@@ -176,11 +176,11 @@
 
 
 ;;; An empty list in ARENA, which stays lent while the list lives.
-(impl [T] (VecIn T ArenaRef)
+(impl [(T Droppable)] (VecIn T ArenaRef)
   (in-arena [(arena (ref Arena))] (-> (VecIn T ArenaRef))
     (unsafe (VecIn :items (empty [T]) :count 0 :alloc (Arena::lend arena)))))
 
-(impl [T] (Vec T)
+(impl [(T Droppable)] (Vec T)
   ;;; An empty list.
   (new :inline (Always) [] (-> (Vec T))
     (Vec :in (VecIn::new-in [T Heap] (Heap))))
@@ -269,53 +269,53 @@
       (SliceMut :items (range-within (.items s) (.count s) from to) :count (- to from)))))
 
 ;;; `(len v)`, as for Coil's own collections.
-(impl [T A] Len (VecIn T A)
+(impl [(T Droppable) (A Alloc)] Len (VecIn T A)
   (len :inline (Always) [(v (ref (VecIn T A)))] (-> i64) (.count v)))
 
-(impl [T] Len (Vec T)
+(impl [(T Droppable)] Len (Vec T)
   (len :inline (Always) [(v (ref (Vec T)))] (-> i64) (.count (field v in))))
 
 ;;; `(get v i)`: a copy of element I, for elements that are plain data; one
 ;;; that owns something is lent with `(Vec::at v i)`.
-(impl [T A] Get (VecIn T A)
+(impl [(T Droppable) (A Alloc)] Get (VecIn T A)
   (get :inline (Always) :collection/copies-element "(VecIn::at v i)" [(v (ref (VecIn T A))) (i i64)] (-> T)
     (unsafe (load (slot v i)))))
 
-(impl [T] Get (Vec T)
+(impl [(T Droppable)] Get (Vec T)
   (get :inline (Always) :collection/copies-element "(Vec::at v i)" [(v (ref (Vec T))) (i i64)] (-> T)
     (unsafe (load (slot (field v in) i)))))
 
 ;;; `(set! (mut v) i x)`: element I replaced, the old one dropped.
-(impl [T (A Alloc)] Set (VecIn T A)
+(impl [(T Droppable) (A Alloc)] Set (VecIn T A)
   (set! [(v (mut (VecIn T A))) (i i64) (x T)] (-> i64)
     (set! (VecIn::at-mut (mut v) i) x)
     0))
 
-(impl [T] Set (Vec T)
+(impl [(T Droppable)] Set (Vec T)
   (set! [(v (mut (Vec T))) (i i64) (x T)] (-> i64)
     (set! (Vec::at-mut (mut v) i) x)
     0))
 
 ;;; `(clone v)`: a new list of the elements' clones.
-(impl [(T Clone)] Clone (Vec T)
+(impl [(T Clone Droppable)] Clone (Vec T)
   (clone [(v (ref (Vec T)))] (-> (Vec T))
     (let [(mut out) (Vec::new [T])]
       (for i (range 0 (Vec::len v))
         (Vec::push! (mut out) (clone (Vec::at v i))))
       out)))
 
-(impl [T (A Alloc)] Each (VecIn T A)
+(impl [(T Droppable) (A Alloc)] Each (VecIn T A)
   (count :inline (Always) [(xs (ref (VecIn T A)))] (-> i64) (VecIn::len xs))
   (item :inline (Always) [(xs (ref (VecIn T A))) (i i64)] (-> (ref T)) (VecIn::at xs i)))
 
-(impl [T (A Alloc)] EachMut (VecIn T A)
+(impl [(T Droppable) (A Alloc)] EachMut (VecIn T A)
   (item-mut :inline (Always) [(xs (mut (VecIn T A))) (i i64)] (-> (mut T)) (VecIn::at-mut (mut xs) i)))
 
-(impl [T] Each (Vec T)
+(impl [(T Droppable)] Each (Vec T)
   (count :inline (Always) [(xs (ref (Vec T)))] (-> i64) (Vec::len xs))
   (item :inline (Always) [(xs (ref (Vec T))) (i i64)] (-> (ref T)) (Vec::at xs i)))
 
-(impl [T] EachMut (Vec T)
+(impl [(T Droppable)] EachMut (Vec T)
   (item-mut :inline (Always) [(xs (mut (Vec T))) (i i64)] (-> (mut T)) (Vec::at-mut (mut xs) i)))
 
 (impl [T] Each (Slice T)
@@ -329,7 +329,7 @@
 (impl [T] EachMut (SliceMut T)
   (item-mut [(xs (mut (SliceMut T))) (i i64)] (-> (mut T)) (SliceMut::at-mut (mut xs) i)))
 
-(impl [T (A Alloc)] Drop (VecIn T A)
+(impl [(T Droppable) (A Alloc)] Drop (VecIn T A)
   (drop [(self (mut (VecIn T A)))] (-> void)
     (unsafe
       (when (drops? (field self alloc))

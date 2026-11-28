@@ -16,6 +16,12 @@
 ;;; whole body is one `(unsafe …)`, which vouches for it.
 (defannotation :safe/keeps (slice u8))
 
+;;; `(defn end [(t Tx)] :safe/destroys "t" (-> void) (unsafe …))`: what the
+;;; parameters named are given ends here, its drop run: the drop a linear value
+;;; is allowed. The body vouches for it, so it is one `(unsafe …)`. A call gives
+;;; such a parameter nothing that holds a linear value inside it.
+(defannotation :safe/destroys (slice u8))
+
 ;;; `(unsafe FORM…)`: the forms may follow raw memory. Every other rule still
 ;;; applies inside. The checker recognizes the `do` this expands to by the macro
 ;;; that produced it.
@@ -116,7 +122,7 @@
   (unsafe (len s)))
 
 ;;; A copy of element I of S. An index out of range stops the program.
-(defn nth :inline (Always) [T] [(s (slice T)) (i i64)] (-> T)
+(defn nth :inline (Always) [(T Copy)] [(s (slice T)) (i i64)] (-> T)
   (unsafe
     (when (or (< i 0) (>= i (len s)))
       (stop-index i "a slice" (len s)))
@@ -172,3 +178,21 @@
       (let [xs (primitive/fresh-identifier "collection")]
         `(let [(mut ~xs) ~(get binding 1)]
            (each-mut [~(get binding 0) ~xs] ~@body)))))
+
+;;; `(impl Linear TYPE)`: a TYPE is never dropped implicitly. It ends by
+;;; `destroy`, by being taken apart (every field moved out), or by going to
+;;; something that ends it; dropping it any other way is refused. What holds one
+;;; is linear too. Only the module that declares TYPE may say it.
+(deftrait Linear [Self])
+
+;;; `[(T Droppable)]`: a generic function may drop values of T, which is then
+;;; given no linear type. A type parameter without it may stand for a linear
+;;; type, so the function drops none of its values. Every type has the trait, so
+;;; the bound asks nothing of the compiler; the checker gives it its meaning.
+(deftrait Droppable [Self])
+(impl [T] Droppable T)
+
+;;; End VALUE, running its drop: the one way a value that is linear but holds
+;;; nothing linear inside it is dropped.
+(defn destroy :safe/destroys "value" [T] [(value T)] (-> void)
+  (unsafe (do)))

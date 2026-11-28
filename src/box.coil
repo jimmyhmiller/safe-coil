@@ -3,7 +3,7 @@
 (module safe.box)
 (export Box BoxIn)
 (import "coil.primitive" :as primitive)
-(import "safe.core" :use [unsafe lend lend-mut View])
+(import "safe.core" :use [unsafe lend lend-mut View Droppable])
 (import "safe.alloc" :use [Alloc InArena Heap Arena ArenaRef room-in room-in-arena release-in])
 
 ;;; A value of type T in memory from A, freed when its box leaves scope. A box
@@ -27,7 +27,7 @@
       (store! at value)
       at)))
 
-(impl [T (A Alloc)] (BoxIn T A)
+(impl [T (A Alloc Droppable)] (BoxIn T A)
   ;;; A box holding VALUE, in memory from A: the heap (`Heap`) or a Lease. A
   ;;; box in an arena is made by `BoxIn::in-arena`.
   (new-in :inline (Always) [(value T) (a A)] (-> (BoxIn T A))
@@ -49,8 +49,9 @@
       (let [(mut held) (manually-drop box)
             at (load (field (field held value) at))
             value (take! [T] at)
-            ; the allocator goes with the box: it is dropped here
-            a (take! [A] (mut (.alloc (.value held))))]
+            ; the allocator goes with the box: moved out of memory no drop
+            ; will run on, and dropped here
+            a (take! [A] (primitive/cast (ptr A) (mut (.alloc (.value held)))))]
         (release-in [T A] a (slice::new [T] at 1))
         (forget held)
         value))))
@@ -88,7 +89,7 @@
   (clone [(b (ref (Box T)))] (-> (Box T))
     (Box::new (clone (Box::get b)))))
 
-(impl [T (A Alloc)] Drop (BoxIn T A)
+(impl [(T Droppable) (A Alloc)] Drop (BoxIn T A)
   (drop [(self (mut (BoxIn T A)))] (-> void)
     (unsafe
       (let [at (load (field self at))]

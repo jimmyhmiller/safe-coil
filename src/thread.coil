@@ -21,7 +21,7 @@
 (import "coil.alloc" :as alloc)
 (import "coil.atomic" :as atomic)
 (import "coil.thread" :use [Thread])
-(import "safe.core" :use [unsafe])
+(import "safe.core" :use [unsafe Droppable])
 (import "safe.mem" :as mem)
 
 (extern pthread_detach :cc (cc/C) [(ptr i8)] (-> i32))
@@ -96,7 +96,7 @@
       (Task [R] :packet packet))))
 
 ;;; The thread's last act: leave VALUE for the task, or drop it if nobody will ask.
-(defn deliver [R] [(raw (ptr i8)) (value R)] (-> (ptr i8))
+(defn deliver [(R Droppable)] [(raw (ptr i8)) (value R)] (-> (ptr i8))
   (unsafe
     (let [packet (primitive/cast (ptr Packet) raw)]
       (alloc/free (alloc/malloc-allocator) (load (field packet slots)))
@@ -107,7 +107,7 @@
         (release [R] packet))
       (primitive/cast (ptr i8) 0))))
 
-(impl [R] (Task R)
+(impl [(R Droppable)] (Task R)
   ;;; Wait for the call to return, and take what it returned.
   (join [(task (Task R))] (-> R)
     (unsafe
@@ -131,7 +131,7 @@
         0))))
 
 ;;; A task that is dropped waits for its thread and drops what it returned.
-(impl [R] Drop (Task R)
+(impl [(R Droppable)] Drop (Task R)
   (drop [(self (mut (Task R)))] (-> void)
     (unsafe
       (let [packet (.packet self)]

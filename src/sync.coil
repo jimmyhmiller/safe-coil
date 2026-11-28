@@ -7,7 +7,7 @@
 (import "coil.atomic" :as atomic)
 (import "coil.sync" :as sync)
 (import "coil.thread" :as thread)
-(import "safe.core" :use [unsafe lend lend-mut View])
+(import "safe.core" :use [unsafe lend lend-mut View Droppable])
 (import "safe.mem" :as mem)
 
 (defn must [T] [(memory (Option (slice T)))] (-> (slice T))
@@ -61,7 +61,7 @@
 (impl [T] Clone (Arc T)
   (clone [(a (ref (Arc T)))] (-> (Arc T)) (Arc::clone a)))
 
-(impl [T] Drop (Arc T)
+(impl [(T Droppable)] Drop (Arc T)
   (drop [(self (mut (Arc T)))] (-> void)
     (unsafe
       (when (= (atomic/sub (field (.held self) holders) 1) 1)
@@ -313,7 +313,7 @@
       (store! (field q count) (- (load (field q count)) 1))
       value)))
 
-(impl [T] (Channel T)
+(impl [(T Droppable)] (Channel T)
   ;;; A new, empty queue, and one `Channel` on it.
   (new [] (-> (Channel T))
     (unsafe
@@ -388,7 +388,7 @@
         (sure (sync/Mutex::unlock! (field q lock)))
         0))))
 
-(impl [T] Drop (Channel T)
+(impl [(T Droppable)] Drop (Channel T)
   (drop [(self (mut (Channel T)))] (-> void)
     (unsafe
       (let [q (.queue self)]

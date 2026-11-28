@@ -36,7 +36,7 @@
 (import "coil.meta" :as meta)
 (import "coil.str" :use *)
 (import "coil.cc" :as cc)
-(import "safe.core" :use [unsafe lend lend-mut View QuietDrop SharedView])
+(import "safe.core" :use [unsafe lend lend-mut View QuietDrop SharedView Droppable])
 (import "safe.mem" :as mem)
 
 ;;; The address of what R refers to, as a raw pointer: a capture's place.
@@ -164,7 +164,8 @@
        (impl ~@(tparams tps) Drop ~own-self
          (drop [(self (mut ~own-self))] (-> void)
            (unsafe (let [free (load (field self free))] (free (load (field self at)))) 0)))
-       (defn ~own-free [~@tps (~f-type ~trait-of)] [(p (ptr u8))] (-> void)
+       ;; what an owning closure captured is dropped with it: never a linear value
+       (defn ~own-free [~@tps (~f-type ~trait-of Droppable)] [(p (ptr u8))] (-> void)
          (unsafe
            (let [at (primitive/cast (ptr ~f-type) p)
                  gone (take! [~f-type] at)]
@@ -175,7 +176,7 @@
        (defn ~(name+ name "-call-once") [~@tps (~f-type ~trait-of)] [(f ~f-type) ~@xparams] (-> ~result)
          (~(name+ name "::call-once") f ~@xargs))
        ;;; The owning closure F, erased, on the heap.
-       (defn ~(name+ name "-own-of") [~@tps (~f-type ~trait-of)] [(f ~f-type)] (-> ~own-self)
+       (defn ~(name+ name "-own-of") [~@tps (~f-type ~trait-of Droppable)] [(f ~f-type)] (-> ~own-self)
          (unsafe
            (let [at (data (mem/room [~f-type] 1))]
              (store! at f)

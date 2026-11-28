@@ -1,0 +1,10 @@
+(module case.bad-linear-par-result)
+(import "safe.core" :use [Linear destroy])
+(import "safe.par" :use [par])
+(defstruct Tx [(n i64)])
+(impl Drop Tx (drop [(self (mut Tx))] (-> void) 0))
+(impl Linear Tx)
+(defn open [] (-> Tx) (Tx :n 5))
+(defn zero [] (-> i64) 0)
+;; the thread drops what its call returns
+(defn main [] (-> i64) (par (open) (zero)) 0)

@@ -16,7 +16,7 @@
 (import "coil.os" :as os)
 (import "coil.alloc" :as alloc)
 (import "coil.atomic" :as atomic)
-(import "safe.core" :use [unsafe lend lend-mut View])
+(import "safe.core" :use [unsafe lend lend-mut View Droppable])
 
 ; hygiene: the declarations below are made once for the target and used by name
 (defn public-name [(name Code)] (-> Code)
@@ -108,7 +108,7 @@
     0))
 
 ;;; A thread ended: drop its value and free its cell.
-(defn destroy-cell [T] [(raw (ptr i8))] (-> void)
+(defn destroy-cell [(T Droppable)] [(raw (ptr i8))] (-> void)
   (unsafe
     (let [cell (primitive/cast (ptr (Cell T)) raw)]
       (when (= (load (field cell filled)) 2)

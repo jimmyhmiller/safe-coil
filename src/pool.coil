@@ -4,7 +4,7 @@
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc)
 (import "safe.vec" :use [Vec])
-(import "safe.core" :use [unsafe lend lend-mut stop])
+(import "safe.core" :use [unsafe lend lend-mut stop Droppable])
 
 ;;; The name of one element of a `(Pool T)`. A handle is plain data: it can be
 ;;; copied and stored, and it keeps nothing alive. Using one whose element has
@@ -100,7 +100,7 @@
   (at-mut :inline (Always) [(pool (mut (Pool T))) (h (Handle T))] (-> (mut T))
     (unsafe (lend-mut (field (live pool h) value)))))
 
-(impl [T] Drop (Pool T)
+(impl [(T Droppable)] Drop (Pool T)
   (drop [(self (mut (Pool T)))] (-> void)
     (unsafe
       (for i (range 0 (.used self))

@@ -3,7 +3,7 @@
 (export Map each-entry)
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc)
-(import "safe.core" :use [unsafe lend lend-mut stop])
+(import "safe.core" :use [unsafe lend lend-mut stop Droppable])
 
 ;;; One place in the table. `state` is 0 when it never held a pair, 1 while it
 ;;; holds one, 2 after its pair was removed. `key` and `value` hold values only
@@ -93,7 +93,7 @@
           (return-from :found at)))
       -1)))
 
-(impl [(K Hash Eq) V] (Map K V)
+(impl [(K Hash Eq Droppable) (V Droppable)] (Map K V)
   ;;; An empty table.
   (new [] (-> (Map K V))
     (unsafe (Map :entries (room [K V] 8) :count 0 :used 0)))
@@ -169,7 +169,7 @@
     (unsafe (lend (field (pair-at m cursor) value)))))
 
 ;;; `(clone m)`: a new table of the keys' and values' clones.
-(impl [(K Hash Eq Clone) (V Clone)] Clone (Map K V)
+(impl [(K Hash Eq Clone Droppable) (V Clone Droppable)] Clone (Map K V)
   (clone [(m (ref (Map K V)))] (-> (Map K V))
     (let [(mut out) (Map::new [K V])
           (mut cursor) (Map::first m)]
@@ -178,7 +178,7 @@
         (set! cursor (Map::next m cursor)))
       out)))
 
-(impl [K V] Drop (Map K V)
+(impl [(K Droppable) (V Droppable)] Drop (Map K V)
   (drop [(self (mut (Map K V)))] (-> void)
     (unsafe
       (for i (range 0 (len (.entries self)))

@@ -312,6 +312,51 @@ that builds one from the arena and something else it is given says which it
 borrows from: `examples/arena.coil`'s parser takes the arena and the parser's
 state and says `:safe/borrows "ar"`.
 
+### Linear values
+
+```coil
+(defstruct Tx [(conn i64) (amount i64)])
+(impl Drop Tx (drop [(self (mut Tx))] (-> void) 0))
+(impl Linear Tx)                          ; never dropped implicitly
+
+(defn commit [(t Tx)] (-> i64)
+  (let [n (.amount t)] (destroy t) n))    ; destroy: the one place a Tx ends
+
+(let [t (open 1)]
+  (debit (mut t) 5)
+  (commit t))                             ; leave this out and the checker refuses
+```
+
+A linear value is one obligation. It ends by `destroy`, by being taken apart
+(every field moved out of a linear struct that has no drop of its own), or by
+going to something that ends it. Dropping it any other way is refused: at the end
+of a scope, by a `set!` over it, thrown away as a statement, left behind by a
+`break` or a return, or moved on only some of the ways that reach a join. What
+holds one is linear too: an `Option`, a struct with such a field, a collection
+of them. Named destructors, a `commit` and a `rollback` say, are functions that
+end in `destroy`. A linear type is an owner, so one made of plain data has a drop
+of its own (Coil would copy it otherwise), and only its own module may say it
+is linear. These are Mojo's explicitly destroyed types (`@explicit_destroy`).
+
+Generics follow Mojo too: every type parameter may stand for a linear type, and
+a generic whose body drops a T says `[(T Droppable)]`. That is Mojo's
+`ImplicitlyDestructible`, and no linear type is given to such a T.
+`(defn keep [T] [(x T)] (-> T) x)` takes a `Tx`, and
+`(defn toss [(T Droppable)] [(x T)] (-> i64) 0)` does not. The collections drop
+what they hold, so `Vec`, `Box`, `Map`, `Pool`, `Arc` and `Channel` are
+`Droppable` in their element, and a generic over one of them says so too. An
+allocator parameter `(A Alloc)` is droppable without saying it: only
+`safe.alloc` implements `Alloc`, and none of its allocators is linear.
+
+Where a value is dropped is the compiler's answer: the checker asks
+`meta/drops-in`, which reports every drop ownership elaboration inserts, and a
+generic's with its type parameters abstract. The checker does not redo that
+analysis. Through a bound, a value given by value to a trait method may be taken
+by the impl or borrowed by it; the compiler marks such a drop, and the checker
+lets it stand for a linear value because an impl for a type that may be linear
+must take by value what its trait takes by value. `par`'s other thread drops
+what its call returns, so that call returns nothing linear.
+
 ### Owned trait objects
 
 ```coil

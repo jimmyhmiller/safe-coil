@@ -89,7 +89,10 @@
    ;;; `let` bound to one or to a call declared to return one
    (dyns (ArrayList i64))
    ;;; the type parameters bounded by a closure trait: `((F trait) …)`
-   (closures Code)])
+   (closures Code)
+   ;;; the type parameters bounded by `safe.core.Droppable`, whose values the
+   ;;; function may drop; any other may stand for a linear type
+   (droppable Code)])
 
 ;;; ---- small things ------------------------------------------------------------
 
@@ -1394,8 +1397,37 @@
                                                         (- (primitive/code-int (get found 2)) 1)
                                                         (get found 3)))
                          (None [] `()))
+        ; the callee's type parameters bounded Droppable, which take no linear
+        ; type, and its own type parameters in order, for explicit type arguments
+        drop-params (match (callee-form kind module name signature)
+                      (Some [found]
+                        (union (droppable-tparams (get found 0) (primitive/code-int (get found 1))
+                                                  (- (primitive/code-int (get found 2)) 1)
+                                                  (get found 3))
+                               (if (> (len found) 4)
+                                   (droppable-tparams (get found 4) 1 (len (get found 4)) `())
+                                   `())))
+                      (None [] `()))
+        own-tparams (match (callee-form kind module name signature)
+                      (Some [found]
+                        (block :first
+                          (for [i (primitive/code-int (get found 1)) (- (primitive/code-int (get found 2)) 1)]
+                            (when (primitive/code-vector? (get (get found 0) i))
+                              (return-from :first (type-parameter-names (get (get found 0) i)))))
+                          `()))
+                      (None [] `()))
+        ; the parameters whose arguments end in the callee
+        destroys (callee-flags kind module name signature "safe/destroys")
         ; the loans each argument holds while the call runs
         (mut each) (ArrayList::new [Code] (meta/expansion-allocator))]
+    (for [i 1 (len e)]
+      (let [arg (get e i)]
+        (when (type-arguments? arg)
+          (for [j 0 (len arg)]
+            (when (and (< j (len own-tparams)) (name-in? (get own-tparams j) drop-params)
+                       (linear? (generics-of cx) (written-type (get arg j)) `()))
+              (fail! arg (text3 "safe: a linear type is given to `" (meta/source (get own-tparams j))
+                                "`, which the callee may drop (it is bounded Droppable)")))))))
     (for [i 1 (len e)]
       (when (primitive/code-keyword? (get e i)) (set! positional false))
       (when (type-arguments? (get e i)) (set! skipped (+ skipped 1))))
@@ -1435,7 +1467,15 @@
                                           (None [] false))
                                         (closure-accepts? cx closure-params param arg)))
               (check-crossing! cx e name arg)
+              (check-par-result! cx e arg)
               (check-dyn-argument! (mut cx) arg param)
+              (when (linear-for-droppable? (generics-of cx) param (type-of arg) drop-params)
+                (fail! arg "safe: this is linear, and the callee may drop what this parameter is given (its type parameter is bounded Droppable)"))
+              (when (match destroys
+                      (Some [flags] (and (< (- i 1 before) (len flags))
+                                         (primitive/code-eq (get flags (- i 1 before)) `t)))
+                      (None [] false))
+                (check-destroyed! cx arg))
               (when (view-type? cx (pointee (type-of arg)))
                 (set! all (union all (view-argument-loans (mut cx) arg param r))))
               ; two-phase: what an argument lends exclusively is only reserved
@@ -1661,13 +1701,13 @@
           (or (head-is? e `fn*) (head-is? e `fn))
             (let [arrow (arrow-index e)]
               (cond (and (> arrow 0) (primitive/code-vector? (get e (- arrow 1))))
-                      (check-function! (.user cx) e arrow (.tparams cx) `() (.closures cx))
+                      (check-function! (.user cx) e arrow (.tparams cx) `() (.closures cx) (.droppable cx))
                     ; parameters whose types the compiler inferred: the literal's
                     ; function-pointer type says what they are
                     (and (> (len e) 1) (primitive/code-vector? (get e 1)))
                       (let [typed (typed-literal e)]
                         (if (> (len typed) 0)
-                            (check-function! (.user cx) typed 2 (.tparams cx) `() (.closures cx))
+                            (check-function! (.user cx) typed 2 (.tparams cx) `() (.closures cx) (.droppable cx))
                             (fail! e "safe: the types of this function's parameters are not known")))
                     :else (fail! e "safe: this function form is not covered by the rules"))
               (fresh))
@@ -1842,8 +1882,9 @@
 ;;; borrows from it, when it has a `:safe/borrows`: `(t f …)`.
 ;;; The form that defines the callee: a function's `defn`, or a method's part
 ;;; of an `impl` in its module, the one of that name whose first parameter is
-;;; the type the call takes first. -> (FORM FROM ARROW): its parts from FROM up
-;;; to ARROW hold its annotations and type parameter vectors.
+;;; the type the call takes first. -> (FORM FROM ARROW MODULE [IMPL]): its parts
+;;; from FROM up to ARROW hold its annotations and type parameter vectors; a
+;;; method's IMPL holds the impl's.
 (defn callee-form [(kind primitive/DeclKind) (module Code) (name Code) (signature Code)] (-> (Option Code))
   (match kind
     ;; the `defn` as written, whose names resolve where it was written: its
@@ -1888,7 +1929,7 @@
                               (let [first (get (get part (- arrow 1)) 0)]
                                 (when (and (primitive/code-list? first) (= (len first) 2)
                                            (= (receiver-name (get first 1)) receiver))
-                                  (return-from :found (Some `(~part 1 ~arrow ())))))))))))
+                                  (return-from :found (Some `(~part 1 ~arrow () ~form)))))))))))
                   (None [Code])))
               (_ (None [Code]))))))
     (_ (None [Code]))))
@@ -1996,7 +2037,8 @@
         (when (primitive/code-eq (get pr 0) t) (return-from :found (get pr 1)))))
     `()))
 
-(defn check-function! [(user Code) (form Code) (arrow i64) (outer Code) (self-type Code) (outer-closures Code)] (-> i64)
+(defn check-function! [(user Code) (form Code) (arrow i64) (outer Code) (self-type Code) (outer-closures Code)
+                       (outer-droppable Code)] (-> i64)
   (let [params (get form (- arrow 1))
         result (written-type (get (get form arrow) 1))
         own (if (and (>= (- arrow 2) 0) (primitive/code-vector? (get form (- arrow 2))))
@@ -2005,6 +2047,7 @@
         a (meta/expansion-allocator)
         borrows (annotation-in form 1 (- arrow 1) "safe/borrows")
         keeps (annotation-in form 1 (- arrow 1) "safe/keeps")
+        destroys (annotation-in form 1 (- arrow 1) "safe/destroys")
         (mut named) (ArrayList::new [i64] a)
         (mut cx) (Cx :locals (ArrayList::new [Local] a)
                      :loans (ArrayList::new [Loan] a)
@@ -2019,7 +2062,10 @@
                      :dyns (ArrayList::new [i64] a)
                      :closures (if (and (>= (- arrow 2) 0) (primitive/code-vector? (get form (- arrow 2))))
                                    (union outer-closures (closure-tparams form (- arrow 2) (- arrow 1) `()))
-                                   outer-closures))]
+                                   outer-closures)
+                     :droppable (if (and (>= (- arrow 2) 0) (primitive/code-vector? (get form (- arrow 2))))
+                                    (union outer-droppable (droppable-tparams form (- arrow 2) (- arrow 1) `()))
+                                    outer-droppable))]
     (if (or (mentions-code? params) (mentions-code? result))
         ; compile-time code: it runs in the compiler, not in the program
         0
@@ -2062,6 +2108,18 @@
                                   (not (and (= (len form) (+ arrow 2))
                                             (expanded-by? (get form (+ arrow 1)) `(safe.core.unsafe)))))
                          (fail! form "safe: a function that says :safe/keeps vouches for where the view goes: its whole body is one (unsafe …)"))
+                ; so is :safe/destroys, that what the parameters it names are
+                ; given ends in it: their drop is the one a linear value has
+                _destroys (when (and (match destroys (Some [_] true) (None [] false))
+                                     (not (and (= (len form) (+ arrow 2))
+                                               (expanded-by? (get form (+ arrow 1)) `(safe.core.unsafe)))))
+                            (fail! form "safe: a function that says :safe/destroys vouches for ending what it is given: its whole body is one (unsafe …)"))
+                ; a value no one ends is dropped where elaboration says, never a
+                ; linear one
+                ; an impl's methods are asked of with the impl (`check-impl!`)
+                _drops (when (and (or (head-is? form `defn*) (head-is? form `defn))
+                                  (match destroys (Some [_] false) (None [] true)))
+                         (check-drops! (generics-of cx) form))
                 r (eval-seq (mut cx) form (+ arrow 1) want)
                 left (exit-scopes! (mut cx) form 0 0 (.loans r))]
             (for l (iter left)
@@ -2080,6 +2138,275 @@
                     (fail! form "safe: this returns a reference to what a parameter its :safe/borrows leaves out was lent")))))
             0)))))
 
+;;; ---- linear values -----------------------------------------------------------
+;;;
+;;; `(impl Linear TYPE)` says a TYPE is never dropped implicitly: it ends by
+;;; `destroy`, by being taken apart (every field moved out), or by going to what
+;;; ends it. What holds one is linear too. Every type parameter may stand for a
+;;; linear type, except one bounded `Droppable`, whose values the function may
+;;; drop and which is given no linear type. Where a value is dropped is the
+;;; compiler's to say (`meta/drops-in`): the checker refuses the drops of
+;;; linear values.
+
+;;; The type parameters in scope, and those bounded `Droppable`.
+(defstruct Generics [(tparams Code) (droppable Code)])
+
+(defn generics-of [(cx (ref Cx))] (-> Generics)
+  (Generics :tparams (.tparams cx) :droppable (.droppable cx)))
+
+;;; Does the declaration NAME resolves to have the qualified name Q?
+(defn decl-is? [(name Code) (q Code)] (-> bool)
+  (match (primitive/code-decl name)
+    (primitive/Declared [_ _ found _] (primitive/code-eq found q))
+    (_ false)))
+
+;;; Does BOUND, a bound as a type parameter vector writes it, name the trait Q?
+;;; MODULE is the module a declaration parsed again from text was written in.
+(defn bound-is? [(bound Code) (module Code) (q Code)] (-> bool)
+  (let [head (if (and (primitive/code-list? bound) (> (len bound) 0)) (get bound 0) bound)]
+    (and (primitive/code-sym? head)
+         (or (decl-is? head q)
+             (and (primitive/code-sym? module)
+                  (decl-is? (primitive/code-symbol module "." head) q))))))
+
+;;; The type parameters a definition's vectors (FORM's parts FROM up to TO)
+;;; bound by `safe.core.Droppable`, or by `safe.alloc.Alloc`: only safe.alloc
+;;; implements that (`check-sealed!`), for allocators, none of them linear.
+(defn droppable-tparams [(form Code) (from i64) (to i64) (module Code)] (-> Code)
+  (let [(mut out) (primitive/code-list-new)]
+    (for [i from to]
+      (let [part (get form i)]
+        (when (primitive/code-vector? part)
+          (for p (iter part)
+            (when (and (primitive/code-list? p) (>= (len p) 2) (primitive/code-sym? (get p 0)))
+              (for [k 1 (len p)]
+                (when (or (bound-is? (get p k) module `safe.core.Droppable)
+                          (bound-is? (get p k) module `safe.alloc.Alloc))
+                  (push! (mut out) (get p 0)))))))))
+    `(~@out)))
+
+;;; Is T marked `safe.core.Linear`?
+(defn declared-linear? [(t Code)] (-> bool)
+  (match (primitive/code-type-traits t)
+    (primitive/TraitsAre [names] (name-in? `safe.core.Linear names))
+    (primitive/TraitsUnknown [] false)))
+
+;;; Is a value of type T linear: is T marked `safe.core.Linear`, or does a
+;;; field, a variant's field or a type argument of T hold one? A type parameter
+;;; is, unless it is bounded `Droppable`. A reference or raw memory owns nothing.
+;;; SEEN holds the types already being followed.
+(defn linear? [(g Generics) (t Code) (seen Code)] (-> bool)
+  (cond (ref-type? t) false
+        (raw-type? t) false
+        (primitive/code-sym? t)
+          (cond (scalar-name? t) false
+                (name-in? t (.tparams g)) (not (name-in? t (.droppable g)))
+                :else (linear-parts? g t seen true))
+        (primitive/code-list? t) (linear-parts? g t seen true)
+        :else false))
+
+;;; Does T hold something linear: is it itself (when SELF), or is a field or a
+;;; variant's field? A type with a drop of its own may drop what its type
+;;; arguments stand for, held in raw memory as a list's are: those its `Drop`
+;;; impl bounds `Droppable`, the only ones the checked drop may drop. A type
+;;; without a drop drops only its fields.
+(defn linear-parts? [(g Generics) (t Code) (seen Code) (self bool)] (-> bool)
+  (cond (and self (declared-linear? t)) true
+        (name-in? t seen) false
+        :else
+          (let [more `(~t ~@seen)]
+            (block :found
+              (when (and (primitive/code-list? t) (has-drop? t))
+                (let [dropped (dropped-arguments t)]
+                  (for [i 1 (len t)]
+                    (when (and (or (not (primitive/code-list? dropped)) (head-is? dropped `all)
+                                   (name-in? (primitive/code-lift i) dropped))
+                               (linear? g (get t i) more))
+                      (return-from :found true)))))
+              (match (primitive/code-type-shape t)
+                (primitive/StructShape []
+                  (for [i 0 (primitive/code-field-count t)]
+                    (when (linear? g (primitive/code-field-type t i) more)
+                      (return-from :found true))))
+                (primitive/SumShape []
+                  (for [v 0 (primitive/code-variant-count t)]
+                    (for [i 0 (primitive/code-variant-fields t v)]
+                      (when (linear? g (primitive/code-variant-field-type t v i) more)
+                        (return-from :found true)))))
+                (primitive/UnknownShape [] 0))
+              false))))
+
+;;; The type a trait impl `(impl [T…] TRAIT TYPE methods…)` is for: its second
+;;; part that is not a type parameter vector.
+(defn impl-target [(form Code)] (-> Code)
+  (let [(mut seen) 0]
+    (block :found
+      (for [i 1 (len form)]
+        (unless (primitive/code-vector? (get form i))
+          (set! seen (+ seen 1))
+          (when (= seen 2) (return-from :found (get form i)))))
+      `())))
+
+;;; Which type arguments of T, `(G A…)`, its `Drop` impl may drop: the positions
+;;; (from 1) of those its parameters bounded `Droppable` stand at, or `(all)` when
+;;; the impl is not found, a drop of its own whose bounds are not known.
+(defn dropped-arguments [(t Code)] (-> Code)
+  (match (primitive/code-decl (get t 0))
+    (primitive/Declared [module _ q _]
+      (match (meta/module-impls module)
+        (primitive/Answer [forms]
+          (block :found
+            (for form (iter forms)
+              (when (and (head-is? form `impl) (> (len form) 2)
+                         (block :drop
+                           (for part (iter form)
+                             (when (decl-is? part `coil.core.Drop) (return-from :drop true)))
+                           false))
+                (let [target (impl-target form)]
+                  (when (and (primitive/code-list? target) (= (len target) (len t))
+                             (decl-is? (get target 0) q))
+                    (let [drops (droppable-tparams form 1 (len form) module)
+                          (mut out) (primitive/code-list-new)]
+                      (for [i 1 (len target)]
+                        (when (name-in? (get target i) drops) (push! (mut out) (primitive/code-lift i))))
+                      (return-from :found `(~@out)))))))
+            `(all)))
+        (_ `(all))))
+    (_ `(all))))
+
+;;; The paths of MOVED (`a`, `a.b`, as symbols) inside the field NAME, relative
+;;; to it; `whole` alone when the field itself was moved.
+(defn moved-in [(moved Code) (name (slice u8))] (-> Code)
+  (let [(mut out) (primitive/code-list-new)]
+    (block :done
+      (for m (iter moved)
+        (let [s (primitive/code-str m)
+              n (len name)]
+          (cond (= s name) (return-from :done `(whole))
+                (and (> (len s) (+ n 1)) (= (slice/subslice s 0 n) name) (= (get s n) #\.))
+                  (push! (mut out) (primitive/code-symbol (slice/subslice s (+ n 1) (len s))))
+                :else 0)))
+      `(~@out))))
+
+;;; Does a value of type T, the parts at the paths MOVED moved out of it, still
+;;; hold something linear? One marked Linear is taken apart only when every
+;;; field is; what is left of another holds what its parts left hold.
+(defn linear-left? [(g Generics) (t Code) (moved Code)] (-> bool)
+  (cond (= (len moved) 0) (linear? g t `())
+        (and (declared-linear? t)
+             (block :all
+               (for [i 0 (primitive/code-field-count t)]
+                 (unless (head-is? (moved-in moved (primitive/code-str (primitive/code-field-name t i))) `whole)
+                   (return-from :all false)))
+               true))
+          false
+        (declared-linear? t) true
+        :else
+          (block :found
+            (match (primitive/code-type-shape t)
+              (primitive/StructShape []
+                (for [i 0 (primitive/code-field-count t)]
+                  (let [inside (moved-in moved (primitive/code-str (primitive/code-field-name t i)))]
+                    (unless (head-is? inside `whole)
+                      (when (linear-left? g (primitive/code-field-type t i) inside)
+                        (return-from :found true))))))
+              (_ (when (linear? g t `()) (return-from :found true))))
+            false)))
+
+;;; The drops elaboration puts in the functions FORM defines (a `defn`, or an
+;;; `impl`, whose methods are each defined where it is) are of no linear value.
+;;; A function literal's are its enclosing function's, checked with them.
+(defn check-drops! [(g Generics) (form Code)] (-> i64)
+  (match (meta/drops-in form)
+    (primitive/DropsAre [drops]
+      (for d (iter drops)
+        (let [t (get d 0)]
+          ; given by value to a trait method through a bound: the impl takes it,
+          ; since one for a linear type borrows nothing its trait takes by value
+          ; (`check-linear-impl!`), so this drop is not a linear value's
+          (when (and (not (primitive/code-eq (get d 3) `given)) (linear-left? g t (get d 2)))
+            (fail! (get d 1) (text3 "safe: a linear `" (meta/source t) "` is dropped here; destroy it, take it apart or give it to what ends it")))))
+      0)
+    (primitive/DropsUnknown [why]
+      (fail! form (text2 "safe: the compiler cannot say what this drops: " (primitive/code-str why))))))
+
+;;; A call gives no linear type to a type parameter of the callee bounded
+;;; `Droppable` (DROPS): not in the type of the argument ARG for a parameter
+;;; declared PARAM, nor among explicit type arguments.
+(defn linear-for-droppable? [(g Generics) (param Code) (t Code) (drops Code)] (-> bool)
+  (cond (and (primitive/code-sym? param) (name-in? param drops)) (linear? g t `())
+        ; a reference or pointer parameter, given the value or a pointer to it
+        (and (primitive/code-list? param) (= (len param) 2)
+             (or (ref-type? param) (head-is? param `ptr) (head-is? param `slice)))
+          (linear-for-droppable? g (get param 1)
+                                 (if (and (primitive/code-list? t) (= (len t) 2)
+                                          (or (ref-type? t) (head-is? t `ptr) (head-is? t `slice)))
+                                     (get t 1)
+                                     t)
+                                 drops)
+        (and (primitive/code-list? param) (primitive/code-list? t) (= (len param) (len t)))
+          (block :found
+            (for [i 1 (len param)]
+              (when (linear-for-droppable? g (get param i) (get t i) drops) (return-from :found true)))
+            false)
+        :else false))
+
+;;; `par`'s other thread drops what its call returns. The function a call `par`
+;;; wrote is handed as `(fnptr-of F)` returns nothing linear.
+(defn check-par-result! [(cx (ref Cx)) (call Code) (arg Code)] (-> i64)
+  (if (and (expanded-by? call `(safe.par.par)) (form-is? arg `fnptr-of))
+      (let [t (type-of arg)]
+        (if (and (head-is? t `fnptr) (> (len t) 1)
+                 (linear? (generics-of cx) (get t (- (len t) 1)) `()))
+            (fail! arg "safe: par drops what its first call returns, so that call returns nothing linear")
+            0))
+      0))
+
+;;; A trait impl for a type that may be linear takes by value what its trait
+;;; takes by value. A call through a bound gives such a parameter up, and the
+;;; drops the compiler reports leave its end to the impl (`check-drops!`); an
+;;; impl that borrowed it would leave the caller to drop a linear value.
+(defn check-linear-impl! [(g Generics) (form Code) (heads Code)] (-> i64)
+  (if (not (and (head-is? form `impl) (>= (len heads) 2)
+                (match (primitive/code-decl (get heads 0))
+                  (primitive/Declared [_ kind _ _] (match kind (primitive/TraitDecl [] true) (_ false)))
+                  (_ false))
+                (linear? g (written-type (get heads 1)) `())))
+      0
+      (match (primitive/code-decl (get heads 0))
+        (primitive/Declared [_ _ trait _]
+          (for part (iter form)
+            (when (and (primitive/code-list? part) (> (len part) 0) (primitive/code-sym? (get part 0)))
+              (let [arrow (arrow-index part)]
+                (when (and (> arrow 0) (primitive/code-vector? (get part (- arrow 1))))
+                  (let [params (get part (- arrow 1))
+                        mi (block :index
+                             (for [i 0 (primitive/code-trait-method-count trait)]
+                               (when (primitive/code-eq (primitive/code-trait-method-name trait i) (get part 0))
+                                 (return-from :index i)))
+                             -1)]
+                    (when (>= mi 0)
+                      (for [j 0 (let [n (primitive/code-trait-arity trait mi)] (if (< n (len params)) n (len params)))]
+                        (let [declared (primitive/code-trait-param-type trait mi j)
+                              p (get params j)]
+                          (when (and (not (or (ref-type? declared) (raw-type? declared)))
+                                     (primitive/code-list? p) (= (len p) 2)
+                                     (ref-type? (written-type (get p 1))))
+                            (fail! p "safe: an impl for a type that may be linear takes by value what its trait takes by value: a call through a bound gives it up"))))))))))
+          0)
+        (_ 0))))
+
+;;; ARG ends in a function that says `:safe/destroys` for it: its drop runs,
+;;; which drops what it holds, so it holds nothing linear but itself. Of a type
+;;; parameter that may be linear nothing is known of what it holds.
+(defn check-destroyed! [(cx (ref Cx)) (arg Code)] (-> i64)
+  (let [t (pointee (type-of arg))]
+    (cond (and (primitive/code-sym? t) (name-in? t (.tparams cx)) (not (name-in? t (.droppable cx))))
+            (fail! arg "safe: what this holds is not known, so destroying it could drop a linear value inside it")
+          (linear-parts? (generics-of cx) t `() false)
+            (fail! arg "safe: destroying this would drop the linear values it holds; take them out first")
+          :else 0)))
+
 ;;; Check the methods of an `impl` or a `deftrait` (a trait's method may have a
 ;;; body). A vector written directly in the form lists type parameters.
 (defn check-impl! [(user Code) (form Code)] (-> i64)
@@ -2091,6 +2418,7 @@
         (set! outer (union outer (type-parameter-names part)))))
     (let [impl-closures (closure-tparams form 1 (len form) `())]
       (set! outer-closures impl-closures))
+    (let [outer-droppable (droppable-tparams form 1 (len form) `())]
     ; `(impl TRAIT TYPE methods…)`: TYPE, as the methods spell it; `()` for an
     ; inherent impl or a trait's own default methods
     (for [i 1 (len form)]
@@ -2107,22 +2435,34 @@
         (when (and (primitive/code-list? part) (> (len part) 0) (primitive/code-sym? (get part 0)))
           (let [arrow (arrow-index part)]
             (when (and (> arrow 0) (primitive/code-vector? (get part (- arrow 1))))
-              (check-function! user part arrow outer self-type outer-closures))))))
+              (check-function! user part arrow outer self-type outer-closures outer-droppable))))))
+      (check-linear-impl! (Generics :tparams outer :droppable outer-droppable) form `(~@names))
+      ; every method of the impl is defined where the impl is: one question
+      ; asks for all of them
+      (when (block :body
+              (for part (iter form)
+                (when (and (primitive/code-list? part) (> (len part) 0) (primitive/code-sym? (get part 0)))
+                  (let [arrow (arrow-index part)]
+                    (when (and (> arrow 0) (> (len part) (+ arrow 1))) (return-from :body true)))))
+              false)
+        (check-drops! (Generics :tparams outer :droppable outer-droppable) form)))
     0))
 
 (defn check-top! [(user Code) (module Code) (form Code)] (-> i64)
   (check-quiet-drop! module form)
+  (check-linear-owner! user form)
   (check-sealed! module form)
   (cond (or (head-is? form `defn*) (head-is? form `defn))
           (let [arrow (arrow-index form)]
             (if (and (> arrow 1) (primitive/code-vector? (get form (- arrow 1))))
-                (check-function! user form arrow `() `() `())
+                (check-function! user form arrow `() `() `() `())
                 (fail! form "safe: this function form is not covered by the rules")))
         (or (head-is? form `impl) (head-is? form `deftrait)) (check-impl! user form)
         :else 0))
 
 ;;; `(impl QuietDrop TYPE)` lets a view's loans end before its drop runs, so only
-;;; the module that declares TYPE, and so its drop, may say it.
+;;; the module that declares TYPE, and so its drop, may say it; the same holds of
+;;; the other things a type says of itself, `Linear` among them.
 (defn check-quiet-drop! [(module Code) (form Code)] (-> i64)
   (if (and (head-is? form `impl)
            (block :found
@@ -2131,7 +2471,8 @@
                        (primitive/Declared [_ _ name _] (or (primitive/code-eq name `safe.core.QuietDrop)
                                                             (primitive/code-eq name `safe.core.SharedView)
                                                             (primitive/code-eq name `safe.core.CrossThread)
-                                                            (primitive/code-eq name `safe.core.OneThread)))
+                                                            (primitive/code-eq name `safe.core.OneThread)
+                                                            (primitive/code-eq name `safe.core.Linear)))
                        (_ false))
                  (return-from :found true)))
              false))
@@ -2140,8 +2481,43 @@
           (primitive/Declared [declared _ _ _]
             (if (primitive/code-eq declared module)
                 0
-                (fail! form "safe: only the module that declares a type may say its drop is quiet, that it is shared, that it crosses threads, or that it stays on one")))
-          (_ (fail! form "safe: only the module that declares a type may say its drop is quiet, that it is shared, that it crosses threads, or that it stays on one"))))
+                (fail! form "safe: only the module that declares a type may say its drop is quiet, that it is shared, that it crosses threads, that it stays on one, or that it is linear")))
+          (_ (fail! form "safe: only the module that declares a type may say its drop is quiet, that it is shared, that it crosses threads, that it stays on one, or that it is linear"))))
+      0))
+
+;;; A context with nothing in scope but the type parameters TPARAMS, for
+;;; questions asked of a declaration, not of a body.
+(defn bare-cx [(user Code) (tparams Code)] (-> Cx)
+  (let [a (meta/expansion-allocator)]
+    (Cx :locals (ArrayList::new [Local] a)
+        :loans (ArrayList::new [Loan] a)
+        :targets (ArrayList::new [Target] a)
+        :unsafe false
+        :serial 0
+        :tparams tparams
+        :user user
+        :path (ArrayList::new [Code] a)
+        :pinned (ArrayList::new [i64] a)
+        :trusted (ArrayList::new [i64] a)
+        :dyns (ArrayList::new [i64] a)
+        :closures `()
+        :droppable `())))
+
+;;; `(impl Linear TYPE)`: a linear value is one obligation, so it is moved,
+;;; never copied. Coil copies plain data; a TYPE that is plain data needs a drop
+;;; of its own, which makes it an owner.
+(defn check-linear-owner! [(user Code) (form Code)] (-> i64)
+  (if (and (head-is? form `impl) (> (len form) 2)
+           (block :found
+             (for part (iter form)
+               (when (decl-is? part `safe.core.Linear) (return-from :found true)))
+             false)
+           (let [(mut tparams) `()]
+             (for part (iter form)
+               (when (primitive/code-vector? part) (set! tparams (union tparams (type-parameter-names part)))))
+             (let [cx (bare-cx user tparams)]
+               (copy-type? cx (written-type (get form (- (len form) 1))) 0))))
+      (fail! form "safe: a linear type is moved, never copied; this one is plain data, which Coil copies, so give it a drop of its own")
       0))
 
 ;;; `safe.alloc.Alloc` gives the library's owners their memory, and they trust
