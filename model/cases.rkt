@@ -355,6 +355,12 @@
      ,(prog '() '(let ([r (with ref g1 v (ref (* (* v))))])
                    (seq (with mut g1 w (set! (* w) (box 5))) (* r)))))
 
+    (reject "a box in an arena keeps its loan on the arena until its scope ends: its drop uses the arena"
+     ,(prog '() '(let ([a (arena-new)])
+                   (let ([b (abox a 2)])
+                     (let ([c (abox a (new (view Peek) (ref (* b)) 0))])
+                       (seq (: (* c) i) (let ([d a]) unit)))))))
+
     ;; ================================================== linear values
     (accept "a linear value is destroyed"
      ,(prog '() '(let ([t (new (Tx) 1)]) (seq (destroy t) 0))))

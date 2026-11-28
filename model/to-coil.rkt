@@ -143,6 +143,7 @@
     [`(box ,e1) `(box ,(type-of Σ Γ e1))]
     [`(unbox ,e1) (match (type-of Σ Γ e1) [`(,(or 'box 'abox) ,σ) σ] [_ (bail "an ill-typed program")])]
     ['(arena-new) 'arena]
+    [`(destroy ,_) 'unit]
     [`(abox ,_ ,e1) `(abox ,(type-of Σ Γ e1))]
     [`(reset! ,_) 'unit]
     [`(ref ,p) `(ref ,(place-type Σ Γ p))]
@@ -360,6 +361,7 @@
                     [`(abox ,_) (format "(BoxIn::into ~a)" (plain Σ Γ e1))]
                     [_ (format "(Box::into ~a)" (plain Σ Γ e1))])]
     ['(arena-new) "(Arena::new)"]
+    [`(destroy ,e1) (unit-after (format "(destroy ~a)" (plain Σ Γ e1)))]
     [`(abox ,p ,e1) (format "(BoxIn::in-arena [~a] ~a ~a)"
                             (coil-type (type-of Σ Γ e1)) (shared-place Σ Γ p) (plain Σ Γ e1))]
     [`(reset! ,p) (unit-after (format "(Arena::reset! (mut ~a))" (written-place Σ Γ p)))]
@@ -534,8 +536,13 @@
 
 ;; ---------------------------------------------------------------- declarations
 
-(define (type-params Ts)
-  (if (null? Ts) "" (format " [~a]" (string-join (map symbol->string Ts)))))
+(define (type-params Ts [droppable '()])
+  (if (null? Ts)
+      ""
+      (format " [~a]" (string-join (for/list ([T Ts])
+                                     (if (memq T droppable)
+                                         (format "(~a Droppable)" T)
+                                         (symbol->string T)))))))
 
 (define (declaration ds d)
   (match d
@@ -582,6 +589,15 @@
      (format "(defglobal g-~a ~a ~a)" g (coil-type σ) (plain (make-Σ ds) '() e))]
     ;; said on the function itself, as an annotation
     [`(borrows ,_ ,_) ""]
+    ;; said as the bound of the type parameters
+    [`(droppable ,_ ,_) ""]
+    ;; Coil copies plain data, so a linear struct of plain data is given a drop,
+    ;; which makes it an owner, moved as the model moves it
+    [`(linear ,S)
+     (define T (type-name S))
+     (if (copy-shape? (make-Σ ds) `(,S))
+         (format "(impl Linear ~a)\n(impl Drop ~a (drop [(self (mut ~a))] (-> void) 0))" T T T)
+         (format "(impl Linear ~a)" T))]
     [`(defn ,f ,Ts ,params ,τr ,body)
      (define Σ (make-Σ ds Ts))
      ;; the function a view's drop runs is given the view as Coil's drop has it
@@ -600,7 +616,7 @@
              (if borrows
                  (format " :safe/borrows ~s" (string-join (map var-name borrows)))
                  "")
-             (type-params Ts)
+             (type-params Ts (droppable-of ds f))
              (string-join (for/list ([p params])
                             (format "(~a ~a)" (var-name (car p))
                                     (if dropping (format "(ref ~a)" (view-name dropping)) (coil-type (cadr p))))))
@@ -644,7 +660,7 @@
              (format "(module ~a)\n" name)
              "(import \"coil.primitive\" :as primitive)\n"
              "(import \"coil.alloc\" :as alloc)\n"
-             "(import \"safe.core\" :use [unsafe replace! borrow borrow-mut move lend lend-mut View])\n"
+             "(import \"safe.core\" :use [unsafe replace! borrow borrow-mut move lend lend-mut View Linear Droppable destroy])\n"
              "(import \"safe.box\" :use [Box BoxIn])\n"
              "(import \"safe.alloc\" :use [Arena ArenaRef])\n"
              "(import \"safe.pool\" :use [Pool Handle])\n"

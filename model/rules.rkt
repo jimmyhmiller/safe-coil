@@ -20,7 +20,8 @@
 ;; Λ is an input only: a loan lives exactly as long as the scope of its holder.
 (require redex/reduction-semantics)
 (provide Safe chk check-program check-fn mutant mutants
-         make-Σ fields-of variants-of subst copy? second-class? exclusive? view-drop)
+         make-Σ fields-of variants-of subst copy? copy-shape? second-class? exclusive? view-drop
+         droppable-of)
 
 ;; Testing the tests: with one part of one rule left out, the random search must
 ;; find a program that goes wrong. Never set in a real check. The value is also
