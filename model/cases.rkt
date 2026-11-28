@@ -13,6 +13,10 @@
 (define prelude
   '((struct Pair () ((a (box int)) (b (box int))))
     (struct Holds () ((a arena)))
+    (struct Tx () ((n int)))
+    (linear Tx)
+    (struct Deal () ((amt (box int)) (fee (box int))))
+    (linear Deal)
     (view InArena ((r (ref arena))))
     (view Node ((next (abox int)) (n int)))
     (struct Pt () ((m int) (n int)))
@@ -346,6 +350,79 @@
     (reject "a later argument frees what an earlier one refers into"
      ,(prog '((defn first-of () ((r (ref int)) (n int)) int (* r)))
             '(let ([b (box 1)]) (call first-of () (ref (* b)) (seq (set! b (box 2)) 0)))))
+
+    (reject "a reference into a global does not outlive its with, past a write to the global"
+     ,(prog '() '(let ([r (with ref g1 v (ref (* (* v))))])
+                   (seq (with mut g1 w (set! (* w) (box 5))) (* r)))))
+
+    ;; ================================================== linear values
+    (accept "a linear value is destroyed"
+     ,(prog '() '(let ([t (new (Tx) 1)]) (seq (destroy t) 0))))
+    (accept "a linear value is given to a function that destroys it"
+     ,(prog '((defn finish () ((t (Tx))) int (seq (destroy t) 1)))
+            '(let ([t (new (Tx) 1)]) (call finish () t))))
+    (accept "a function makes a linear value and its caller destroys it"
+     ,(prog '((defn open () () (Tx) (new (Tx) 5)))
+            '(let ([t (call open ())]) (seq (destroy t) 0))))
+    (accept "a linear value is destroyed on both ways of a branch"
+     ,(prog '() '(let ([t (new (Tx) 1)]) (if0 0 (seq (destroy t) 1) (seq (destroy t) 2)))))
+    (accept "destroying a linear struct drops what it holds"
+     ,(prog '() '(let ([d (new (Deal) (box 3) (box 4))]) (seq (destroy d) 0))))
+    (accept "a linear struct is taken apart, every field moved out of it"
+     ,(prog '() '(let ([d (new (Deal) (box 3) (box 4))])
+                   (let ([a (: d amt)]) (let ([f (: d fee)]) (+ (* a) (* f)))))))
+    (accept "a type parameter passes a linear value through"
+     ,(prog '((defn keep (T) ((x T)) T x))
+            '(let ([t (call keep ((Tx)) (new (Tx) 1))]) (seq (destroy t) 0))))
+    (accept "a linear value boxed, unboxed and destroyed"
+     ,(prog '() '(let ([b (box (new (Tx) 1))]) (let ([t (unbox b)]) (seq (destroy t) 0)))))
+    (accept "a linear value made in a loop is destroyed in it"
+     ,(prog '() '(let ([i 0]) (seq (while (+ i 0) (let ([t (new (Tx) 1)]) (destroy t))) 0))))
+    (reject "a linear value is not dropped when its scope ends"
+     ,(prog '() '(let ([t (new (Tx) 1)]) 0)))
+    (reject "a linear value is not thrown away"
+     ,(prog '() '(seq (new (Tx) 1) 0)))
+    (reject "a linear value is not overwritten"
+     ,(prog '() '(let ([t (new (Tx) 1)]) (seq (set! t (new (Tx) 2)) (seq (destroy t) 0)))))
+    (reject "a linear value destroyed on one way only is not assigned over"
+     ,(prog '() '(let ([t (new (Tx) 1)])
+                   (seq (if0 0 (destroy t) unit) (seq (set! t (new (Tx) 2)) (seq (destroy t) 0))))))
+    (reject "a linear value is not destroyed on one way only"
+     ,(prog '() '(let ([t (new (Tx) 1)]) (if0 0 (seq (destroy t) 1) 2))))
+    (reject "a linear value is not given to a type parameter its function may drop"
+     ,(prog '((defn toss (T) ((x T)) int 0) (droppable toss (T)))
+            '(call toss ((Tx)) (new (Tx) 1))))
+    (accept "a type parameter its function may drop takes what is not linear"
+     ,(prog '((defn toss (T) ((x T)) int 0) (droppable toss (T)))
+            '(call toss ((box int)) (box 1))))
+    (reject "a function does not drop a value of a type parameter it does not say it may drop"
+     ,(prog '((defn toss (T) ((x T)) int 0))
+            '(let ([t (new (Tx) 1)]) (seq (destroy t) 0))))
+    (reject "a linear parameter is not dropped"
+     ,(prog '((defn lose () ((t (Tx))) int 0))
+            '(call lose () (new (Tx) 1))))
+    (reject "a linear value does not leave its scope by a break"
+     ,(prog '() '(seq (while 1 (let ([t (new (Tx) 1)]) (break))) 0)))
+    (reject "a linear value is not held by an owning closure"
+     ,(prog '() '(let ([t (new (Tx) 1)]) (let ([f (lamo ([c (Tx) t]) () int 0)]) 0))))
+    (reject "a linear value is moved, never copied"
+     ,(prog '() '(let ([t (new (Tx) 1)]) (let ([u t]) (seq (destroy t) (seq (destroy u) 0))))))
+    (reject "a linear struct taken apart in part still holds the rest"
+     ,(prog '() '(let ([d (new (Deal) (box 3) (box 4))]) (let ([a (: d amt)]) (* a)))))
+    (reject "a task whose result is linear is joined, not dropped"
+     ,(prog '((defn open () () (Tx) (new (Tx) 5)))
+            '(let ([k (spawn (call open ()))]) 0)))
+    (reject "two calls at once give nothing back: neither returns a linear value"
+     ,(prog '((defn open () () (Tx) (new (Tx) 5)) (defn zero () () int 0))
+            '(seq (par (call open ()) (call zero ())) 0)))
+    (reject "a return does not drop a linear local"
+     ,(prog '((defn early () () int (let ([t (new (Tx) 1)]) (seq (return 0 unit) (seq (destroy t) 1)))))
+            '(call early ())))
+    (accept "a linear local destroyed before a return"
+     ,(prog '((defn early () () int (let ([t (new (Tx) 1)]) (seq (destroy t) (seq (return 0 unit) 1)))))
+            '(call early ())))
+    (reject "a linear value is not in a box that is dropped"
+     ,(prog '() '(let ([b (box (new (Tx) 1))]) 0)))
 
     ;; ================================================== arenas
     (accept "two boxes in one arena, and the arena reset once they are gone"

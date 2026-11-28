@@ -70,7 +70,12 @@
     (reset-unchecked "an arena is reset while what is in it is used")
     (par-arena-shared "an arena may be lent shared to both of two calls at once")
     (abox-view-loans "a box in an arena that holds a view does not hold the view's loans")
-    (arena-owner "an owner may be put in an arena, which drops nothing it holds")))
+    (arena-owner "an owner may be put in an arena, which drops nothing it holds")
+    (linear-scope "a linear value may be dropped when its variable's scope ends")
+    (linear-discard "a linear value may be thrown away by a seq or a loop")
+    (linear-overwrite "a linear value may be dropped by set! over it")
+    (linear-some-ways "a linear value may be moved on some ways to a join and dropped on the others")
+    (linear-generic "a linear type may be given to a type parameter its function may drop")))
 (define (mutant? m) (eq? (mutant) m))
 
 (define-language Safe
@@ -85,7 +90,12 @@
             (defn f (T ...) ((x τ) ...) τ e)
             ;; what f's result may borrow from: the parameters named, and no
             ;; others; without one, any reference parameter
-            (borrows f (x ...)))
+            (borrows f (x ...))
+            ;; S's values are linear: never dropped, only destroyed or taken apart
+            (linear S)
+            ;; f may drop values of its type parameters T, which then stand for
+            ;; no linear type; any other type parameter may stand for one
+            (droppable f (T ...)))
   ;; storable types; what a view's field can be; all types. A closure that owns
   ;; what it captured is storable; one that borrows is second-class, exclusive
   ;; when it captured something exclusively. An out parameter refers to a place
@@ -105,6 +115,7 @@
          (while e e) (break) (return e τ)
          (box e) (unbox e) (ref p) (mut p) (out p) (set! p e) (take p e) (uninit σ)
          (arena-new) (abox p e) (reset! p)
+         (destroy e)
          (new τ e ...) (inj σ K e)
          (match e ((K x) e) ...) (match-ref p ((K x) e) ...) (match-mut p ((K x) e) ...)
          (pool-new σ) (insert p e) (remove p x)
@@ -120,9 +131,11 @@
   (n ::= integer)
   (w ::= ref mut)
   (k ::= shr mut)
-  ;; what of a variable is still there: all of it, none of it, or all but the
-  ;; parts at these paths (a path is fields and `*`s from the variable)
-  (s ::= live moved (gone π ...))
+  ;; what of a variable is still there: all of it, none of it, all but the
+  ;; parts at these paths (a path is fields and `*`s from the variable), or
+  ;; none of it on some of the ways that led here (`maybe`), the rest of it
+  ;; still there on the others
+  (s ::= live moved maybe (gone π ...))
   (π ::= (step ...))
   (step ::= * fld)
   ;; the same, joined over every `break` of the loop being checked; none when
@@ -149,7 +162,10 @@
 ;; result type, its parameters (a closure's captures count as parameters) and
 ;; those its result may borrow from (`all` without a `borrows`), or #f outside
 ;; any function.
-(define (make-Σ decls [Ts '()] [fn #f]) (list (mutant) 'safe 'noloop Ts (program-decls decls) '() fn))
+(define (make-Σ decls [Ts '()] [fn #f] [lin-Ts '()]) (list (mutant) 'safe 'noloop Ts (program-decls decls) '() fn lin-Ts))
+;; the type parameters of the function being checked that may stand for linear
+;; types: those it does not say it may drop
+(define (Σ-lin-Ts Σ) (eighth Σ))
 (define (in-unsafe? Σ) (eq? (second Σ) 'unsafe))
 (define (in-loop? Σ) (eq? (third Σ) 'loop))
 (define (tparams Σ) (fourth Σ))
@@ -277,7 +293,75 @@
 (define (moved-second? Σ τ) (or (exclusive? Σ τ) (dropped-view? Σ τ)))
 
 ;; a storable type whose values own nothing. A type parameter may stand for an owner.
+;; ---------------------------------------------------------------- linear values
+
+;; Is a value of type τ linear: one never dropped, only destroyed or taken
+;; apart? A struct the program declares linear is, and so is what holds one: a
+;; struct or sum with a part that is, a box, a pool or a task of one. A type
+;; parameter is when the function says it may be.
+(define (lin? Σ τ [seen '()])
+  (match τ
+    [(? symbol? T) (and (memq T (Σ-lin-Ts Σ)) #t)]
+    [`(,(or 'box 'pool 'task) ,σ) (lin? Σ σ seen)]
+    [(cons (? symbol? S) _)
+     #:when (find-decl Σ 'linear S)
+     #t]
+    [_ (and (pair? τ) (not (member τ seen)) (not (second-class? τ))
+            (let ([parts (or (fields-of Σ τ) (variants-of Σ τ) '())])
+              (for/or ([part parts]) (lin? Σ (cadr part) (cons τ seen)))))]))
+
+;; Does a variable of type τ in state s still hold something linear, which
+;; leaving its scope would drop? A part moved out is gone; a struct declared
+;; linear is taken apart when every one of its fields is.
+(define (lin-left? Σ τ s)
+  (match s
+    ['moved #f]
+    ['live (lin? Σ τ)]
+    ;; moved on some ways: still there on the others
+    ['maybe (and (not (mutant? 'linear-some-ways)) (lin? Σ τ))]
+    [`(gone ,πs ...)
+     (define fs (or (fields-of Σ τ) '()))
+     (cond [(member '() πs) #f]
+           ;; one declared linear is taken apart only when every field is gone
+           [(and (pair? τ) (symbol? (car τ)) (find-decl Σ 'linear (car τ)))
+            (not (for/and ([f fs]) (member (list (car f)) πs)))]
+           [else
+            (for/or ([f fs])
+              (define in (for/list ([π πs] #:when (and (pair? π) (eq? (car π) (car f)))) (cdr π)))
+              (lin-left? Σ (cadr f) (if (null? in) 'live `(gone ,@in))))])]
+    [_ (lin? Σ τ)]))
+
+;; The type parameters f says it may drop.
+(define (droppable-of decls f)
+  (or (for/first ([d decls] #:when (and (eq? (car d) 'droppable) (eq? (cadr d) f))) (caddr d))
+      '()))
+
+;; The type parameters Ts of f that may stand for linear types: those it does
+;; not say it may drop.
+(define (lin-Ts-of decls f Ts)
+  (let ([drops (droppable-of decls f)])
+    (filter (λ (T) (not (memq T drops))) Ts)))
+
+;; Is a linear type given to none of the type parameters f may drop?
+(define (admits-linear? Σ f Ts σs)
+  (or (mutant? 'linear-generic)
+      (let ([drops (droppable-of (decls-of Σ) f)])
+        (for/and ([T Ts] [σ σs]) (or (not (memq T drops)) (not (lin? Σ σ)))))))
+
+;; Does x leave its scope still holding something linear: at the end, or at a
+;; break that left it? Where the end cannot be reached (after a return or a
+;; break) only the breaks count: a return checks what it leaves itself.
+(define (lin-dropped? Σ x Γ)
+  (and (not (mutant? 'linear-scope))
+       (match (assq x Γ)
+         [(list _ τ s b)
+          (or (and (not (dead? Γ)) (lin-left? Σ τ s))
+              (and (not (eq? b 'none)) (lin-left? Σ τ b)))]
+         [_ #f])))
+
 (define (copy? Σ σ [seen '()])
+  (and (not (lin? Σ σ)) (copy-shape? Σ σ seen)))
+(define (copy-shape? Σ σ [seen '()])
   (match σ
     [(or 'int 'unit) #t]
     [(? symbol?) (mutant? 'copy-typevar)]
@@ -295,7 +379,7 @@
 
 (define (lookup Γ x)
   (match (assq x Γ)
-    [(list _ τ 'moved _) (if (mutant? 'no-moves) τ #f)]
+    [(list _ τ (or 'moved 'maybe) _) (if (mutant? 'no-moves) τ #f)]
     [(list _ τ _ _) τ]
     [_ #f]))
 
@@ -524,7 +608,7 @@
   (match-define (cons x π) (reach-of p))
   (match (state-of Γ x)
     ['live #t]
-    ['moved (mutant? 'no-moves)]
+    [(or 'moved 'maybe) (mutant? 'no-moves)]
     [`(gone ,πs ...) (not (for/or ([g πs]) (paths-overlap? g π)))]
     [#f #f]))
 
@@ -532,7 +616,7 @@
 (define (state-minus s π)
   (cond [(null? π) 'moved]
         [else (match s
-                ['moved 'moved]
+                [(or 'moved 'maybe) s]
                 ['live `(gone ,π)]
                 [`(gone ,πs ...) `(gone ,@(filter (λ (g) (not (list-prefix? π g))) πs) ,π)])]))
 ;; part π is given a value again
@@ -540,7 +624,7 @@
   (cond [(null? π) 'live]
         [else (match s
                 ['live 'live]
-                ['moved 'moved]
+                [(or 'moved 'maybe) s]
                 [`(gone ,πs ...)
                  (define left (filter (λ (g) (not (list-prefix? π g))) πs))
                  (if (null? left) 'live `(gone ,@left))])]))
@@ -551,7 +635,7 @@
   (match-define (cons x π) (or (path-of p) (reach-of p)))
   (match (state-of Γ x)
     ['live #t]
-    ['moved (or (null? π) (mutant? 'set-inside-moved))]
+    [(or 'moved 'maybe) (or (null? π) (mutant? 'set-inside-moved))]
     [`(gone ,πs ...) (or (mutant? 'set-inside-moved)
                          (not (for/or ([g πs]) (and (list-prefix? g π) (not (equal? g π))))))]
     [#f #f]))
@@ -572,16 +656,22 @@
   (define path (path-of p))
   (and path
        (match (state-of Γ (car path))
-         ['moved (null? (cdr path))]
+         [(or 'moved 'maybe) (null? (cdr path))]
          [`(gone ,πs ...) (and (member (cdr path) πs) #t)]
          [_ #f])))
 
+;; Moved on one way and not the other is `maybe`: as moved, except that what is
+;; still there on the other way is dropped there, which a linear value never is.
 (define (state-join a b)
   (match* (a b)
+    [('live 'live) 'live]
+    [('moved 'moved) 'moved]
+    [('maybe _) 'maybe]
+    [(_ 'maybe) 'maybe]
+    [('moved _) 'maybe]
+    [(_ 'moved) 'maybe]
     [('live s) s]
     [(s 'live) s]
-    [('moved _) 'moved]
-    [(_ 'moved) 'moved]
     [(`(gone ,xs ...) `(gone ,ys ...))
      (define all (remove-duplicates (append xs ys)))
      `(gone ,@(filter (λ (g) (not (for/or ([h all]) (and (list-prefix? h g) (not (equal? h g)))))) all))]))
@@ -780,6 +870,16 @@
    -------------------------------------------- "unbox"
    (chk Σ Γ Λ (unbox e) σ () Γ_1)]
 
+;; ---- linear values
+
+  ;; a struct declared linear, taken apart: what it holds is dropped, so none
+  ;; of it is linear itself
+  [(chk Σ Γ Λ e (S σ ...) () Γ_1)
+   (side-condition ,(find-decl (term Σ) 'linear (term S)))
+   (side-condition ,(for/and ([f (fields-of (term Σ) (term (S σ ...)))]) (not (lin? (term Σ) (cadr f)))))
+   -------------------------------------------- "destroy"
+   (chk Σ Γ Λ (destroy e) unit () Γ_1)]
+
   ;; ---- arenas
 
   [-------------------------------------------- "arena-new"
@@ -822,12 +922,14 @@
    (where Γ_b ,(let ([g (bind-var (term Γ_1) (term x) (term τ_1))])
                  (match (term e_1) [`(uninit ,_) (set-state g (term x) 'moved)] [_ g])))
    (chk Σ Γ_b Λ_2 e_2 τ_2 L_2 Γ_2)
+   (side-condition ,(not (lin-dropped? (term Σ) (term x) (term Γ_2))))
    (where L_3 ,(exit-scope (term x) (term τ_1) (term Λ_2) (term L_2)))
    (where Γ_3 ,(remove-var (term Γ_2) (term x)))
    -------------------------------------------- "let"
    (chk Σ Γ Λ (let ([x e_1]) e_2) τ_2 L_3 Γ_3)]
 
   [(chk ,(Σ+ (term Σ) (term e_2)) Γ Λ e_1 τ_1 L_1 Γ_1)
+   (side-condition ,(or (mutant? 'linear-discard) (not (lin? (term Σ) (term τ_1)))))
    (chk Σ Γ_1 Λ e_2 τ_2 L_2 Γ_2)
    -------------------------------------------- "seq"
    (chk Σ Γ Λ (seq e_1 e_2) τ_2 L_2 Γ_2)]
@@ -841,13 +943,19 @@
    (side-condition ,(assignable? (term Γ_1) (term p)))
    (side-condition ,(writable? (term Σ) (term Γ_1) (term p)))
    (side-condition ,(write-ok? (active (term Σ) (term Γ_1) (term Λ)) (term p)))
+   ;; the old value is dropped: never a linear one
+   (side-condition ,(or (mutant? 'linear-overwrite) (not (lin? (term Σ) (term σ)))))
    (where Γ_2 ,(mark-filled (term Γ_1) (term p)))
    -------------------------------------------- "set"
    (chk Σ Γ Λ (set! p e) unit () Γ_2)]
 
-  ;; a variable whose whole value was moved
+  ;; a variable whose whole value was moved; one moved on some ways only still
+  ;; holds it on the others, where set! drops it
   [(chk ,(Σ+ (term Σ) (term x)) Γ Λ e σ () Γ_1)
-   (where (x σ moved b) ,(assq (term x) (term Γ_1)))
+   (where (x σ any_s b) ,(assq (term x) (term Γ_1)))
+   (side-condition ,(or (eq? (term any_s) 'moved)
+                        (and (eq? (term any_s) 'maybe)
+                             (or (mutant? 'linear-some-ways) (not (lin? (term Σ) (term σ)))))))
    (where Γ_2 ,(mark-filled (term Γ_1) (term x)))
    -------------------------------------------- "set-moved"
    (chk Σ Γ Λ (set! x e) unit () Γ_2)]
@@ -876,6 +984,7 @@
   [(where Γ_0 ,(clear-breaks (term Γ)))
    (chk ,(Σ+ (term Σ) (term e_c) (term e_b)) Γ_0 Λ e_c int L_c Γ_1)
    (chk ,(Σ-loop (Σ+ (term Σ) (term e_c) (term e_b))) Γ_1 Λ e_b τ_b L_b Γ_2)
+   (side-condition ,(or (mutant? 'linear-discard) (not (lin? (term Σ) (term τ_b)))))
    (side-condition ,(or (mutant? 'loop-moves) (dead? (term Γ_2)) (same-states? (term Γ_2) (term Γ_0))))
    (where Γ_3 ,(let ([out (loop-exit (term Γ) (term Γ_1) (term Γ_2))])
                  (if (dead? (term Γ)) (make-dead out) out)))
@@ -982,6 +1091,7 @@
   [(where (defn f (T ...) ((x_p τ_p) ...) τ_r any_b) ,(find-decl (term Σ) 'defn (term f)))
    (side-condition ,(and (= (length (term (T ...))) (length (term (σ ...))))
                          (andmap (λ (t) (wf? (term Σ) t)) (term (σ ...)))))
+   (side-condition ,(admits-linear? (term Σ) (term f) (term (T ...)) (term (σ ...))))
    (where (τ_a ...) ,(for/list ([t (term (τ_p ...))]) (subst t (term (T ...)) (term (σ ...)))))
    (where τ_ra ,(subst (term τ_r) (term (T ...)) (term (σ ...))))
    (chk-args-each Σ Γ Λ (e ...) (τ_a ...) (L_a ...) Γ_1)
@@ -1007,6 +1117,7 @@
   ;; A closure that owns what it captured, which is moved into it: it is
   ;; storable, and calling it may change what it holds.
   [(side-condition ,(or (mutant? 'clo-own-ref) (andmap (λ (t) (not (second-class? t))) (term (τ_c ...)))))
+   (side-condition ,(not (ormap (λ (t) (lin? (term Σ) t)) (term (τ_c ...)))))
    (chk-args Σ Γ Λ (e_c ...) (τ_c ...) L Γ_1)
    (side-condition ,(check-closure (term Σ) (term ((x_c τ_c) ...)) (term ((x τ) ...)) (term τ_r) (term e_b) #t))
    -------------------------------------------- "lamo"
@@ -1048,6 +1159,12 @@
    (side-condition ,(and (= (length (term (T_1 ...))) (length (term (σ_1 ...))))
                          (= (length (term (T_2 ...))) (length (term (σ_2 ...))))
                          (andmap (λ (t) (wf? (term Σ) t)) (term (σ_1 ... σ_2 ...)))))
+   (side-condition ,(and (admits-linear? (term Σ) (term f_1) (term (T_1 ...)) (term (σ_1 ...)))
+                         (admits-linear? (term Σ) (term f_2) (term (T_2 ...)) (term (σ_2 ...)))))
+   ;; what the two calls give is thrown away: never something linear
+   (side-condition ,(or (mutant? 'linear-discard)
+                        (not (or (lin? (term Σ) (subst (term σ_r1) (term (T_1 ...)) (term (σ_1 ...))))
+                                 (lin? (term Σ) (subst (term σ_r2) (term (T_2 ...)) (term (σ_2 ...))))))))
    (where (τ_a1 ...) ,(for/list ([t (term (τ_1 ...))]) (subst t (term (T_1 ...)) (term (σ_1 ...)))))
    (where (τ_a2 ...) ,(for/list ([t (term (τ_2 ...))]) (subst t (term (T_2 ...)) (term (σ_2 ...)))))
    (chk-args ,(Σ+* (term Σ) (term (e_2 ...))) Γ Λ (e_1 ...) (τ_a1 ...) L_1 Γ_1)
@@ -1063,6 +1180,7 @@
    (side-condition ,(and (= (length (term (T ...))) (length (term (σ ...))))
                          (andmap (λ (t) (wf? (term Σ) t)) (term (σ ...)))))
    (where (τ_a ...) ,(for/list ([t (term (τ_p ...))]) (subst t (term (T ...)) (term (σ ...)))))
+   (side-condition ,(admits-linear? (term Σ) (term f) (term (T ...)) (term (σ ...))))
    (side-condition ,(or (mutant? 'spawn-ref) (not (ormap second-class? (term (τ_a ...))))))
    (where σ_ra ,(subst (term σ_r) (term (T ...)) (term (σ ...))))
    (chk-args Σ Γ Λ (e ...) (τ_a ...) L Γ_1)
@@ -1177,6 +1295,7 @@
    (where Λ_1 ,(add-loans (term Λ) (term x) (if (mutant? 'match-no-loans) '() (term L_x))))
    (where Γ_b ,(bind-var (term Γ) (term x) (term τ_x)))
    (chk Σ Γ_b Λ_1 e τ L_2 Γ_2)
+   (side-condition ,(not (lin-dropped? (term Σ) (term x) (term Γ_2))))
    (where L_3 ,(exit-scope (term x) (term τ_x) (term Λ_1) (term L_2)))
    (where Γ_3 ,(remove-var (term Γ_2) (term x)))
    -------------------------------------------- "arm"
@@ -1227,13 +1346,16 @@
            (for/and ([l after-params])
              (match (place-root (car l)) [`(ext ,x) (and (memq x only) #t)] [_ #t])))
        (for/and ([e vars] #:when (memq (car e) params))
-         (restored? Σ (car e) (cadr e) (caddr e)))))
+         (restored? Σ (car e) (cadr e) (caddr e)))
+       ;; nor is anything linear dropped, a parameter's or a local's
+       (or (mutant? 'linear-scope)
+           (for/and ([e vars]) (not (lin-left? Σ (cadr e) (caddr e)))))))
 
 ;; The body of a function, a closure or a drop: its parameters (and a closure's
 ;; captures, which are parameters to it) hold loans on what the caller lent; an
 ;; out parameter refers to a place that holds nothing yet.
-(define (check-body decls Ts params τr body [only 'all])
-  (define Σ (make-Σ decls Ts (list τr (map car params) only)))
+(define (check-body decls Ts params τr body [only 'all] [lin-Ts '()])
+  (define Σ (make-Σ decls Ts (list τr (map car params) only) lin-Ts))
   (define Γ (for/list ([p params])
               (list (car p) (cadr p) (match (cadr p) [`(out ,_) '(gone (*))] [_ 'live]) 'none)))
   (define Λ (for/list ([p params] #:when (second-class? (cadr p)))
@@ -1258,7 +1380,7 @@
   (define all (append caps params))
   (and (distinct? (map car all))
        (andmap (λ (c) (wf? Σ (cadr c))) caps)
-       (let ([Σb (make-Σ decls (tparams Σ) (list τr (map car all) 'all))]
+       (let ([Σb (make-Σ decls (tparams Σ) (list τr (map car all) 'all) (Σ-lin-Ts Σ))]
              [Γ (for/list ([p all])
                   (list (car p) (cadr p) (match (cadr p) [`(out ,_) '(gone (*))] [_ 'live]) 'none))]
              [Λ (for/list ([p all] #:when (second-class? (cadr p)))
@@ -1278,13 +1400,13 @@
   (match fn
     [`(defn ,f ,Ts ,params ,τr ,body)
      (and (distinct? (append Ts (decl-names decls)))
-          (check-body decls Ts params τr body (borrows-of decls f))
+          (check-body decls Ts params τr body (borrows-of decls f) (lin-Ts-of decls f Ts))
           #t)]))
 
 ;; The names the declarations define: a `borrows` defines none, it says more
 ;; about a function.
 (define (decl-names decls)
-  (map cadr (filter (λ (d) (not (eq? (car d) 'borrows))) decls)))
+  (map cadr (filter (λ (d) (not (memq (car d) '(borrows linear droppable)))) decls)))
 
 ;; The parameters f's `borrows` names, or `all`.
 (define (borrows-of decls f)
@@ -1327,8 +1449,20 @@
             [(list f) (match (find-decl Σ 'defn f)
                         [`(defn ,_ () ((,_ (view ,(== V)))) unit ,_) #t]
                         [_ #f])]))]
+    ;; a struct of the program's
+    [`(linear ,S)
+     (and (match (find-decl (make-Σ decls) 'struct S) [`(struct . ,_) #t] [_ #f])
+          (= 1 (for/sum ([e decls]) (if (and (eq? (car e) 'linear) (eq? (cadr e) S)) 1 0))))]
+    ;; a function's own type parameters
+    [`(droppable ,f ,Ts)
+     (match (for/first ([e decls] #:when (and (eq? (car e) 'defn) (eq? (cadr e) f))) e)
+       [`(defn ,_ ,fTs . ,_) (and (distinct? Ts) (andmap (λ (T) (memq T fTs)) Ts) #t)]
+       [#f #f])]
+    ;; a global lives for the whole program, and is never dropped: it holds
+    ;; nothing linear, which would then outlive the program's obligations
     [`(global ,_ ,σ ,e)
      (and (wf? (make-Σ decls) σ)
+          (not (lin? (make-Σ decls) σ))
           (constant? e)
           (equal? (one-answer 'check-decl (judgment-holds (chk ,(make-Σ decls) () () ,e τ L Γ) τ)) σ))]
     [`(defn . ,_) (check-fn decls d)]

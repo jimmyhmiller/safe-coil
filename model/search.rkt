@@ -50,9 +50,14 @@
     (defn lock () ((r (mut (box int)))) (view Lock) (new (view Lock) r))
     ;; a view lent where it lies
     (defn relock () ((k (mut (view Lock)))) unit (set! (* (: (* k) r)) (box 5)))
-    (defn peek-at () ((v (ref (view Peek)))) int (+ (* (: (* v) s)) (: (* v) i)))))
+    (defn peek-at () ((v (ref (view Peek)))) int (+ (* (: (* v) s)) (: (* v) i)))
+    ;; linear values: one made, one used up, one passed through a type
+    ;; parameter that may be linear
+    (defn open () () (Tx) (new (Tx) 3))
+    (defn finish () ((t (Tx))) int (let ([n (: t n)]) (seq (destroy t) n)))
+    (defn pass (T) ((x T)) T x)))
 (define stock-sigs
-  (for/list ([fn stock])
+  (for/list ([fn stock] #:when (eq? (car fn) 'defn))
     (match-define `(defn ,f ,Ts ((,_ ,τs) ...) ,τr ,_) fn)
     (list f Ts τs τr)))
 
@@ -65,7 +70,7 @@
 (define base-storables
   '(int int int int unit (box int) (box int) (box int) (box (box int))
     (Pair) (Pt) (Wrap (box int)) (Opt (box int)) (Opt (box int)) (Opt int)
-    (pool (box int)) (handle (box int)) (ptr int) (ptr (box int)) arena))
+    (pool (box int)) (handle (box int)) (ptr int) (ptr (box int)) arena (Tx)))
 (define (gen-storable)
   (if (and (pair? (tvars)) (zero? (random 3)))
       (pick '(T T (box T) (Opt T) (Wrap T)))
@@ -89,6 +94,7 @@
     [(? symbol?) #f]
     [`(,(or 'ptr 'handle) ,_) #t]
     [`(,(or 'box 'pool 'task) ,_) #f]
+    [(list (or 'Tx 'Deal)) #f]
     [`(fno . ,_) #f]
     [_ (andmap (λ (part) (plain? (cadr part))) (or (fields σ) (variants σ) '()))]))
 
@@ -448,6 +454,47 @@
     (define restore (if (and (not (eq? (root tp) x)) (< (random 4) 3)) `(set! ,tp ,(sub tτ 0)) 'unit))
     (define body `(seq ,used (seq ,again (seq ,restore ,(sub τ)))))
     (if (eq? own fresh-one) `(let ([,x ,(sub (cdr own) 0)]) ,body) body))
+  ;; A linear value is made and then used up: destroyed, taken apart, given
+  ;; away, on every way or only some, or else dropped, overwritten, thrown
+  ;; away, boxed and dropped, or given to a type parameter that may drop it.
+  (define (linear-hazard)
+    (define x (fresh 'v))
+    (define deal? (zero? (random 3)))
+    (define t (if deal? '(Deal) '(Tx)))
+    (define made (cond [deal? `(new (Deal) (box ,(random 3)) (box ,(random 3)))]
+                       [(zero? (random 3)) '(call open ())]
+                       [(zero? (random 4)) `(call pass ((Tx)) (new (Tx) ,(random 3)))]
+                       [else `(new (Tx) ,(random 3))]))
+    (define (consume)
+      (case (random (if deal? 3 5))
+        [(0) `(destroy ,x)]
+        [(1) (if deal?
+                 (let ([a (fresh 'v)] [b (fresh 'v)])
+                   `(let ([,a (: ,x amt)]) (let ([,b (: ,x fee)]) (+ (* ,a) (* ,b)))))
+                 `(seq (call finish () ,x) unit))]
+        [(2) (let ([y (fresh 'v)]) `(let ([,y ,x]) (destroy ,y)))]
+        [(3) `(seq (call finish () (call pass ((Tx)) ,x)) unit)]
+        [else `(seq (call ,(pick '(id finish)) ,@(if (zero? (random 2)) '(((Tx))) '(())) ,x) unit)]))
+    (define body
+      (case (random 14)
+        [(0 1 2 3) `(seq ,(consume) ,(sub τ))]
+        [(4) `(seq (if0 ,(random 2) ,(consume) ,(consume)) ,(sub τ))]
+        [(5) `(seq (if0 ,(random 2) ,(consume) unit) ,(sub τ))]
+        [(6) (let ([i (fresh 'i)])
+               `(let ([,i 2]) (while ,i (seq ,(consume) (seq (break) (set! ,i 0))))))]
+        [(7) `(seq (set! ,x ,(leaf-of t)) (seq ,(consume) ,(sub τ)))]
+        [(8) `(seq ,x ,(sub τ))]
+        [(9) (let ([b (fresh 'v)]) `(let ([,b (box ,x)]) ,(sub τ)))]
+        [(10) (let ([b (fresh 'v)] [y (fresh 'v)])
+                `(let ([,b (box ,x)]) (let ([,y (unbox ,b)]) (seq (destroy ,y) ,(sub τ)))))]
+        [(11) `(seq (match (inj (Opt int) ,(pick '(None Some)) ,(pick '(unit 1)))
+                      ((None ,(fresh 'v)) ,(consume)) ((Some ,(fresh 'v)) ,(consume)))
+                    ,(sub τ))]
+        [(12) (if deal?
+                  (let ([a (fresh 'v)]) `(let ([,a (: ,x amt)]) (seq (* ,a) ,(sub τ))))
+                  `(seq (call id ((Tx)) ,x) ,(sub τ)))]
+        [else (sub τ)]))
+    `(let ([,x ,made]) ,body))
   (define (maybe-unsafe e) (if (zero? (random 2)) `(unsafe ,e) e))
   (define (gen-raw)
     (if (and (storable? τ) (zero? (random 2)))
@@ -733,7 +780,8 @@
   (cond
     [(<= d 0) (leaf)]
     [else
-     (case (if (and (pair? (tvars)) (zero? (random 3))) 26 (random 32))
+     (case (if (and (pair? (tvars)) (zero? (random 3))) 26 (random 34))
+       [(32 33) (linear-hazard)]
        [(0 1 2 3) (hazard)]
        [(26 27 28) (move-hazard)]
        [(29 30) `(seq ,(call-for-effect) ,(sub τ))]
@@ -808,7 +856,8 @@
   (define-values (fns call-sigs)
     (for/fold ([fns stock] [call-sigs stock-sigs]) ([s sigs])
       (match-define (list f Ts params ret borrows) s)
-      (define bdecl (if borrows (list `(borrows ,f ,borrows)) '()))
+      (define bdecl (append (if borrows (list `(borrows ,f ,borrows)) '())
+                            (if (and (pair? Ts) (zero? (random 2))) (list `(droppable ,f ,Ts)) '())))
       (define fn
         (for/or ([try 5])
           (define fn `(defn ,f ,Ts ,(for/list ([p params]) (list (car p) (cdr p))) ,ret

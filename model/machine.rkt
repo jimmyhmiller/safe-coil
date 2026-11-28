@@ -123,6 +123,7 @@
       [`(abox ,_) #t]
       ;; a view whose drop runs code is moved, so that the code runs once
       [`(rec (%drop . ,_) . ,_) #t]
+      [`(rec (%linear . ,_) . ,_) #t]
       [`(task ,_) #t]
       [`(tbl . ,_) #t]
       [`(rec (,_ . ,vs) ...) (ormap owning? vs)]
@@ -144,6 +145,11 @@
        (kill! a)]
       [`(rec (%drop . ,V) . ,fs)
        (drop-val! (invoke (find 'defn (view-drop V)) (list `(rec ,@fs))))]
+      ;; a linear value is never dropped; one taken apart, every field moved
+      ;; out of it, holds nothing
+      [`(rec (%linear . ,S) . ,fs)
+       (unless (for/and ([f fs]) (eq? (cdr f) 'moved))
+         (raise (stuck (format "a linear ~a dropped" S))))]
       ;; an arena gives back the memory of everything in it
       [`(arena ,a)
        (define c (hash-ref store a))
@@ -334,7 +340,13 @@
        (define fs (map cons (field-names τ) (ev-list es env)))
        (match τ
          [`(view ,V) #:when (view-drop V) `(rec (%drop . ,V) ,@fs)]
+         ;; a linear struct's value says so: dropping one is what goes wrong
+         [(cons S _) #:when (find 'linear S) `(rec (%linear . ,S) ,@fs)]
          [_ `(rec ,@fs)])]
+      [`(destroy ,e1)
+       (match (ev e1 env)
+         [`(rec (%linear . ,_) . ,fs) (for ([f fs]) (drop-val! (cdr f))) 'unit]
+         [v (raise (stuck (format "destroy of ~a" v)))])]
       [`(inj ,_ ,K ,e1) `(var ,K ,(ev e1 env))]
       [`(match ,e1 ,arms ...)
        (match (ev e1 env)
