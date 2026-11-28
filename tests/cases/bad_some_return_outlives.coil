@@ -1,0 +1,11 @@
+;;; A lambda returned as `(some TRAIT)` that borrows a local of the function
+;;; would outlive what it borrows.
+(module bad_some_return_outlives)
+(import "safe.fn" :use [deffn lambda])
+(deffn Add [] [i64] i64)
+(defn adder [(n i64)] (-> (some Add))
+  (let [k n]
+    (lambda Add [(ref k)] [x] (+ x k))))
+(defn main [] (-> i64)
+  (let [(mut a) (adder 3)]
+    (Add::run (mut a) 1)))

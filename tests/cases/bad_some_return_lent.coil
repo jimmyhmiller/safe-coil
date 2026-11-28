@@ -1,0 +1,12 @@
+;;; What a lambda returned as `(some TRAIT)` borrows from the call's arguments
+;;; stays lent while the lambda is used.
+(module bad_some_return_lent)
+(import "safe.fn" :use [deffn lambda])
+(deffn Add [] [i64] i64)
+(defn adder-of [(n (ref i64))] (-> (some Add))
+  (lambda Add [(m (ref n))] [x] (+ x m)))
+(defn main [] (-> i64)
+  (let [(mut k) 3
+        (mut a) (adder-of k)]
+    (set! k 4)
+    (Add::run (mut a) 1)))

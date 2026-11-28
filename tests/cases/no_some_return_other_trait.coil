@@ -1,0 +1,10 @@
+;;; `(some TRAIT)` is the type of a lambda of TRAIT: a function asking for one
+;;; cannot end with a lambda of another trait.
+(module no_some_return_other_trait)
+(import "safe.fn" :use [deffn lambda-own])
+(deffn Add [] [i64] i64)
+(deffn Mul [] [i64] i64)
+(defn adder [(n i64)] (-> (some Add))
+  (lambda-own Mul [n] [x] (* x n)))
+(defn main [] (-> i64)
+  (let [a (adder 3)] 0))

@@ -287,9 +287,13 @@
   (define (call) (let ([sig (pick calls)]) (call-with sig (instantiate sig τ))))
   (define (assign)
     (define targets (filter (λ (pt) (storable? (cdr pt))) ps))
-    (if (null? targets)
-        'unit
-        (match-let ([(cons p σ) (pick targets)]) `(set! ,p ,(sub σ)))))
+    ;; a reference or view local given another: often to a place it does not
+    ;; hold, which the rules must refuse
+    (define refs (for/list ([b env] #:when (and (symbol? (car b)) (second-class? (cdr b)))) b))
+    (cond [(and (pair? refs) (zero? (random 3)))
+           (match-let ([(cons x τx) (pick refs)]) `(set! ,x ,(sub τx 0)))]
+          [(null? targets) 'unit]
+          [else (match-let ([(cons p σ) (pick targets)]) `(set! ,p ,(sub σ)))]))
   (define (construct)
     (match τ
       ['int `(+ ,(sub 'int) ,(sub 'int))]

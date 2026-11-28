@@ -1,0 +1,23 @@
+;;; A function returns the lambda it ends with as the type of its own that
+;;; lambda is given, `(some TRAIT)`: what it returns is called directly, and
+;;; nothing is erased. One that borrows what it was given keeps that lent while
+;;; it is used, and no longer.
+(module ok_some_return)
+(import "safe.fn" :use [deffn lambda lambda-own])
+(deffn Add [] [i64] i64)
+(defn adder [(n i64)] (-> (some Add))
+  (lambda-own Add [n] [x] (+ x n)))
+(defn adder-of [(n (ref i64))] (-> (some Add))
+  (lambda Add [(m (ref n))] [x] (+ x m)))
+(defn twice [(F Add)] [(f (mut F)) (x i64)] (-> i64)
+  (let [once (Add::run (mut f) x)]
+    (Add::run (mut f) once)))
+(defn main [] (-> i64)
+  (let [(mut a) (adder 3)
+        one (Add::run (mut a) 1)
+        (mut k) 5
+        (mut b) (adder-of k)
+        two (twice (mut b) 10)]
+    (set! k 6)
+    (println "{} {} {}" one (twice (mut a) 10) (+ two k))
+    0))

@@ -361,6 +361,22 @@
                      (let ([c (abox a (new (view Peek) (ref (* b)) 0))])
                        (seq (: (* c) i) (let ([d a]) unit)))))))
 
+    ;; ================================================== assigning references
+    (accept "a reference local is given another to the same place"
+     ,(prog '() '(let ([a (box 1)]) (let ([r (ref (* a))]) (seq (set! r (ref (* a))) (* r))))))
+    (accept "a reference local made on two ways is given either"
+     ,(prog '() '(let ([a (box 1)]) (let ([b (box 2)])
+                   (let ([r (if0 0 (ref (* a)) (ref (* b)))]) (seq (set! r (ref (* b))) (* r)))))))
+    (accept "a cursor moves along what it refers to"
+     ,(prog '() '(let ([p (new (Pair) (box 1) (box 2))])
+                   (let ([r (ref p)]) (let ([c (ref (: (* r) a))]) (seq (set! c (ref (: (* r) b))) (* (* c))))))))
+    (reject "a reference local is not given one to a place it does not hold"
+     ,(prog '() '(let ([a (box 1)]) (let ([b (box 2)])
+                   (let ([r (ref (* a))]) (seq (set! r (ref (* b))) (seq (set! b (box 3)) (* r))))))))
+    (reject "a shared reference local is not given an exclusive one it does not hold"
+     ,(prog '() '(let ([a (box 1)])
+                   (let ([r (ref (* a))]) (seq (set! r (mut (* a))) (* r))))))
+
     ;; ================================================== linear values
     (accept "a linear value is destroyed"
      ,(prog '() '(let ([t (new (Tx) 1)]) (seq (destroy t) 0))))
@@ -415,6 +431,13 @@
      ,(prog '() '(let ([t (new (Tx) 1)]) (let ([u t]) (seq (destroy t) (seq (destroy u) 0))))))
     (reject "a linear struct taken apart in part still holds the rest"
      ,(prog '() '(let ([d (new (Deal) (box 3) (box 4))]) (let ([a (: d amt)]) (* a)))))
+    (accept "a linear struct taken apart on one way and destroyed on the other"
+     ,(prog '() '(let ([d (new (Deal) (box 3) (box 4))])
+                   (if0 0 (let ([a (: d amt)]) (let ([f (: d fee)]) (+ (* a) (* f))))
+                          (seq (destroy d) 0)))))
+    (reject "a linear struct taken apart in part on one way still holds the rest there"
+     ,(prog '() '(let ([d (new (Deal) (box 3) (box 4))])
+                   (if0 0 (let ([a (: d amt)]) (* a)) (seq (destroy d) 0)))))
     (reject "a task whose result is linear is joined, not dropped"
      ,(prog '((defn open () () (Tx) (new (Tx) 5)))
             '(let ([k (spawn (call open ()))]) 0)))

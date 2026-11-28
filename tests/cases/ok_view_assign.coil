@@ -1,0 +1,9 @@
+(module case.ok-view-assign)
+(import "safe.vec" :use [Vec Slice])
+(defn main [] (-> i64)
+  (let [(mut v) (Vec::new [i64])]
+    (Vec::push! (mut v) 1)
+    (Vec::push! (mut v) 2)
+    (let [(mut s) (Vec::slice v 0 1)]
+      (set! s (Vec::slice v 1 2))
+      (Slice::len s))))

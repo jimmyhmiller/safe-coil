@@ -76,7 +76,8 @@
     (linear-discard "a linear value may be thrown away by a seq or a loop")
     (linear-overwrite "a linear value may be dropped by set! over it")
     (linear-some-ways "a linear value may be moved on some ways to a join and dropped on the others")
-    (linear-generic "a linear type may be given to a type parameter its function may drop")))
+    (linear-generic "a linear type may be given to a type parameter its function may drop")
+    (set-ref-widens "a reference or view local may be given one with loans it does not hold")))
 (define (mutant? m) (eq? (mutant) m))
 
 (define-language Safe
@@ -501,6 +502,22 @@
   (append (for/list ([l L]) (cons h l)) Λ))
 (define (union L1 L2) (remove-duplicates (append L1 L2)))
 
+;; Is each loan of L covered by one HELD: on the same place or one it is part
+;; of, and exclusive when it is?
+(define (loans-covered? L held)
+  (for/and ([l L])
+    (match-define (list q k) l)
+    (for/or ([h held])
+      (match-define (list q2 k2) h)
+      (and (place-within? q q2) (or (eq? k 'shr) (eq? k2 'mut))))))
+(define (place-within? q outer)
+  (or (equal? q outer)
+      (match q
+        [`(* ,q1) (place-within? q1 outer)]
+        [`(: ,q1 ,_) (place-within? q1 outer)]
+        [`(elem ,q1) (place-within? q1 outer)]
+        [_ #f])))
+
 ;; the loans a shared borrow of p carries: through a shared reference, the loans
 ;; of whoever holds that reference; otherwise a shared loan on p itself
 (define (shared-loans Σ Γ Λ p)
@@ -661,23 +678,38 @@
          [`(gone ,πs ...) (and (member (cdr path) πs) #t)]
          [_ #f])))
 
+;; Does a variable of type τ in state s hold nothing at all: moved, or a struct
+;; every field of which is?
+(define (emptied? Σ τ s)
+  (match s
+    ['moved #t]
+    [`(gone ,πs ...)
+     (define fs (or (fields-of Σ τ) '()))
+     (and (pair? fs)
+          (for/and ([f fs])
+            (define in (for/list ([π πs] #:when (and (pair? π) (eq? (car π) (car f)))) (cdr π)))
+            (or (and (member '() in) #t)
+                (and (pair? in) (emptied? Σ (cadr f) `(gone ,@in))))))]
+    [_ #f]))
+
 ;; Moved on one way and not the other is `maybe`: as moved, except that what is
 ;; still there on the other way is dropped there, which a linear value never is.
-(define (state-join a b)
+;; Where the other way left nothing in it either, it is moved.
+(define (state-join Σ τ a b)
   (match* (a b)
     [('live 'live) 'live]
     [('moved 'moved) 'moved]
     [('maybe _) 'maybe]
     [(_ 'maybe) 'maybe]
-    [('moved _) 'maybe]
-    [(_ 'moved) 'maybe]
+    [('moved s) (if (emptied? Σ τ s) 'moved 'maybe)]
+    [(s 'moved) (if (emptied? Σ τ s) 'moved 'maybe)]
     [('live s) s]
     [(s 'live) s]
     [(`(gone ,xs ...) `(gone ,ys ...))
      (define all (remove-duplicates (append xs ys)))
      `(gone ,@(filter (λ (g) (not (for/or ([h all]) (and (list-prefix? h g) (not (equal? h g)))))) all))]))
-(define (break-join a b)
-  (cond [(eq? a 'none) b] [(eq? b 'none) a] [else (state-join a b)]))
+(define (break-join Σ τ a b)
+  (cond [(eq? a 'none) b] [(eq? b 'none) a] [else (state-join Σ τ a b)]))
 
 ;; An unreachable point: after a break or a return.
 (define dead-mark '(%dead unit live none))
@@ -691,18 +723,18 @@
                            (if (dead? Γ) (make-dead bound) bound)))
 ;; Two ways the program may have come: a variable is moved after it if it was
 ;; on either way, and an unreachable way does not count.
-(define (join Γ1 Γ2)
+(define (join Σ Γ1 Γ2)
   (define d1 (dead? Γ1))
   (define d2 (dead? Γ2))
   (define body
     (for/list ([a (vars-of Γ1)] [b (vars-of Γ2)])
       (list (car a) (cadr a)
-            (cond [d1 (caddr b)] [d2 (caddr a)] [else (state-join (caddr a) (caddr b))])
-            (break-join (cadddr a) (cadddr b)))))
+            (cond [d1 (caddr b)] [d2 (caddr a)] [else (state-join Σ (cadr a) (caddr a) (caddr b))])
+            (break-join Σ (cadr a) (cadddr a) (cadddr b)))))
   (if (and d1 d2) (make-dead body) body))
 ;; A break: what each variable is here joins what it is at the loop's other breaks.
-(define (record-break Γ)
-  (make-dead (for/list ([e (vars-of Γ)]) (list (car e) (cadr e) (caddr e) (break-join (cadddr e) (caddr e))))))
+(define (record-break Σ Γ)
+  (make-dead (for/list ([e (vars-of Γ)]) (list (car e) (cadr e) (caddr e) (break-join Σ (cadr e) (cadddr e) (caddr e))))))
 (define (same-states? Γ1 Γ2)
   (equal? (map caddr (vars-of Γ1)) (map caddr (vars-of Γ2))))
 ;; A loop is left when its condition is 0 (the state after the condition) or by
@@ -710,10 +742,10 @@
 (define (clear-breaks Γ)
   (define vs (for/list ([e (vars-of Γ)]) (list (car e) (cadr e) (caddr e) 'none)))
   (if (dead? Γ) (make-dead vs) vs))
-(define (loop-exit Γ-outer Γ-cond Γ-body)
+(define (loop-exit Σ Γ-outer Γ-cond Γ-body)
   (for/list ([o (vars-of Γ-outer)] [c (vars-of Γ-cond)] [e (vars-of Γ-body)])
     (list (car o) (cadr o)
-          (if (mutant? 'break-forgets) (caddr c) (break-join (caddr c) (cadddr e)))
+          (if (mutant? 'break-forgets) (caddr c) (break-join Σ (cadr o) (caddr c) (cadddr e)))
           (cadddr o))))
 
 ;; Can the part of an exclusive or out parameter's referent be left as it is
@@ -950,6 +982,19 @@
    -------------------------------------------- "set"
    (chk Σ Γ Λ (set! p e) unit () Γ_2)]
 
+  ;; A reference or view local is given another value: one that carries only
+  ;; loans the local already holds, which stay alive as long as it does, so what
+  ;; either value refers to stays lent. A cursor walking a structure borrows
+  ;; through itself, `(set! c (ref (: (* c) next)))`; a local made on several
+  ;; ways holds what each way lent.
+  [(where τ ,(lookup (term Γ) (term x)))
+   (side-condition ,(second-class? (term τ)))
+   (chk ,(Σ+ (term Σ) (term x)) Γ Λ e τ L Γ_1)
+   (side-condition ,(available? (term Γ_1) (term x)))
+   (side-condition ,(or (mutant? 'set-ref-widens) (loans-covered? (term L) (loans-of (term Λ) (term x)))))
+   -------------------------------------------- "set-ref"
+   (chk Σ Γ Λ (set! x e) unit () Γ_1)]
+
   ;; a variable whose whole value was moved; one moved on some ways only still
   ;; holds it on the others, where set! drops it
   [(chk ,(Σ+ (term Σ) (term x)) Γ Λ e σ () Γ_1)
@@ -974,7 +1019,7 @@
    (chk Σ Γ_1 Λ e_2 τ L_2 Γ_2)
    (chk Σ Γ_1 Λ e_3 τ L_3 Γ_3)
    (where L ,(if (mutant? 'no-union) (term L_2) (union (term L_2) (term L_3))))
-   (where Γ_4 ,(if (mutant? 'no-join) (term Γ_2) (join (term Γ_2) (term Γ_3))))
+   (where Γ_4 ,(if (mutant? 'no-join) (term Γ_2) (join (term Σ) (term Γ_2) (term Γ_3))))
    -------------------------------------------- "if0"
    (chk Σ Γ Λ (if0 e_1 e_2 e_3) τ L Γ_4)]
 
@@ -987,13 +1032,13 @@
    (chk ,(Σ-loop (Σ+ (term Σ) (term e_c) (term e_b))) Γ_1 Λ e_b τ_b L_b Γ_2)
    (side-condition ,(or (mutant? 'linear-discard) (not (lin? (term Σ) (term τ_b)))))
    (side-condition ,(or (mutant? 'loop-moves) (dead? (term Γ_2)) (same-states? (term Γ_2) (term Γ_0))))
-   (where Γ_3 ,(let ([out (loop-exit (term Γ) (term Γ_1) (term Γ_2))])
+   (where Γ_3 ,(let ([out (loop-exit (term Σ) (term Γ) (term Γ_1) (term Γ_2))])
                  (if (dead? (term Γ)) (make-dead out) out)))
    -------------------------------------------- "while"
    (chk Σ Γ Λ (while e_c e_b) unit () Γ_3)]
 
   [(side-condition ,(in-loop? (term Σ)))
-   (where Γ_1 ,(record-break (term Γ)))
+   (where Γ_1 ,(record-break (term Σ) (term Γ)))
    -------------------------------------------- "break"
    (chk Σ Γ Λ (break) unit () Γ_1)]
 
@@ -1314,7 +1359,7 @@
   [(chk-arm Σ Γ Λ x τ_x L_x e τ L_1 Γ_1)
    (chk-arms Σ Γ Λ (any_a any_r ...) (τ_y τ_r ...) L_x τ L_2 Γ_2)
    (where L ,(if (mutant? 'no-union) (term L_1) (union (term L_1) (term L_2))))
-   (where Γ_3 ,(if (mutant? 'no-join) (term Γ_1) (join (term Γ_1) (term Γ_2))))
+   (where Γ_3 ,(if (mutant? 'no-join) (term Γ_1) (join (term Σ) (term Γ_1) (term Γ_2))))
    -------------------------------------------- "arms"
    (chk-arms Σ Γ Λ (((K x) e) any_a any_r ...) (τ_x τ_y τ_r ...) L_x τ L Γ_3)])
 

@@ -1,0 +1,8 @@
+;;; `(some TRAIT)` is the type of the lambda a function ends with: a function
+;;; that ends with anything else cannot ask for one.
+(module no_some_return_not_lambda)
+(import "safe.fn" :use [deffn])
+(deffn Add [] [i64] i64)
+(defn adder [(n i64)] (-> (some Add))
+  n)
+(defn main [] (-> i64) 0)

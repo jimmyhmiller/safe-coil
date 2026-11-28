@@ -117,6 +117,11 @@
   (or (for/first ([d (current-decls)] #:when (and (eq? (car d) kind) (eq? (cadr d) name))) d)
       (bail "an ill-typed program")))
 
+;; Arms of different types: the rules refuse the program, and Coil takes a match
+;; used as a statement whatever its arms give.
+(define (arms-agree! τs)
+  (unless (= (length (remove-duplicates τs)) 1) (bail "an ill-typed program")))
+
 (define (type-of Σ Γ e)
   (match e
     [(? integer?) 'int]
@@ -365,6 +370,11 @@
     [`(abox ,p ,e1) (format "(BoxIn::in-arena [~a] ~a ~a)"
                             (coil-type (type-of Σ Γ e1)) (shared-place Σ Γ p) (plain Σ Γ e1))]
     [`(reset! ,p) (unit-after (format "(Arena::reset! (mut ~a))" (written-place Σ Γ p)))]
+    ;; Coil's set! of a reference writes through it: a reference local is never
+    ;; given another
+    [`(set! ,(? symbol? x) ,_)
+     #:when (match (lookup Γ x) [`(,(or 'ref 'mut) ,_) #t] [_ #f])
+     (bail "a reference local given another reference")]
     [`(set! ,p ,e1)
      (unit-after
       (if (symbol? p)
@@ -399,6 +409,8 @@
      (format "(~a ~a)" (constructor (variant-name K) (cdr σ)) (plain Σ Γ e1))]
     [`(match ,e1 ,arms ...)
      (define τ1 (type-of Σ Γ e1))
+     (arms-agree! (for/list ([arm arms])
+                    (match arm [`((,K ,x) ,ea) (type-of Σ (cons (cons x (variant-type Σ τ1 K)) Γ) ea)])))
      (format "(match (move ~a)~a)" (plain Σ Γ e1)
              (string-append*
               (for/list ([arm arms])
@@ -411,6 +423,8 @@
     [`(,(and form (or 'match-ref 'match-mut)) ,p ,arms ...)
      (define τp (place-type Σ Γ p))
      (define k (if (eq? form 'match-ref) 'ref 'mut))
+     (arms-agree! (for/list ([arm arms])
+                    (match arm [`((,K ,x) ,ea) (type-of Σ (cons (cons x `(,k ,(variant-type Σ τp K))) Γ) ea)])))
      ;; Coil copies a plain-data payload into the arm. A shared reference to the
      ;; copy reads what a reference to the payload would, while the scrutinee
      ;; keeps the place lent; an exclusive one would change the copy only.

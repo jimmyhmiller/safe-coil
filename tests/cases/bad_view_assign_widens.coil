@@ -1,0 +1,11 @@
+(module case.bad-view-assign-widens)
+(import "safe.vec" :use [Vec Slice])
+(defn main [] (-> i64)
+  (let [(mut v) (Vec::new [i64])
+        (mut w) (Vec::new [i64])]
+    (Vec::push! (mut v) 1)
+    (Vec::push! (mut w) 2)
+    (let [(mut s) (Vec::slice v 0 1)]
+      (set! s (Vec::slice w 0 1))
+      (Vec::clear! (mut w))
+      (Slice::len s))))

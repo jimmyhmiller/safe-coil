@@ -1073,6 +1073,32 @@
 
 ;;; `(set! PLACE VALUE)` and `(store! PLACE VALUE)`: the value is computed first.
 (defn eval-store [(cx (mut Cx)) (e Code)] (-> Res)
+  (let [target (get e 1)
+        at (if (primitive/code-sym? target) (find-local (mut cx) target) -1)]
+    (if (and (>= at 0) (view-type? cx (pointee (type-of target))))
+        (eval-view-assign (mut cx) e at)
+        (eval-store-place (mut cx) e))))
+
+;;; `(set! V VIEW)` for a view local V: VIEW carries only loans V already
+;;; holds, which stay alive as long as V does, so what either view refers to
+;;; stays lent. A local made on several ways holds what each way lent.
+(defn eval-view-assign [(cx (mut Cx)) (e Code) (at i64)] (-> Res)
+  (let [l (get (.locals cx) at)
+        held (loans-of cx (.serial l))
+        r (eval (mut cx) (get e 2) (WValue))]
+    (for x (iter (.loans r))
+      (unless (block :covered
+                (for h (iter held)
+                  (when (and (prefix? (loan-place h) (loan-place x))
+                             (or (primitive/code-eq (get x 1) `shr) (primitive/code-eq (get h 1) `mut)))
+                    (return-from :covered true)))
+                false)
+        (fail! (get e 2) "safe: a view local is given only a view of what it already borrows; this one borrows what the local does not")))
+    (let [q (place-of (mut cx) (get e 1))]
+      (when (= (len q) 1) (check-write! cx e (get q 0) "written")))
+    (fresh)))
+
+(defn eval-store-place [(cx (mut Cx)) (e Code)] (-> Res)
   (let [target (get e 1)]
     (guard-raw-flow! cx e (get e 2))
     (refuse-stored-view! cx (get e 2))

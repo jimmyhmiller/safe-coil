@@ -112,6 +112,12 @@ adds the rest of the model:
   into the view it returns, which then holds `x`'s loans. The checker cannot see
   where `x` goes, so such a function's whole body is one `(unsafe …)`.
   `BoxIn::in-arena` is one: it is how a tree's nodes are put in an arena.
+- **A view local given another view.** `(set! s VIEW)`, for a local `s` that
+  holds a view, is allowed when VIEW carries only loans `s` already holds: `s`
+  keeps them alive as long as it lives, so what either view refers to stays
+  lent. A slice of a `Vec` may move along that `Vec`; one given a slice of
+  another `Vec` is refused. Only a view local is given another: `set!` on a
+  reference local writes through it, so a reference is never rebound.
 - **Closures.** Each lambda is a type of its own: a struct of what it
   captured, implementing the closure trait `deffn` declared, whose `run` is the
   lambda's body, checked as any method is. One that borrows (`lambda`) is a view
@@ -186,7 +192,7 @@ operations are allowed.
 | `safe.core` | `unsafe`; `borrow` and `borrow-mut`, a reference as a value; `replace!`, which swaps an owner out of a place; `move`; `each` and `each-mut`, a loop over a list, a slice or a string; `size` and `nth`, a `(slice T)` read with every index checked; the traits `View`, `QuietDrop`, `SharedView`, `CrossThread` and `OneThread`; the annotations `:safe/borrows` and `:safe/keeps` |
 | `safe.alloc` | Where collections get memory. `Heap`, the heap, of no size; `Lease`, any Coil allocator by lease: `Lease::heap`, and `Lease::assume` of a raw `AllocatorLease` inside `unsafe`; `Arena`, an owner that hands out memory by bumping a pointer and gives it all back at once: `Arena::new`, `with-room`, `reset!`, `live`, `reserved`, and `lend`, an `ArenaRef`. The traits `Alloc`, and `InArena`, a collection in an arena, which drops nothing it holds |
 | `safe.loop` | `(for (ref x) xs …)` and `(for (mut x) xs …)` over a safe collection, each element by reference; any other `for` is Coil's |
-| `safe.fn` | `(deffn NAME [T…] [PARAM-TYPE…] RESULT)` declares a closure trait; `(lambda NAME [(ref x) (mut y) (z (ref PLACE))…] [params…] body…)` makes a closure of its own type that borrows what it captures, `(lambda-own NAME [x (y VALUE)…] [params…] body…)` one that owns them; `(NAME::run (mut f) args…)` calls either and `(NAME::call-once f args…)` calls one and drops it. A function takes a closure as `[(F NAME)] [(f (mut F))]`, so the call is direct. Erased, for keeping or choosing among closures: `(NAME-view-of (mut f))` is a `NAME-view` that borrows `f`; `(NAME-own-of f)` puts an owning closure on the heap as a `NAME-own`; both implement `NAME`. `(spawn (NAME-call-once f))` runs an owning closure on a thread |
+| `safe.fn` | `(deffn NAME [T…] [PARAM-TYPE…] RESULT)` declares a closure trait; `(lambda NAME [(ref x) (mut y) (z (ref PLACE))…] [params…] body…)` makes a closure of its own type that borrows what it captures, `(lambda-own NAME [x (y VALUE)…] [params…] body…)` one that owns them; `(NAME::run (mut f) args…)` calls either and `(NAME::call-once f args…)` calls one and drops it. A function takes a closure as `[(F NAME)] [(f (mut F))]`, so the call is direct, and returns the lambda it ends with as `(-> (some NAME))`. Erased, for keeping or choosing among closures: `(NAME-view-of (mut f))` is a `NAME-view` that borrows `f`; `(NAME-own-of f)` puts an owning closure on the heap as a `NAME-own`; both implement `NAME`. `(spawn (NAME-call-once f))` runs an owning closure on a thread |
 | `safe.view` | `(defview NAME [T…] [(field TYPE)…])`, a view whose fields may be references or views: `NAME::new`, `NAME::field`, `NAME::field-mut`. `(defsubscript NAME [T…] [params…] (-> (ref R) or (mut R)) before… (yield PLACE) after…)`: `NAME::open` runs `before` and gives a view of `PLACE`, read with `NAME::get` and `NAME::get-mut`; `after` runs when the view is dropped |
 | `safe.box` | `(Box T)`, an owner of one heap value: `Box::new`, `get`, `get-mut`, `into`. `(BoxIn T A)` is one in memory from the allocator A, with the same methods: `BoxIn::new-in [T A] value a` for the heap or a lease, `(BoxIn::in-arena [T] arena value)` for an arena. `(Box T)` is a `(BoxIn T Heap)` and one pointer wide |
 | `safe.own` | `(own Trait value)` makes an `(Own (dyn Trait))`, an owned trait object: a value of any type that implements the trait, on the heap, dropped as its own type drops. `(Own::get-mut (mut o))` lends the `(dyn Trait)` |
@@ -250,16 +256,37 @@ each turn, so the body cannot add to it or take from it. With `safe.loop`,
 Inside the body, `total` is an exclusive reference and `step` a shared one; the
 closure keeps `total` lent exclusively and `step` shared until its last use.
 `lambda-own` captures by moving: `(lambda-own Count [n] [] (set! n (+ n 1)) n)`
-is a counter that can be stored or given to `spawn` through `Count-call-once`;
-it is returned from a function erased, as a `Count-own`, since the lambda's own
-type has no name a function can declare. A closure gives back a value, never a
-reference into what it captured.
+is a counter that can be stored or given to `spawn` through `Count-call-once`.
+A closure gives back a value, never a reference into what it captured.
+
+A function returns the lambda it ends with as the lambda's own type when it
+says `(some TRAIT)`, so what it returns is called directly and nothing is
+erased:
+
+```coil
+(deffn Add [] [i64] i64)
+
+(defn adder [(n i64)] (-> (some Add))
+  (lambda-own Add [n] [x] (+ x n)))
+
+(defn adder-of [(n (ref i64))] (-> (some Add))
+  (lambda Add [(m (ref n))] [x] (+ x m)))   ; keeps the caller's n lent while it is used
+```
+
+The function ends with a lambda of TRAIT, last in its body or in a `let` or `do`
+there; one that ends with anything else, or with a lambda of another trait, is
+refused by `safe.fn`. What the lambda borrows is a loan of what the call was
+given, as for any view a function returns, and a lambda that borrows a local of
+the function would outlive it. A function that returns one of several lambdas
+returns it erased, as a `Count-own`.
 
 `lambda` leaves a marker that `safe.fn`'s transform replaces, once the compiler
 has typed what the lambda captures, with the lambda's type and its
 construction: the struct of captures and its impl of the trait are written in
 the program's module, where the lambda is, so the checker checks the body
-there and a diagnostic about it points at the lambda.
+there and a diagnostic about it points at the lambda. A `(some TRAIT)` result
+is the erased `TRAIT-view` until then, so the definition checks and the
+lambda's captures can be typed, and the lambda's type once it is made.
 
 ### Views and subscripts
 
@@ -505,16 +532,18 @@ run fails if the checker accepts anything the model refuses.
 checker at a time and requires `diff.py` to find a program the weakened checker
 wrongly accepts.
 
-On the model's 196 hand-written cases and 4000 random programs (seed 7), 3284
-can be written as Coil; 912 use something Coil cannot express (most often a
-closure that borrows made where no name holds it, or one that returns a
-reference). The compiler refuses 1181 of them itself. On the other 2100 the
-checker accepts nothing the model refuses: 1389 accepted by both, 691 refused by
-both, and 20 refused only by the checker, each for one of the differences below. All 39
+On the model's 232 hand-written cases and 4000 random programs (seed 7), 3343
+can be written as Coil; 889 use something Coil cannot express (most often a
+closure that returns a reference, or one that borrows made where no name holds
+it). The compiler refuses 1121 of them itself. On the other 2222 the checker
+accepts nothing the model refuses: 1399 accepted by both, 798 refused by both,
+19 refused only by the checker, each for one of the differences below, and 6
+that the model refuses only for using an exclusive reference after moving it,
+which Coil never does (it lends again). All 49
 weakenings of the checker are caught, by a hand-written case or the
 differential run.
 
-`tests/run.py` has 186 hand-written cases. The programs in `examples/` run clean
+`tests/run.py` has 210 hand-written cases. The programs in `examples/` run clean
 under `--sanitize=address`, and the threaded ones under `--sanitize=thread`.
 
 ### Where Coil and the model differ
@@ -579,8 +608,10 @@ Found by the differential run:
   payload itself leave.
 
 Model programs Coil cannot express, which `diff.py` skips: `match-mut` on a
-plain-data payload (a write would change the copy), and an exclusive reference
-read out of a view's field as a value.
+plain-data payload (a write would change the copy), an exclusive reference
+read out of a view's field as a value, and a reference local given another
+reference (the model's `set-ref` gives one, as it gives a view local another
+view; Coil's `set!` on a reference writes through it).
 
 ## The model
 
@@ -632,7 +663,7 @@ racket model/search.rkt teeth       # each rule weakened in turn: the search mus
 racket model/search.rkt teeth 20000 no-union par-split   # only those weakenings
 ```
 
-`teeth` is the check on the search itself. `rules.rkt` lists 43 ways to weaken
+`teeth` is the check on the search itself. `rules.rkt` lists 49 ways to weaken
 one rule (`mutants`), and the machine can drop its run-time check on globals.
 `teeth` fails unless a hand-written case or the search finds a program that goes
 wrong under each one.
@@ -641,7 +672,7 @@ rules refuse is generated again, so `teeth` looks through four seeds before it
 says a weakening was not found.
 
 Four seeds of 20000 programs find no counterexample under the rules as they
-are. All 44 weakenings are found at 5000 programs a seed. Two (an argument's
+are. All 50 weakenings are found at 5000 programs a seed. Two (an argument's
 loans not alive while later arguments run, a later branch's loans forgotten) are
 found only by a hand-written case that goes wrong when run: the search never
 writes a place inside an argument, and since it learned arenas it no longer

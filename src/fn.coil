@@ -307,7 +307,12 @@
 
 ;;; What the transform carries through a module: the forms it adds, and how
 ;;; many lambdas it has made.
-(defstruct Made [(defs Code) (count i64)])
+(defstruct Made [(defs Code) (count i64) (traits Code)])
+
+;;; The result of a definition that asked for `(some TRAIT …)` until the lambda
+;;; it ends with is made: V is the erased view of TRAIT, so the definition
+;;; checks, and its body's types are known.
+(defstruct Asked [V] [])
 
 ;;; The lambda at the marker F, inside definitions whose type parameters are
 ;;; SCOPE, made a type of its own in MODULE. -> what replaces the marker.
@@ -402,6 +407,7 @@
           (for d (iter `(~@defs)) (push! (mut placed) (primitive/code-list-like f d)))
           (set! (.defs made) `(~@(.defs made) ~@placed)))
         (set! (.count made) (+ (.count made) 1))
+        (set! (.traits made) `(~@(.traits made) (~name ~witness)))
         ;; a borrowing closure is a view built from the views of its captures,
         ;; so it keeps each of them lent, as a reference to it would
         `(~name ~@impl-tps ~@inits))))))
@@ -429,14 +435,121 @@
 (defn rewrite [(f Code) (scope Code) (module Code) (made (mut Made))] (-> Code)
   (cond (marker? f) (make-lambda f scope module (mut made))
         (template? f) f
+        (some-asked? f) (ask-some f)
         (or (primitive/code-list? f) (primitive/code-vector? f))
-          (if (has-marker? f)
+          (if (or (has-marker? f) (asks-some? f))
               (let [inner `(~@scope ~@(introduced-tparams f))
                     (mut kids) (primitive/code-list-new)]
                 (for k (iter f) (push! (mut kids) (rewrite k inner module (mut made))))
-                (primitive/code-list-like f `(~@kids)))
+                (let [out (primitive/code-list-like f `(~@kids))]
+                  (if (> (len (some-recorded out)) 0) (give-some out module made) out)))
               f)
         :else f))
+
+;;; ---- a lambda returned as itself ------------------------------------------------
+;;;
+;;; `(defn f [...] (-> (some TRAIT ARG…)) … (lambda TRAIT …))`: F returns the
+;;; lambda it ends with as the type of its own the lambda is given, so what it
+;;; returns is called directly, as by a function generic over the closure it is
+;;; given, and nothing is erased; only this transform names the type. A body's
+;;; types are known only once its signature checks, so `(some …)` is first the
+;;; erased view of TRAIT, as `(Asked TRAIT-view …)`, and once the lambda is made
+;;; it is the lambda's type.
+
+;;; Is F, or a form directly in F, a definition that asks for `(some …)`, or one
+;;; whose `(Asked …)` is not yet a lambda's type? A module whose only lambda is
+;;; missing still has its `(some …)` asked for, and refused.
+(defn asks-some? [(f Code)] (-> bool)
+  (or (some-asked? f) (> (len (some-recorded f)) 0)
+      (and (primitive/code-list? f)
+           (block :found
+             (for k (iter f)
+               (when (or (some-asked? k) (> (len (some-recorded k)) 0)) (return-from :found true)))
+             false))))
+
+;;; The index of the `(-> R)` of the definition F, or -1.
+(defn arrow-at [(f Code)] (-> i64)
+  (block :found
+    (for [i 2 (len f)]
+      (when (head-named? (get f i) "->") (return-from :found i)))
+    -1))
+
+;;; Is F a definition whose result is written `(some TRAIT ARG…)`?
+(defn some-asked? [(f Code)] (-> bool)
+  (and (head-named? f "defn*")
+       (let [at (arrow-at f)]
+         (and (> at 0) (= (len (get f at)) 2) (head-named? (get (get f at) 1) "some")
+              (> (len (get (get f at) 1)) 1)))))
+
+;;; F with its result `(Asked TRAIT-view ARG…)`; its lambdas are made once its
+;;; body checks.
+(defn ask-some [(f Code)] (-> Code)
+  (let [at (arrow-at f)
+        arrow (get f at)
+        asked (get arrow 1)
+        trait (get asked 1)
+        args (primitive/code-slice asked 2 (len asked))
+        view (primitive/datum->syntax trait (primitive/code-symbol trait "-view"))
+        result `(Asked ~(if (> (len args) 0) `(~view ~@args) view))
+        (mut parts) (primitive/code-list-new)]
+    (for [i 0 (len f)]
+      (push! (mut parts)
+             (if (= i at) (primitive/code-list-like arrow `(~(get arrow 0) ~result)) (get f i))))
+    (primitive/code-list-like f `(~@parts))))
+
+;;; The view the definition F asked for, `(V)` of a result `(Asked V)`, or `()`.
+(defn some-recorded [(f Code)] (-> Code)
+  (let [at (if (head-named? f "defn*") (arrow-at f) -1)]
+    (if (and (> at 0) (= (len (get f at)) 2))
+        (let [r (get (get f at) 1)]
+          ;; the Asked this transform wrote: its own template's identifier
+          (if (and (primitive/code-list? r) (= (len r) 2) (primitive/code-sym? (get r 0))
+                   (primitive/free-identifier=? (get r 0) `Asked))
+              `(~(get r 1))
+              `()))
+        `())))
+
+;;; The qualified name of the type the head of T, a type, names.
+(defn type-head-name [(t Code)] (-> Code)
+  (match (primitive/code-decl (if (primitive/code-list? t) (get t 0) t))
+    (primitive/Declared [_ _ q _] q)
+    (_ `())))
+
+;;; The expression F ends with: the last form of its body, and of a `let*` or a
+;;; `do` there.
+(defn tail-of [(e Code)] (-> Code)
+  (if (and (or (head-named? e "let*") (head-named? e "do")) (> (len e) 1))
+      (tail-of (get e (- (len e) 1)))
+      e))
+
+;;; The definition F, whose lambdas are made, with its result the type of the
+;;; lambda it ends with, which implements the trait `:safe/some` names.
+(defn give-some [(f Code) (module Code) (made (ref Made))] (-> Code)
+  (let [at (arrow-at f)
+        tail (tail-of (get f (- (len f) 1)))
+        made-as (block :found
+                  (when (and (primitive/code-list? tail) (> (len tail) 0) (primitive/code-sym? (get tail 0)))
+                    (for pr (iter (.traits made))
+                      (when (primitive/code-eq (get pr 0) (get tail 0)) (return-from :found pr))))
+                  `())]
+    (if (= (len made-as) 0)
+        (do (primitive/report f "safe: (some TRAIT) is the type of the lambda a function ends with, and this one ends with something else")
+            f)
+        (let [asked (get (some-recorded f) 0)
+              same (and (primitive/code-sym? (type-head-name asked))
+                        (primitive/code-eq (type-head-name asked) (type-head-name (get made-as 1))))
+              name (get tail 0)
+              result (if (and (> (len tail) 1) (primitive/code-vector? (get tail 1)))
+                         `(~name ~@(get tail 1))
+                         name)
+              arrow (get f at)
+              (mut parts) (primitive/code-list-new)]
+          (unless same
+            (primitive/report f "safe: the lambda this function ends with is not of the trait its (some …) names"))
+          (for [i 0 (len f)]
+            (push! (mut parts)
+                   (if (= i at) (primitive/code-list-like arrow `(~(get arrow 0) ~result)) (get f i))))
+          (primitive/code-list-like f `(~@parts))))))
 
 (defn has-marker? [(f Code)] (-> bool)
   (cond (marker? f) true
@@ -453,8 +566,8 @@
 (defn closures [(modules Code)] (-> Code)
   (let [(mut out) (primitive/code-list-new)]
     (for m (iter modules)
-      (if (has-marker? m)
-          (let [(mut made) (Made :defs `() :count (lambdas-in m))
+      (if (or (has-marker? m) (asks-some? m))
+          (let [(mut made) (Made :defs `() :count (lambdas-in m) :traits `())
                 r (rewrite m `() m (mut made))]
             (push! (mut out) `(~@r ~@(.defs made))))
           (push! (mut out) m)))
