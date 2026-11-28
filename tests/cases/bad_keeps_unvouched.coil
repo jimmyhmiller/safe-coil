@@ -1,4 +1,5 @@
 (module case.bad-keeps-unvouched)
 (import "safe.vec" :use [Vec])
-(defn stash :safe/keeps "x" [T] [(x T) (v (mut (Vec T)))] (-> i64) (Vec::push! (mut v) x) 0)
+(import "safe.core" :use [Droppable])
+(defn stash :safe/keeps "x" [(T Droppable)] [(x T) (v (mut (Vec T)))] (-> i64) (Vec::push! (mut v) x) 0)
 (defn main [] (-> i64) 0)

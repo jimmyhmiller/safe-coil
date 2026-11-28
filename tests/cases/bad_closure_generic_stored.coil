@@ -3,10 +3,10 @@
 (import "safe.fn" :use [deffn lambda lambda-own])
 (import "safe.vec" :use [Vec])
 (import "safe.par" :use [par])
-(import "safe.core" :use [borrow])
+(import "safe.core" :use [borrow Droppable])
 (deffn Get [] i64)
 ;;; Generic code given a closure cannot store it: it may borrow.
-(defn keep [(F Get)] [(f (mut F)) (out (mut (Vec F)))] (-> void)
+(defn keep [(F Get Droppable)] [(f (mut F)) (out (mut (Vec F)))] (-> void)
   (Vec::push! (mut out) (take! (mut f)))
   0)
 (defn main [] (-> i64) 0)

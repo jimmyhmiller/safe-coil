@@ -3,11 +3,11 @@
 (import "safe.fn" :use [deffn lambda lambda-own])
 (import "safe.vec" :use [Vec])
 (import "safe.par" :use [par])
-(import "safe.core" :use [borrow])
+(import "safe.core" :use [borrow Droppable])
 (deffn Get [] i64)
 ;;; Generic code cannot swap two closures it was lent: each would then hold the
 ;;; other one's captures, which are lent to the wrong name.
-(defn swap-them [(F Get)] [(a (mut F)) (b (mut F))] (-> void)
+(defn swap-them [(F Get Droppable)] [(a (mut F)) (b (mut F))] (-> void)
   (let [ta (take! (mut a))
         tb (take! (mut b))]
     (set! a tb)
